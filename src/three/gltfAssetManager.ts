@@ -8,6 +8,8 @@ import type {
   CustomClipSlot,
   CustomMotionPreset,
   CustomRigSettings,
+  ObjectMakerDoc,
+  ObjectMechanism,
   VisualStyleId,
 } from '../types/maker';
 import { getAssetBlob } from '../utils/assetVault';
@@ -112,7 +114,8 @@ function computeNormalizedBounds(root: THREE.Object3D, category: AssetCategory) 
   const size = new THREE.Vector3();
   box.getSize(size);
   const maxDim = Math.max(0.01, size.y, Math.max(size.x, size.z) * 0.85);
-  const targetHeight = category === 'character' ? 1.85 : category === 'scenery' ? 2.8 : 1.25;
+  const targetHeight =
+    category === 'character' ? 1.85 : category === 'scenery' ? 2.8 : category === 'plant' ? 1.45 : 1.25;
   const baseScale = THREE.MathUtils.clamp(targetHeight / maxDim, 0.01, 60);
   const baseGroundOffset = -box.min.y * baseScale;
   return { baseScale, baseGroundOffset };
@@ -476,6 +479,63 @@ export async function parseUploadedGlbFile(
 
   notifyAssetCache();
   return { meta, buffer };
+}
+
+export function evictCachedAsset(assetId: string): void {
+  parsedCache.delete(assetId);
+  pendingLoads.delete(assetId);
+  notifyAssetCache();
+}
+
+export async function registerGeneratedGlbAsset(opts: {
+  existingMeta?: CustomAssetMeta;
+  name: string;
+  category: AssetCategory;
+  buffer: ArrayBuffer;
+  mechanisms?: ObjectMechanism[];
+  objectRecipe?: ObjectMakerDoc;
+  keepMetricScale?: boolean;
+}): Promise<{ meta: CustomAssetMeta; buffer: ArrayBuffer }> {
+  const gltf = await loader.parseAsync(opts.buffer, '');
+  const cached = prepareGLTFScene(gltf, opts.category);
+  const clipNames = cached.animations.map((c, idx) => c.name || `Clip ${idx + 1}`);
+  const id = opts.existingMeta?.id ?? uid();
+  parsedCache.set(id, cached);
+
+  const cleanName = opts.name.trim() || 'Custom Object';
+  const safeFile =
+    cleanName
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, '_')
+      .replace(/^_|_$/g, '') || 'custom_object';
+
+  const thumbnailDataUrl = await renderThumbnailSnapshot(cached);
+
+  const meta: CustomAssetMeta = {
+    ...(opts.existingMeta ?? {}),
+    id,
+    name: cleanName,
+    category: opts.category,
+    fileName: `${safeFile}.glb`,
+    byteSize: opts.buffer.byteLength,
+    hasSkeleton: cached.hasSkeleton,
+    boneNames: cached.skeletonInfo.boneNames,
+    animationClips: clipNames,
+    clipMap: opts.existingMeta?.clipMap ?? autoMapAnimationClips(clipNames),
+    rigSettings: opts.existingMeta?.rigSettings ?? cached.defaultRigSettings,
+    mechanisms: opts.mechanisms && opts.mechanisms.length > 0 ? opts.mechanisms : undefined,
+    objectRecipe: opts.objectRecipe,
+    groundOffset: Number(cached.baseGroundOffset.toFixed(3)),
+    defaultScale: opts.keepMetricScale
+      ? 1
+      : opts.existingMeta?.defaultScale ?? Number(cached.baseScale.toFixed(3)),
+    animSpeed: opts.existingMeta?.animSpeed ?? 1,
+    thumbnailDataUrl: thumbnailDataUrl ?? opts.existingMeta?.thumbnailDataUrl,
+    createdAt: opts.existingMeta?.createdAt ?? new Date().toISOString(),
+  };
+
+  notifyAssetCache();
+  return { meta, buffer: opts.buffer };
 }
 
 export function getCachedAssetSync(assetId?: string): CachedGLTF | null {

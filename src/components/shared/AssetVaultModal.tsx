@@ -70,6 +70,7 @@ const CATEGORIES: { id: AssetCategory; label: string; hint: string }[] = [
   { id: 'character', label: 'Character / Rig', hint: 'Hero, NPC, Baddie' },
   { id: 'prop', label: 'Prop', hint: 'Chest, crate, artifact' },
   { id: 'scenery', label: 'Scenery', hint: 'Trees, ruins, rocks' },
+  { id: 'plant', label: 'Plant', hint: 'Foliage, shrubs, flowers' },
 ];
 
 const FACING_PRESETS = [0, 90, 180, -90];

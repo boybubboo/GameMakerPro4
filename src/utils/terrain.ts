@@ -688,44 +688,68 @@ function buildLevelColliderGrid(level: GameLevel): CachedLevelColliderGrid {
 
       if (ent.buildingBlock) {
         const shape = ent.buildingBlock.shape;
-        if (shape === 'floorTile' || shape === 'stairsStraight' || shape === 'trapdoor' || shape === 'wallTorch') {
-          continue; // Walkable surfaces / wall sconces
+        const bx = s * Math.max(0.1, Math.min(8, ent.buildingBlock.scaleX ?? 1));
+        const by = s * Math.max(0.1, Math.min(8, ent.buildingBlock.scaleY ?? 1));
+        const bz = s * Math.max(0.1, Math.min(8, ent.buildingBlock.scaleZ ?? 1));
+        if (
+          shape === 'floorTile' ||
+          shape === 'stairsStraight' ||
+          shape === 'porchSteps' ||
+          shape === 'beamLarge' ||
+          shape === 'beamSmall' ||
+          shape === 'plankTrim' ||
+          shape === 'trapdoor' ||
+          shape === 'wallTorch'
+        ) {
+          continue; // Walkable surfaces / trim beams / wall sconces
         }
         if (shape === 'wallCube') {
-          addObbCollider(cells, wx, wz, yaw, 1.0 * s, 1.0 * s, undefined, baseY, baseY + 2.0 * s);
+          addObbCollider(cells, wx, wz, yaw, 1.0 * bx, 1.0 * bz, undefined, baseY, baseY + 2.0 * by);
+        } else if (shape === 'wallCubeHalf') {
+          addObbCollider(cells, wx, wz, yaw, 0.5 * bx, 0.5 * bz, undefined, baseY, baseY + 1.0 * by);
         } else if (shape === 'halfWall') {
-          addObbCollider(cells, wx, wz, yaw, 1.0 * s, 0.35 * s, undefined, baseY, baseY + 1.0 * s);
+          addObbCollider(cells, wx, wz, yaw, 1.0 * bx, 0.35 * bz, undefined, baseY, baseY + 1.0 * by);
+        } else if (shape === 'fence') {
+          addObbCollider(cells, wx, wz, yaw, 1.0 * bx, 0.2 * bz, undefined, baseY, baseY + 1.0 * by);
         } else if (shape === 'pillar') {
-          addCircleCollider(cells, wx, wz, 0.42 * s, { minY: baseY, maxY: baseY + 2.0 * s });
+          if (Math.abs(bx - bz) > 0.15) {
+            addObbCollider(cells, wx, wz, yaw, 0.42 * bx, 0.42 * bz, undefined, baseY, baseY + 2.0 * by);
+          } else {
+            addCircleCollider(cells, wx, wz, 0.42 * Math.max(bx, bz), { minY: baseY, maxY: baseY + 2.0 * by });
+          }
         } else if (shape === 'windowWall') {
-          addObbCollider(cells, wx, wz, yaw, 1.0 * s, 0.28 * s, undefined, baseY, baseY + 2.0 * s);
+          addObbCollider(cells, wx, wz, yaw, 1.0 * bx, 0.28 * bz, undefined, baseY, baseY + 2.0 * by);
+        } else if (shape === 'roofGable') {
+          addObbCollider(cells, wx, wz, yaw, 1.0 * bx, 0.26 * bz, undefined, baseY, baseY + 1.35 * by);
+        } else if (shape === 'roofAFrame' || shape === 'roofSlope') {
+          addObbCollider(cells, wx, wz, yaw, 1.08 * bx, 1.04 * bz, undefined, baseY + 0.1 * by, baseY + 1.38 * by);
         } else if (shape === 'archway') {
           const cos = Math.cos(yaw);
           const sin = Math.sin(yaw);
           addObbCollider(
             cells,
-            wx - 0.8 * s * cos,
-            wz + 0.8 * s * sin,
+            wx - 0.8 * bx * cos,
+            wz + 0.8 * bx * sin,
             yaw,
-            0.22 * s,
-            0.36 * s,
+            0.22 * bx,
+            0.36 * bz,
             undefined,
             baseY,
-            baseY + 2.2 * s
+            baseY + 2.2 * by
           );
           addObbCollider(
             cells,
-            wx + 0.8 * s * cos,
-            wz - 0.8 * s * sin,
+            wx + 0.8 * bx * cos,
+            wz - 0.8 * bx * sin,
             yaw,
-            0.22 * s,
-            0.36 * s,
+            0.22 * bx,
+            0.36 * bz,
             undefined,
             baseY,
-            baseY + 2.2 * s
+            baseY + 2.2 * by
           );
         } else if (shape === 'stairsSpiral') {
-          addCircleCollider(cells, wx, wz, 0.25 * s, { minY: baseY, maxY: baseY + 2.1 * s });
+          addCircleCollider(cells, wx, wz, 0.25 * Math.max(bx, bz), { minY: baseY, maxY: baseY + 2.1 * by });
         }
         continue;
       }

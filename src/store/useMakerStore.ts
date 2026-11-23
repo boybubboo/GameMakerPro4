@@ -17,7 +17,11 @@ import {
   WidgetKindMeta,
 } from '../data/registries';
 import type { FxLibraryTemplate } from '../data/fxEffectLibrary';
-import { parseUploadedGlbFile } from '../three/gltfAssetManager';
+import {
+  parseUploadedGlbFile,
+  registerGeneratedGlbAsset,
+} from '../three/gltfAssetManager';
+import { setCustomAssetThumbnailCache } from '../three/assetThumbnailer';
 import {
   collectReferencedTextureIds,
   evictCustomTexture,
@@ -38,6 +42,7 @@ import type {
   CustomTextureResolution,
   DoorConfig,
   EntityKind,
+  EntityMaterialVariant,
   EntitySection,
   ExportedAssetBundle,
   ExportedTextureBundle,
@@ -51,6 +56,7 @@ import type {
   ItemMetadata,
   LevelEntity,
   MakerIssue,
+  ObjectMakerDoc,
   ObjectMechanism,
   PlayerTelemetry,
   RuleRecipe,
@@ -70,7 +76,11 @@ import type {
   VisualStyleId,
   WidgetKind,
 } from '../types/maker';
-import { BUILDING_SHAPES, DEFAULT_DOOR_CONFIG } from '../three/buildingBlocks';
+import {
+  BUILDING_SHAPES,
+  DEFAULT_DOOR_CONFIG,
+  inferRoofStyleFromMaterial,
+} from '../three/buildingBlocks';
 
 type LiveTelemetryListener = (telemetry: PlayerTelemetry | null) => void;
 let currentLivePlayerTelemetry: PlayerTelemetry | null = null;
@@ -158,6 +168,7 @@ const ORGANIC_MOSS_MIGRATION_KEY = 'maker.organicMoss.v1';
 const MOUNTAIN_CAVE_MIGRATION_KEY = 'maker.mountainCave.v1';
 const INVENTORY_STARTER_MIGRATION_KEY = 'maker.inventoryStarter.v1';
 const LUSH_FLORA_MIGRATION_KEY = 'maker.lushFlora.v1';
+const DUNGEON_BUILDER_FRONT_CAM_MIGRATION_KEY = 'maker.dungeonBuilderFrontCam.v1';
 
 interface HistorySnapshot {
   label: string;
@@ -260,6 +271,8 @@ function loadInitialProjects(): GameProject[] {
         const shouldMountainCave = localStorage.getItem(MOUNTAIN_CAVE_MIGRATION_KEY) !== '1';
         const shouldInventoryStarter = localStorage.getItem(INVENTORY_STARTER_MIGRATION_KEY) !== '1';
         const shouldLushFlora = localStorage.getItem(LUSH_FLORA_MIGRATION_KEY) !== '1';
+        const shouldDungeonBuilderFrontCam =
+          localStorage.getItem(DUNGEON_BUILDER_FRONT_CAM_MIGRATION_KEY) !== '1';
         const migrated = parsed.map((p) => {
           const base = migrateProject(p);
           if (
@@ -267,7 +280,8 @@ function loadInitialProjects(): GameProject[] {
             !shouldOrganicMoss &&
             !shouldMountainCave &&
             !shouldInventoryStarter &&
-            !shouldLushFlora
+            !shouldLushFlora &&
+            !shouldDungeonBuilderFrontCam
           ) {
             return base;
           }
@@ -326,6 +340,19 @@ function loadInitialProjects(): GameProject[] {
                   entities: [...updatedEntities, ...createStarterOpenWorldPickups()],
                 };
               }
+              if (
+                shouldDungeonBuilderFrontCam &&
+                env === 'dungeon' &&
+                nextLvl.gameplayMode !== 'roguelike' &&
+                nextLvl.cameraMode === 'chase' &&
+                (nextLvl.name.includes('Crypt Keep') ||
+                  nextLvl.entities.some((e) => Boolean(e.buildingBlock)))
+              ) {
+                nextLvl = {
+                  ...nextLvl,
+                  cameraMode: 'front',
+                };
+              }
               return nextLvl;
             }),
           };
@@ -344,6 +371,9 @@ function loadInitialProjects(): GameProject[] {
         }
         if (shouldLushFlora) {
           localStorage.setItem(LUSH_FLORA_MIGRATION_KEY, '1');
+        }
+        if (shouldDungeonBuilderFrontCam) {
+          localStorage.setItem(DUNGEON_BUILDER_FRONT_CAM_MIGRATION_KEY, '1');
         }
         return migrated;
       }
@@ -411,7 +441,7 @@ export function useMakerStore() {
   const [rehearseSkitId, setRehearseSkitId] = useState<string | null>(null);
 
   const [worldTool, setWorldTool] = useState<ViewportTool>('move');
-  const [worldGridSnap, setWorldGridSnap] = useState<0 | 1 | 2>(1);
+  const [worldGridSnap, setWorldGridSnap] = useState<0 | 0.5 | 1 | 2>(1);
   const [terrainBrush, setTerrainBrush] = useState<TerrainBrush>('raiseGround');
   const [terrainBrushRadius, setTerrainBrushRadius] = useState<number>(5.5);
   const [terrainBrushStrength, setTerrainBrushStrength] = useState<number>(0.75);
@@ -430,7 +460,8 @@ export function useMakerStore() {
     Record<string, { durability: number; maxDurability: number }>
   >({});
   const [motionAssetId, setMotionAssetId] = useState<string | null>(null);
-  const [interactionAssetId, setInteractionAssetId] = useState<string | null>(null);
+  const [objectMakerOpen, setObjectMakerOpen] = useState(false);
+  const [objectMakerTargetAssetId, setObjectMakerTargetAssetId] = useState<string | null>(null);
   const [isPlaying, setIsPlaying] = useState(false);
   const [playModalOpen, setPlayModalOpen] = useState(false);
   const [playFromPoint, setPlayFromPoint] = useState<BoardPoint | null>(null);
@@ -638,6 +669,44 @@ export function useMakerStore() {
     await updateAssetMetaRecord(meta);
     setCustomAssets((prev) => prev.map((a) => (a.id === meta.id ? meta : a)));
   }, []);
+
+  const saveGeneratedAsset = useCallback(
+    async (opts: {
+      existingAssetId?: string;
+      name: string;
+      category: AssetCategory;
+      buffer: ArrayBuffer;
+      mechanisms?: ObjectMechanism[];
+      objectRecipe?: ObjectMakerDoc;
+      keepMetricScale?: boolean;
+    }): Promise<CustomAssetMeta> => {
+      const existingMeta = opts.existingAssetId
+        ? customAssets.find((a) => a.id === opts.existingAssetId)
+        : undefined;
+      const { meta, buffer } = await registerGeneratedGlbAsset({
+        existingMeta,
+        name: opts.name,
+        category: opts.category,
+        buffer: opts.buffer,
+        mechanisms: opts.mechanisms,
+        objectRecipe: opts.objectRecipe,
+        keepMetricScale: opts.keepMetricScale ?? true,
+      });
+      await saveAssetRecord(meta, buffer);
+      if (meta.thumbnailDataUrl) {
+        setCustomAssetThumbnailCache(meta.id, meta.thumbnailDataUrl);
+      }
+      setCustomAssets((prev) => {
+        const idx = prev.findIndex((a) => a.id === meta.id);
+        if (idx >= 0) {
+          return prev.map((a) => (a.id === meta.id ? meta : a));
+        }
+        return [meta, ...prev];
+      });
+      return meta;
+    },
+    [customAssets]
+  );
 
   const removeCustomAsset = useCallback(async (id: string) => {
     await deleteAssetRecord(id);
@@ -939,28 +1008,49 @@ export function useMakerStore() {
 
   const addBuildingBlockEntity = useCallback(
     (
-      shapeOrDoor: BuildingShapeId | 'door',
+      shapeOrDoor: BuildingShapeId | 'door' | 'rusticDoor',
       material: BuildingMaterialId,
       pos: { x: number; y: number },
       opts: {
         elevationY?: number;
         rotation?: number;
+        scale?: number;
         name?: string;
-        doorConfig?: DoorConfig;
+        doorConfig?: Partial<DoorConfig>;
         buildingBlockPatch?: Partial<BuildingBlockConfig>;
+        materialVariant?: EntityMaterialVariant;
       } = {}
     ) => {
-      if (shapeOrDoor === 'door') {
+      if (shapeOrDoor === 'door' || shapeOrDoor === 'rusticDoor') {
+        const isRustic = shapeOrDoor === 'rusticDoor';
         const doorCfg: DoorConfig = {
           ...DEFAULT_DOOR_CONFIG,
-          frameMaterial: material,
+          ...(isRustic
+            ? {
+                frameShape: 'rectangular',
+                leafStyle: 'rusticWood',
+                openMode: 'hingedSide',
+                frameMaterial:
+                  material === 'timberPlank' || material === 'roundLogs' || material === 'weatheredSlats'
+                    ? material
+                    : 'timberPlank',
+              }
+            : { frameMaterial: material }),
           ...opts.doorConfig,
         };
-        const entity = createEntity('door', opts.name ?? 'Dungeon Door', pos.x, pos.y, {
-          rotation: opts.rotation ?? 0,
-          elevationY: opts.elevationY,
-          doorConfig: doorCfg,
-        });
+        const entity = createEntity(
+          'door',
+          opts.name ?? (isRustic ? 'Rustic Front Door' : 'Dungeon Door'),
+          pos.x,
+          pos.y,
+          {
+            rotation: opts.rotation ?? 0,
+            scale: opts.scale ?? 1,
+            elevationY: opts.elevationY,
+            doorConfig: doorCfg,
+            ...(opts.materialVariant ? { materialVariant: { ...opts.materialVariant } } : {}),
+          }
+        );
         updateLevel(`place ${entity.name}`, (lvl) => ({
           ...lvl,
           entities: [...lvl.entities, entity],
@@ -969,16 +1059,38 @@ export function useMakerStore() {
         return entity;
       }
 
-      const shapeMeta = BUILDING_SHAPES.find((s) => s.id === shapeOrDoor) ?? BUILDING_SHAPES[0];
-      const kind: EntityKind = shapeOrDoor === 'wallTorch' ? 'light' : 'prop';
-      const entity = createEntity(kind, opts.name ?? shapeMeta.defaultName, pos.x, pos.y, {
+      const resolvedShape: BuildingShapeId =
+        material === 'sandstone'
+          ? shapeOrDoor === 'wallCubeHalf'
+            ? 'wallCubeHalf'
+            : 'wallCube'
+          : shapeOrDoor;
+      const shapeMeta = BUILDING_SHAPES.find((s) => s.id === resolvedShape) ?? BUILDING_SHAPES[0];
+      const kind: EntityKind = resolvedShape === 'wallTorch' ? 'light' : 'prop';
+      const isRoof = resolvedShape === 'roofAFrame' || resolvedShape === 'roofSlope';
+      const isBeam =
+        resolvedShape === 'beamLarge' || resolvedShape === 'beamSmall' || resolvedShape === 'plankTrim';
+      const defaultName =
+        material === 'sandstone'
+          ? resolvedShape === 'wallCubeHalf'
+            ? 'Half Sandstone Cube'
+            : 'Sandstone Cube'
+          : shapeMeta.defaultName;
+      const entity = createEntity(kind, opts.name ?? defaultName, pos.x, pos.y, {
         rotation: opts.rotation ?? 0,
+        scale: opts.scale ?? 1,
         elevationY: opts.elevationY,
+        ...(opts.materialVariant ? { materialVariant: { ...opts.materialVariant } } : {}),
         buildingBlock: {
-          shape: shapeOrDoor,
+          shape: resolvedShape,
           material,
-          ...(shapeOrDoor === 'archway' ? { archStyle: 'arched' } : {}),
-          ...(shapeOrDoor === 'windowWall' ? { windowStyle: 'barred' } : {}),
+          ...(material === 'sandstone' ? { edgeWear: 0.35 } : {}),
+          ...(resolvedShape === 'archway' ? { archStyle: 'arched' } : {}),
+          ...(resolvedShape === 'windowWall' ? { windowStyle: 'barred' } : {}),
+          ...(isRoof ? { roofStyle: inferRoofStyleFromMaterial(material), roofMedievalTruss: true } : {}),
+          ...(resolvedShape === 'roofGable' ? { roofMedievalTruss: true } : {}),
+          ...(resolvedShape === 'fence' ? { fenceStyle: 'rail' } : {}),
+          ...(isBeam ? { beamOrientation: 'horizontal' } : {}),
           ...opts.buildingBlockPatch,
         },
       });
@@ -988,6 +1100,19 @@ export function useMakerStore() {
       }));
       setSelectedEntityID(entity.id);
       return entity;
+    },
+    [updateLevel]
+  );
+
+  const addEntitiesBatch = useCallback(
+    (undoLabel: string, entities: LevelEntity[]) => {
+      if (entities.length === 0) return [];
+      updateLevel(undoLabel, (lvl) => ({
+        ...lvl,
+        entities: [...lvl.entities, ...entities],
+      }));
+      setSelectedEntityID(entities[0].id);
+      return entities;
     },
     [updateLevel]
   );
@@ -2420,6 +2545,7 @@ export function useMakerStore() {
     importSavePresetsFile,
     uploadCustomGlb,
     updateCustomAssetMeta,
+    saveGeneratedAsset,
     removeCustomAsset,
     uploadCustomTexture,
     resizeCustomTexture,
@@ -2447,12 +2573,15 @@ export function useMakerStore() {
       setShowingAssetVault(false);
       setSelectedTab('motion');
     },
-    interactionAssetId,
-    setInteractionAssetId,
-    openInteractionDesigner: (assetId?: string) => {
-      if (assetId) setInteractionAssetId(assetId);
+    objectMakerOpen,
+    setObjectMakerOpen,
+    objectMakerTargetAssetId,
+    setObjectMakerTargetAssetId,
+    openObjectMaker: (assetId?: string) => {
+      setObjectMakerTargetAssetId(assetId ?? null);
       setShowingAssetVault(false);
-      setSelectedTab('interact');
+      setSelectedTab('world');
+      setObjectMakerOpen(true);
     },
     isPlaying,
     setIsPlaying,
@@ -2483,6 +2612,7 @@ export function useMakerStore() {
     applyBrush,
     resetTerrain,
     addEntity,
+    addEntitiesBatch,
     addBuildingBlockEntity,
     addFxTemplateAtPoint,
     addCanopyTreeEntity,

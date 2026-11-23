@@ -907,7 +907,17 @@ export function applyObjectWearDeformation(root: THREE.Object3D, wearFactor: num
 
     const pArr = pos.array as Float32Array;
     const sArr = smoothNorm!;
-    const maxDent = Math.min(0.11, (geoScale ?? 1.0) * 0.068) * clamped;
+    if (!geo.boundingBox) geo.computeBoundingBox();
+    const bbMin = geo.boundingBox?.min;
+    const bbMax = geo.boundingBox?.max;
+    const bCx = bbMin && bbMax ? (bbMin.x + bbMax.x) * 0.5 : 0;
+    const bCy = bbMin && bbMax ? (bbMin.y + bbMax.y) * 0.5 : 0;
+    const bCz = bbMin && bbMax ? (bbMin.z + bbMax.z) * 0.5 : 0;
+    const bHx = bbMin && bbMax ? Math.max(0.1, (bbMax.x - bbMin.x) * 0.5) : 1;
+    const bHy = bbMin && bbMax ? Math.max(0.1, (bbMax.y - bbMin.y) * 0.5) : 1;
+    const bHz = bbMin && bbMax ? Math.max(0.1, (bbMax.z - bbMin.z) * 0.5) : 1;
+
+    const maxDent = Math.min(0.14, (geoScale ?? 1.0) * 0.082) * clamped;
     const invScale = 1.0 / Math.max(0.35, (geoScale ?? 1.0) * 0.55);
 
     for (let i = 0; i < pos.count; i++) {
@@ -919,16 +929,24 @@ export function applyObjectWearDeformation(root: THREE.Object3D, wearFactor: num
       const sy = vy * invScale;
       const sz = vz * invScale;
 
+      // Normalized distance along the 2nd-closest bounding axis identifies bevels/edges/corners
+      const ax = Math.abs(vx - bCx) / bHx;
+      const ay = Math.abs(vy - bCy) / bHy;
+      const az = Math.abs(vz - bCz) / bHz;
+      let secondAxis = ax <= ay ? (ay <= az ? ay : Math.max(ax, az)) : (ax <= az ? ax : Math.max(ay, az));
+      secondAxis = THREE.MathUtils.clamp(secondAxis, 0, 1);
+      const edgeProx = Math.max(0, (secondAxis - 0.65) / 0.35);
+
       // Multi-pocket impact dings + diagonal scratch gouges (same inputs for shared corners)
       const dingWave =
         Math.sin(sx * 4.3 + sy * 2.1) * Math.cos(sz * 4.7 - sy * 1.9) * 0.6 +
         Math.sin(sx * 8.9 - sz * 7.3 + sy * 5.1) * 0.4;
-      const pocket = Math.max(0, dingWave * 0.5 + 0.5 - (0.72 - clamped * 0.34));
+      const pocket = Math.max(0, dingWave * 0.5 + 0.5 - (0.72 - clamped * 0.36 - edgeProx * 0.14));
       const gougeLine = Math.max(
         0,
         Math.abs(Math.sin(sx * 6.5 + sy * 9.5 + sz * 3.1)) - (0.94 - clamped * 0.14)
       );
-      const disp = Math.min(1.0, pocket * 2.6 + gougeLine * 3.2) * maxDent;
+      const disp = Math.min(1.0, (pocket * 2.6 + gougeLine * 3.2) * (1 + edgeProx * 0.95)) * maxDent;
 
       pArr[i3] = vx - sArr[i3] * disp;
       pArr[i3 + 1] = vy - sArr[i3 + 1] * disp;

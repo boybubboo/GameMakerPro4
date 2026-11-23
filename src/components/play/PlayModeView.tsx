@@ -1716,6 +1716,7 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
     dom.addEventListener('pointerdown', onPointerDown);
     window.addEventListener('pointermove', onPointerMove);
     window.addEventListener('pointerup', onPointerUp);
+    window.addEventListener('pointercancel', onPointerUp);
     dom.addEventListener('wheel', onWheel, { passive: true });
 
     const showToast = (msg: string) => {
@@ -3661,13 +3662,15 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
             let worldDZ = 0;
 
             if (camModeNow === 'front') {
-              // Auto-right camera smoothly into straight-ahead view whenever joystick/movement is active
-              const wrappedOffset = Math.atan2(
-                Math.sin(inp.lookYawOffset),
-                Math.cos(inp.lookYawOffset)
-              );
-              inp.lookYawOffset = THREE.MathUtils.damp(wrappedOffset, 0, 8.5, dt);
-              inp.lookPitchOffset = THREE.MathUtils.damp(inp.lookPitchOffset, 0, 7.0, dt);
+              // Auto-right camera smoothly into straight-ahead view whenever travelling (unless actively dragging)
+              if (!draggingCam) {
+                const wrappedOffset = Math.atan2(
+                  Math.sin(inp.lookYawOffset),
+                  Math.cos(inp.lookYawOffset)
+                );
+                inp.lookYawOffset = THREE.MathUtils.damp(wrappedOffset, 0, 8.5, dt);
+                inp.lookPitchOffset = THREE.MathUtils.damp(inp.lookPitchOffset, 0, 7.0, dt);
+              }
 
               // Hero always faces forward; steering left/right turns the hero + world scene
               const steerX = THREE.MathUtils.clamp(moveX, -1, 1);
@@ -7670,6 +7673,7 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
       dom.removeEventListener('pointerdown', onPointerDown);
       window.removeEventListener('pointermove', onPointerMove);
       window.removeEventListener('pointerup', onPointerUp);
+      window.removeEventListener('pointercancel', onPointerUp);
       dom.removeEventListener('wheel', onWheel);
       timer.dispose();
       islandHandlesRef?.grassSystem?.dispose();

@@ -2763,7 +2763,7 @@ function buildDungeonBuilderProject(name: string): GameProject {
     style: 'roomChain',
     environmentType: 'dungeon',
     visualStyle: 'painterlyPBR',
-    cameraMode: 'chase',
+    cameraMode: 'front',
     biome: 'cave',
     sky: 'cave',
     sunAngle: 32,

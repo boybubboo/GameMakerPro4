@@ -28,6 +28,7 @@ import {
 interface FxLibraryPanelProps {
   templates: FxLibraryTemplate[];
   activePlaceTemplateId: string | null;
+  wideMode?: boolean;
   onSelectPlaceTemplate: (template: FxLibraryTemplate | null) => void;
   onQuickPlaceCenter: (template: FxLibraryTemplate) => void;
   onDragStartTemplate: (template: FxLibraryTemplate) => void;
@@ -80,6 +81,7 @@ function FxTemplateGlyph({ icon, size = 16 }: { icon: FxLibraryIconKey; size?: n
 export const FxLibraryPanel: React.FC<FxLibraryPanelProps> = ({
   templates,
   activePlaceTemplateId,
+  wideMode = false,
   onSelectPlaceTemplate,
   onQuickPlaceCenter,
   onDragStartTemplate,
@@ -108,11 +110,39 @@ export const FxLibraryPanel: React.FC<FxLibraryPanelProps> = ({
     });
   }, [templates, category, query]);
 
+  const categoryButtons = (
+    <div className="flex items-center gap-1 overflow-x-auto pb-0.5 maker-scroll">
+      {CATEGORY_TABS.map((cat) => {
+        if (cat === 'custom' && customCount === 0) return null;
+        const active = category === cat;
+        return (
+          <button
+            key={cat}
+            type="button"
+            onClick={() => setCategory(cat)}
+            className={`shrink-0 px-2 py-0.5 rounded-lg text-[10px] font-bold transition-colors ${
+              active
+                ? 'bg-[#7C5CFF] text-white'
+                : 'bg-slate-100 dark:bg-[#10131B] text-slate-600 dark:text-[#949BB0] hover:text-slate-900 dark:hover:text-white'
+            }`}
+          >
+            {FX_LIBRARY_CATEGORY_LABELS[cat]}
+            {cat === 'custom' && customCount > 0 ? ` (${customCount})` : ''}
+          </button>
+        );
+      })}
+    </div>
+  );
+
   return (
-    <div className="rounded-2xl bg-white dark:bg-[#171A23] border border-slate-200/80 dark:border-white/[0.09] p-3 space-y-2.5 shadow-sm">
-      {/* Header row */}
+    <div
+      className={`rounded-2xl bg-white dark:bg-[#171A23] border border-slate-200/80 dark:border-white/[0.09] shadow-sm ${
+        wideMode ? 'p-2 space-y-1.5' : 'p-2.5 space-y-2'
+      }`}
+    >
+      {/* Header row (combines category tabs inline when wideMode is active) */}
       <div className="flex flex-wrap items-center justify-between gap-2">
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2 shrink-0">
           <div className="w-6 h-6 rounded-lg bg-[#7C5CFF]/15 text-[#7C5CFF] flex items-center justify-center">
             <Sparkles size={13} />
           </div>
@@ -120,13 +150,17 @@ export const FxLibraryPanel: React.FC<FxLibraryPanelProps> = ({
             <div className="text-xs font-extrabold text-slate-900 dark:text-white leading-tight">
               Particle FX Library
             </div>
-            <div className="text-[10px] font-medium text-slate-500 dark:text-[#8E96AB]">
-              Drag any effect directly onto the 3D scene — or click a card to stamp it
-            </div>
+            {!wideMode && (
+              <div className="text-[10px] font-medium text-slate-500 dark:text-[#8E96AB]">
+                Drag any effect directly onto the 3D scene — or click a card to stamp it
+              </div>
+            )}
           </div>
         </div>
 
-        <div className="flex items-center gap-1.5">
+        {wideMode && <div className="flex-1 min-w-0 px-1">{categoryButtons}</div>}
+
+        <div className="flex items-center gap-1.5 shrink-0">
           <div className="relative">
             <Search
               size={12}
@@ -137,13 +171,13 @@ export const FxLibraryPanel: React.FC<FxLibraryPanelProps> = ({
               value={query}
               onChange={(e) => setQuery(e.target.value)}
               placeholder="Filter FX..."
-              className="w-32 sm:w-40 pl-7 pr-2.5 py-1 rounded-lg bg-slate-100 dark:bg-[#10131B] border border-slate-200/80 dark:border-white/[0.08] text-[11px] font-semibold outline-none focus:border-[#7C5CFF]"
+              className="w-32 sm:w-36 pl-7 pr-2.5 py-1 rounded-lg bg-slate-100 dark:bg-[#10131B] border border-slate-200/80 dark:border-white/[0.08] text-[11px] font-semibold outline-none focus:border-[#7C5CFF]"
             />
           </div>
           <button
             type="button"
             onClick={onClose}
-            className="p-1.5 rounded-lg text-slate-400 hover:text-slate-700 dark:hover:text-white hover:bg-slate-100 dark:hover:bg-white/[0.06]"
+            className="p-1 rounded-lg text-slate-400 hover:text-slate-700 dark:hover:text-white hover:bg-slate-100 dark:hover:bg-white/[0.06]"
             title="Close FX Library"
           >
             <X size={14} />
@@ -151,36 +185,16 @@ export const FxLibraryPanel: React.FC<FxLibraryPanelProps> = ({
         </div>
       </div>
 
-      {/* Category tabs */}
-      <div className="flex items-center gap-1 overflow-x-auto pb-0.5 maker-scroll">
-        {CATEGORY_TABS.map((cat) => {
-          if (cat === 'custom' && customCount === 0) return null;
-          const active = category === cat;
-          return (
-            <button
-              key={cat}
-              type="button"
-              onClick={() => setCategory(cat)}
-              className={`shrink-0 px-2.5 py-1 rounded-lg text-[11px] font-bold transition-colors ${
-                active
-                  ? 'bg-[#7C5CFF] text-white'
-                  : 'bg-slate-100 dark:bg-[#10131B] text-slate-600 dark:text-[#949BB0] hover:text-slate-900 dark:hover:text-white'
-              }`}
-            >
-              {FX_LIBRARY_CATEGORY_LABELS[cat]}
-              {cat === 'custom' && customCount > 0 ? ` (${customCount})` : ''}
-            </button>
-          );
-        })}
-      </div>
+      {/* Category tabs on separate row only when narrow */}
+      {!wideMode && categoryButtons}
 
       {/* Draggable FX Cards strip */}
       {filtered.length === 0 ? (
-        <div className="py-5 text-center text-xs font-semibold text-slate-400 dark:text-[#7E879E]">
+        <div className="py-3 text-center text-xs font-semibold text-slate-400 dark:text-[#7E879E]">
           No particle effects match "{query}".
         </div>
       ) : (
-        <div className="flex gap-2 overflow-x-auto pb-1 maker-scroll">
+        <div className="flex gap-1.5 overflow-x-auto pb-0.5 maker-scroll">
           {filtered.map((tpl) => {
             const isSelectedForClickDrop = activePlaceTemplateId === tpl.id;
             const layerCount = tpl.layers.length;
@@ -206,7 +220,9 @@ export const FxLibraryPanel: React.FC<FxLibraryPanelProps> = ({
                     onSelectPlaceTemplate(isSelectedForClickDrop ? null : tpl);
                   }
                 }}
-                className={`group relative shrink-0 w-44 rounded-xl border p-2.5 text-left transition-all cursor-grab active:cursor-grabbing select-none ${
+                className={`group relative shrink-0 rounded-xl border text-left transition-all cursor-grab active:cursor-grabbing select-none ${
+                  wideMode ? 'w-44 p-2' : 'w-44 p-2.5'
+                } ${
                   isSelectedForClickDrop
                     ? 'bg-[#7C5CFF]/12 border-[#7C5CFF] ring-1 ring-[#7C5CFF]/40'
                     : 'bg-slate-50/90 dark:bg-[#11141D] border-slate-200/80 dark:border-white/[0.08] hover:border-[#7C5CFF]/70 hover:bg-white dark:hover:bg-[#1A1F2D]'
@@ -215,12 +231,14 @@ export const FxLibraryPanel: React.FC<FxLibraryPanelProps> = ({
                 <div className="flex items-start justify-between gap-1.5">
                   <div className="flex items-center gap-2 min-w-0">
                     <div
-                      className="w-8 h-8 rounded-lg shrink-0 flex items-center justify-center text-white shadow-sm"
+                      className={`rounded-lg shrink-0 flex items-center justify-center text-white shadow-sm ${
+                        wideMode ? 'w-7 h-7' : 'w-8 h-8'
+                      }`}
                       style={{
                         background: `linear-gradient(135deg, ${tpl.accentHex}, ${tpl.secondaryHex})`,
                       }}
                     >
-                      <FxTemplateGlyph icon={tpl.icon} size={15} />
+                      <FxTemplateGlyph icon={tpl.icon} size={wideMode ? 14 : 15} />
                     </div>
                     <div className="min-w-0">
                       <div className="text-xs font-extrabold text-slate-900 dark:text-white truncate">
@@ -237,11 +255,15 @@ export const FxLibraryPanel: React.FC<FxLibraryPanelProps> = ({
                   />
                 </div>
 
-                <p className="mt-1.5 text-[10px] leading-snug text-slate-500 dark:text-[#949BB0] line-clamp-2">
+                <p
+                  className={`text-[10px] leading-snug text-slate-500 dark:text-[#949BB0] ${
+                    wideMode ? 'mt-1 line-clamp-1' : 'mt-1.5 line-clamp-2'
+                  }`}
+                >
                   {tpl.summary}
                 </p>
 
-                <div className="mt-2 flex items-center justify-between gap-1">
+                <div className={`flex items-center justify-between gap-1 ${wideMode ? 'mt-1' : 'mt-2'}`}>
                   <span
                     className="text-[10px] font-bold"
                     style={{ color: isSelectedForClickDrop ? '#7C5CFF' : tpl.accentHex }}

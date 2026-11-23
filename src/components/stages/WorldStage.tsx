@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   Box,
   Clock,
@@ -8,12 +8,17 @@ import {
   Mountain,
   Move,
   Paintbrush,
+  PanelLeftClose,
+  PanelLeftOpen,
   Play,
   Plus,
   RotateCcw,
   RotateCw,
   Scaling,
+  Shapes,
+  SlidersHorizontal,
   Sparkles,
+  Spline,
   Trash2,
   Trees,
 } from 'lucide-react';
@@ -38,6 +43,7 @@ import {
   VistaPresets,
   VistaPropKinds,
   WeatherOptions,
+  createEntity,
   defaultStorybookConfig,
 } from '../../data/registries';
 import { DEFAULT_ROGUELIKE_CONFIG } from '../../data/roguelikeEngine';
@@ -53,11 +59,15 @@ import {
 } from '../../services/DungeonGenerator';
 import type { MakerStore } from '../../store/useMakerStore';
 import type {
+  BeamOrientation,
+  BuildingBlockConfig,
   BuildingMaterialId,
   BuildingShapeId,
   CameraMode,
   CarPresetId,
   CreatureBodyId,
+  CurveGuideConfig,
+  CurveGuidePresetId,
   DoorConfig,
   DoorFrameShape,
   DoorLeafStyle,
@@ -71,11 +81,15 @@ import type {
   DungeonTrapStyle,
   DungeonWallStyle,
   EntityKind,
+  EntityMaterialVariant,
   EnvironmentType,
+  FenceStyleId,
   GameplayMode,
   GrassFieldConfig,
   GrassQuality,
+  LevelEntity,
   PropPresetId,
+  RoofStyleId,
   StorybookThemeId,
   TerrainBrush,
   ViewportTool,
@@ -88,7 +102,16 @@ import {
   BUILDING_MATERIALS,
   BUILDING_SHAPES,
   DEFAULT_DOOR_CONFIG,
+  getBuildingShapeBaseSize,
+  inferRoofStyleFromMaterial,
+  roofStyleToMaterial,
 } from '../../three/buildingBlocks';
+import {
+  computeCurveLength,
+  createCurvePresetPoints,
+  createDefaultCurveGuide,
+  sampleCurveTransforms,
+} from '../../three/curveGuide';
 import {
   CAR_PRESETS,
   DRIVER_TYPES,
@@ -101,6 +124,7 @@ import {
   applySlopeAutoWeathering,
   createInitialTerrain,
   getEnvironmentType,
+  levelWorldToBoard,
   uid,
 } from '../../utils/terrain';
 import { CanopyTreeInspector } from '../shared/CanopyTreeInspector';
@@ -113,7 +137,9 @@ import { MakerIcon } from '../shared/IconMap';
 import { FieldLabel, MakerCard } from '../shared/MakerUI';
 import { CanopyEngineModal } from '../world/CanopyEngineModal';
 import { FxLibraryPanel } from '../world/FxLibraryPanel';
+import { LeftAssetsPanel } from '../world/LeftAssetsPanel';
 import { LevelMapModal } from '../world/LevelMapModal';
+import { ObjectMakerModal } from '../world/ObjectMakerModal';
 import { PostProcessingPanel } from '../world/PostProcessingPanel';
 import { TextureStudioModal } from '../world/TextureStudioModal';
 import { VertexPaintModal } from '../world/VertexPaintModal';
@@ -191,8 +217,32 @@ export const WorldStage: React.FC<{ store: MakerStore }> = ({ store }) => {
   const [dropKind, setDropKind] = useState<EntityKind>('treasure');
   const [dropCustomAssetId, setDropCustomAssetId] = useState<string>('');
   const [addPaletteMode, setAddPaletteMode] = useState<'blocks' | 'entities'>('blocks');
-  const [activeBuildShape, setActiveBuildShape] = useState<BuildingShapeId | 'door'>('wallCube');
+  const [activeBuildShape, setActiveBuildShape] = useState<BuildingShapeId | 'door' | 'rusticDoor'>('wallCube');
   const [activeBuildMaterial, setActiveBuildMaterial] = useState<BuildingMaterialId>('hewnStone');
+  const [keepToolAdjustments, setKeepToolAdjustments] = useState(false);
+  const [activeBlockAdjustments, setActiveBlockAdjustments] = useState<{
+    rotation: number;
+    scale: number;
+    scaleX: number;
+    scaleY: number;
+    scaleZ: number;
+    edgeWear: number;
+    archStyle?: 'arched' | 'rectangular';
+    windowStyle?: 'open' | 'barred' | 'shuttered' | 'paned';
+    roofStyle?: RoofStyleId;
+    roofMedievalTruss?: boolean;
+    beamOrientation?: BeamOrientation;
+    fenceStyle?: FenceStyleId;
+    doorConfig?: Partial<DoorConfig>;
+    materialVariant?: EntityMaterialVariant;
+  }>({
+    rotation: 0,
+    scale: 1,
+    scaleX: 1,
+    scaleY: 1,
+    scaleZ: 1,
+    edgeWear: 0,
+  });
   const [vistaCustomAssetId, setVistaCustomAssetId] = useState<string>('');
   const [showingMap, setShowingMap] = useState(false);
   const [newObjective, setNewObjective] = useState('');
@@ -200,6 +250,37 @@ export const WorldStage: React.FC<{ store: MakerStore }> = ({ store }) => {
     null
   );
   const [showingFxLibrary, setShowingFxLibrary] = useState(true);
+  const [leftPanelMode, setLeftPanelMode] = useState<'level' | 'assets' | 'hidden'>(() => {
+    try {
+      const savedMode = localStorage.getItem('maker.world.leftPanelMode.v1');
+      if (savedMode === 'level' || savedMode === 'assets' || savedMode === 'hidden') {
+        return savedMode;
+      }
+      return localStorage.getItem('maker.world.showLeftPanel.v1') !== 'false' ? 'level' : 'hidden';
+    } catch {
+      return 'level';
+    }
+  });
+  const setLeftPanel = (next: 'level' | 'assets' | 'hidden') => {
+    setLeftPanelMode(next);
+    try {
+      localStorage.setItem('maker.world.leftPanelMode.v1', next);
+      localStorage.setItem('maker.world.showLeftPanel.v1', String(next !== 'hidden'));
+    } catch {
+      // ignore storage failures
+    }
+  };
+  const showLeftPanel = leftPanelMode !== 'hidden';
+  const [activePlacementAssetId, setActivePlacementAssetId] = useState<string | null>(null);
+  const [curveGuideEnabled, setCurveGuideEnabled] = useState(false);
+  const [curveSpan, setCurveSpan] = useState(10);
+  const [curveBend, setCurveBend] = useState(3.2);
+  const [curveBlockCount, setCurveBlockCount] = useState(7);
+  const [curvePickMode, setCurvePickMode] = useState(false);
+  const [buildingCurve, setBuildingCurve] = useState<CurveGuideConfig>(() => ({
+    ...createDefaultCurveGuide('arc'),
+    points: createCurvePresetPoints('arc', { span: 10, bend: 3.2, baseY: 0.2 }),
+  }));
   const [showingCanopyEngine, setShowingCanopyEngine] = useState(false);
   const [showingTextureStudio, setShowingTextureStudio] = useState(false);
   const [chatBubbleTargetId, setChatBubbleTargetId] = useState<string | null>(null);
@@ -300,6 +381,272 @@ export const WorldStage: React.FC<{ store: MakerStore }> = ({ store }) => {
     ? store.customAssets.find((a) => a.id === currentEntity.customAssetId)
     : null;
 
+  const resetActiveAdjustments = () => {
+    setActiveBlockAdjustments({
+      rotation: 0,
+      scale: 1,
+      scaleX: 1,
+      scaleY: 1,
+      scaleZ: 1,
+      edgeWear: activeBuildMaterial === 'sandstone' ? 0.35 : 0,
+    });
+  };
+
+  const captureEntityIntoActiveTool = (ent: NonNullable<typeof currentEntity>) => {
+    if (ent.buildingBlock) {
+      const bb = ent.buildingBlock;
+      setActiveBuildShape(bb.shape);
+      setActiveBuildMaterial(bb.material);
+      setActiveBlockAdjustments({
+        rotation: ent.rotation ?? 0,
+        scale: ent.scale ?? 1,
+        scaleX: bb.scaleX ?? 1,
+        scaleY: bb.scaleY ?? 1,
+        scaleZ: bb.scaleZ ?? 1,
+        edgeWear: bb.edgeWear ?? (bb.material === 'sandstone' ? 0.35 : 0),
+        archStyle: bb.archStyle,
+        windowStyle: bb.windowStyle,
+        roofStyle: bb.roofStyle,
+        roofMedievalTruss: bb.roofMedievalTruss,
+        beamOrientation: bb.beamOrientation,
+        fenceStyle: bb.fenceStyle,
+        materialVariant: ent.materialVariant ? { ...ent.materialVariant } : undefined,
+      });
+    } else if (ent.kind === 'door') {
+      const dc = ent.doorConfig ?? DEFAULT_DOOR_CONFIG;
+      setActiveBuildShape(dc.leafStyle === 'rusticWood' ? 'rusticDoor' : 'door');
+      if (dc.frameMaterial) setActiveBuildMaterial(dc.frameMaterial);
+      setActiveBlockAdjustments({
+        rotation: ent.rotation ?? 0,
+        scale: ent.scale ?? 1,
+        scaleX: 1,
+        scaleY: 1,
+        scaleZ: 1,
+        edgeWear: 0,
+        doorConfig: { ...dc },
+        materialVariant: ent.materialVariant ? { ...ent.materialVariant } : undefined,
+      });
+    }
+  };
+
+  const toggleKeepToolAdjustments = (forced?: boolean) => {
+    const next = forced !== undefined ? forced : !keepToolAdjustments;
+    setKeepToolAdjustments(next);
+    if (next) {
+      if (currentEntity && (currentEntity.buildingBlock || currentEntity.kind === 'door')) {
+        captureEntityIntoActiveTool(currentEntity);
+      }
+    } else {
+      resetActiveAdjustments();
+    }
+  };
+
+  // When Keep Adjustments is ON and the user selects an earlier/previous cube or door,
+  // automatically readjust the active placement tool to match that selected block.
+  const prevSelectedEntityIdRef = useRef<string | null>(store.selectedEntityID);
+  useEffect(() => {
+    if (store.selectedEntityID === prevSelectedEntityIdRef.current) return;
+    prevSelectedEntityIdRef.current = store.selectedEntityID;
+    if (!keepToolAdjustments || !currentEntity) return;
+    if (currentEntity.buildingBlock || currentEntity.kind === 'door') {
+      captureEntityIntoActiveTool(currentEntity);
+    }
+  }, [store.selectedEntityID, keepToolAdjustments, currentEntity]);
+
+  const placementGhostSize: [number, number, number] = useMemo(() => {
+    const base: [number, number, number] =
+      activeBuildShape === 'door' || activeBuildShape === 'rusticDoor'
+        ? [2.0, 2.4, 0.7]
+        : getBuildingShapeBaseSize(activeBuildShape);
+    if (!keepToolAdjustments) return base;
+    const sc = activeBlockAdjustments.scale || 1;
+    return [
+      base[0] * sc * (activeBlockAdjustments.scaleX || 1),
+      base[1] * sc * (activeBlockAdjustments.scaleY || 1),
+      base[2] * sc * (activeBlockAdjustments.scaleZ || 1),
+    ];
+  }, [activeBuildShape, keepToolAdjustments, activeBlockAdjustments]);
+
+  const placementGhostRotation = keepToolAdjustments ? activeBlockAdjustments.rotation : 0;
+
+  const placeCustomAssetAtPoint = (
+    assetId: string,
+    pos: { x: number; y: number },
+    elevationY?: number
+  ) => {
+    const asset = store.customAssets.find((a) => a.id === assetId);
+    if (!asset) return;
+    const kind: EntityKind =
+      asset.category === 'character'
+        ? 'npc'
+        : asset.category === 'scenery'
+        ? 'scenery'
+        : 'prop';
+    const created = createEntity(kind, asset.name, pos.x, pos.y, {
+      customAssetId: asset.id,
+      ...(elevationY !== undefined ? { elevationY } : {}),
+      ...(asset.mechanisms?.length
+        ? {
+            mechanisms: asset.mechanisms.map((m) => ({
+              ...m,
+              pivot: [...m.pivot] as [number, number, number],
+            })),
+          }
+        : {}),
+    });
+    store.addEntitiesBatch(`drop ${asset.name}`, [created]);
+    setActivePlacementAssetId(null);
+    setTool('move');
+  };
+
+  const applyBuildingCurvePreset = (
+    preset: CurveGuidePresetId,
+    nextSpan = curveSpan,
+    nextBend = curveBend
+  ) => {
+    setCurvePickMode(preset === 'free');
+    setBuildingCurve((prev) => ({
+      ...prev,
+      preset,
+      closed: preset === 'circle',
+      points: createCurvePresetPoints(preset, {
+        span: nextSpan,
+        bend: nextBend,
+        baseY: 0.2,
+      }),
+    }));
+  };
+
+  const handlePickBuildingCurvePoint = ([wx, wz]: [number, number]) => {
+    setBuildingCurve((prev) => ({
+      ...prev,
+      preset: 'free',
+      closed: false,
+      points: [...prev.points, [Number(wx.toFixed(2)), 0.2, Number(wz.toFixed(2))]],
+    }));
+  };
+
+  const handleStampBuildingCurveBlocks = () => {
+    if (buildingCurve.points.length < 2) return;
+    const samples = sampleCurveTransforms(buildingCurve, Math.max(2, curveBlockCount), true);
+    const isDoor = activeBuildShape === 'door' || activeBuildShape === 'rusticDoor';
+    const resolvedShape: BuildingShapeId =
+      activeBuildMaterial === 'sandstone'
+        ? activeBuildShape === 'wallCubeHalf'
+          ? 'wallCubeHalf'
+          : 'wallCube'
+        : isDoor
+        ? 'wallCube'
+        : (activeBuildShape as BuildingShapeId);
+    const shapeMeta =
+      BUILDING_SHAPES.find((s) => s.id === resolvedShape) ?? BUILDING_SHAPES[0];
+    const rotOffset = keepToolAdjustments ? activeBlockAdjustments.rotation : 0;
+    const created: LevelEntity[] = samples.map((s) => {
+      const bp = levelWorldToBoard(currentLevel, s.position.x, s.position.z);
+      const rot = (Math.round(s.yawDeg + rotOffset) + 360) % 360;
+      if (isDoor) {
+        const isRustic = activeBuildShape === 'rusticDoor';
+        const doorCfg: DoorConfig = {
+          ...DEFAULT_DOOR_CONFIG,
+          ...(isRustic
+            ? {
+                frameShape: 'rectangular',
+                leafStyle: 'rusticWood',
+                openMode: 'hingedSide',
+                frameMaterial:
+                  activeBuildMaterial === 'timberPlank' ||
+                  activeBuildMaterial === 'roundLogs' ||
+                  activeBuildMaterial === 'weatheredSlats'
+                    ? activeBuildMaterial
+                    : 'timberPlank',
+              }
+            : { frameMaterial: activeBuildMaterial }),
+          ...(keepToolAdjustments && activeBlockAdjustments.doorConfig
+            ? activeBlockAdjustments.doorConfig
+            : {}),
+        };
+        return createEntity('door', isRustic ? 'Rustic Front Door' : 'Dungeon Door', bp.x, bp.y, {
+          rotation: rot,
+          scale: keepToolAdjustments ? activeBlockAdjustments.scale : 1,
+          doorConfig: doorCfg,
+          ...(keepToolAdjustments && activeBlockAdjustments.materialVariant
+            ? { materialVariant: { ...activeBlockAdjustments.materialVariant } }
+            : {}),
+        });
+      }
+      const isRoof = resolvedShape === 'roofAFrame' || resolvedShape === 'roofSlope';
+      const isBeam =
+        resolvedShape === 'beamLarge' ||
+        resolvedShape === 'beamSmall' ||
+        resolvedShape === 'plankTrim';
+      const bbPatch: Partial<BuildingBlockConfig> = keepToolAdjustments
+        ? {
+            ...(activeBlockAdjustments.scaleX !== 1 ? { scaleX: activeBlockAdjustments.scaleX } : {}),
+            ...(activeBlockAdjustments.scaleY !== 1 ? { scaleY: activeBlockAdjustments.scaleY } : {}),
+            ...(activeBlockAdjustments.scaleZ !== 1 ? { scaleZ: activeBlockAdjustments.scaleZ } : {}),
+            ...(activeBlockAdjustments.edgeWear > 0 || activeBuildMaterial === 'sandstone'
+              ? { edgeWear: activeBlockAdjustments.edgeWear }
+              : {}),
+            ...(resolvedShape === 'archway' && activeBlockAdjustments.archStyle
+              ? { archStyle: activeBlockAdjustments.archStyle }
+              : {}),
+            ...(resolvedShape === 'windowWall' && activeBlockAdjustments.windowStyle
+              ? { windowStyle: activeBlockAdjustments.windowStyle }
+              : {}),
+            ...(isRoof
+              ? {
+                  ...(activeBlockAdjustments.roofStyle ? { roofStyle: activeBlockAdjustments.roofStyle } : {}),
+                  ...(activeBlockAdjustments.roofMedievalTruss !== undefined
+                    ? { roofMedievalTruss: activeBlockAdjustments.roofMedievalTruss }
+                    : {}),
+                }
+              : {}),
+            ...(resolvedShape === 'roofGable' && activeBlockAdjustments.roofMedievalTruss !== undefined
+              ? { roofMedievalTruss: activeBlockAdjustments.roofMedievalTruss }
+              : {}),
+            ...(resolvedShape === 'fence' && activeBlockAdjustments.fenceStyle
+              ? { fenceStyle: activeBlockAdjustments.fenceStyle }
+              : {}),
+            ...(isBeam && activeBlockAdjustments.beamOrientation
+              ? { beamOrientation: activeBlockAdjustments.beamOrientation }
+              : {}),
+          }
+        : {};
+      return createEntity(
+        resolvedShape === 'wallTorch' ? 'light' : 'prop',
+        activeBuildMaterial === 'sandstone'
+          ? resolvedShape === 'wallCubeHalf'
+            ? 'Half Sandstone Cube'
+            : 'Sandstone Cube'
+          : shapeMeta.defaultName,
+        bp.x,
+        bp.y,
+        {
+          rotation: rot,
+          scale: keepToolAdjustments ? activeBlockAdjustments.scale : 1,
+          ...(keepToolAdjustments && activeBlockAdjustments.materialVariant
+            ? { materialVariant: { ...activeBlockAdjustments.materialVariant } }
+            : {}),
+          buildingBlock: {
+            shape: resolvedShape,
+            material: activeBuildMaterial,
+            ...(activeBuildMaterial === 'sandstone' ? { edgeWear: 0.35 } : {}),
+            ...(resolvedShape === 'archway' ? { archStyle: 'arched' } : {}),
+            ...(resolvedShape === 'windowWall' ? { windowStyle: 'barred' } : {}),
+            ...(isRoof
+              ? { roofStyle: inferRoofStyleFromMaterial(activeBuildMaterial), roofMedievalTruss: true }
+              : {}),
+            ...(resolvedShape === 'roofGable' ? { roofMedievalTruss: true } : {}),
+            ...(resolvedShape === 'fence' ? { fenceStyle: 'rail' } : {}),
+            ...(isBeam ? { beamOrientation: 'horizontal' } : {}),
+            ...bbPatch,
+          },
+        }
+      );
+    });
+    store.addEntitiesBatch(`place ${created.length} curved ${shapeMeta.label}`, created);
+  };
+
   const vistaPreset: VistaPresetId = currentLevel.vistaPreset ?? (envType === 'openWorld' || envType === 'castle' ? 'alpineValley' : 'none');
   const vistaDensity = currentLevel.vistaDensity ?? 0.85;
   const vistaItems = currentLevel.vistaItems ?? [];
@@ -332,19 +679,66 @@ export const WorldStage: React.FC<{ store: MakerStore }> = ({ store }) => {
 
   return (
     <div className="h-full min-h-0 flex flex-col lg:flex-row overflow-y-auto lg:overflow-hidden maker-scroll">
-      {/* Left sidebar: Level settings */}
-      <aside className="w-full lg:w-76 shrink-0 lg:h-full lg:min-h-0 bg-white dark:bg-[#171A23] border-b lg:border-b-0 lg:border-r border-slate-200/80 dark:border-white/[0.08] lg:overflow-y-auto maker-scroll p-4 space-y-5">
-        <div className="flex items-center justify-between">
-          <h2 className="text-base font-extrabold">Level world</h2>
-          <button
-            type="button"
-            onClick={() => setShowingMap(true)}
-            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-[#7C5CFF]/15 text-[#7C5CFF] text-xs font-bold hover:bg-[#7C5CFF]/25"
-          >
-            <MapIcon size={13} />
-            <span>Map</span>
-          </button>
-        </div>
+      {/* Left sidebar: Level settings OR Categorized Assets (collapsible to expand viewport & bottom tools) */}
+      {leftPanelMode === 'assets' && (
+        <LeftAssetsPanel
+          store={store}
+          activePlacementAssetId={activePlacementAssetId}
+          onSelectPlacementAsset={(asset) => {
+            setActivePlacementAssetId(asset.id);
+            setPlaceFxTemplateId(null);
+            setAddPaletteMode('entities');
+            setDropCustomAssetId(asset.id);
+            setTool('add');
+          }}
+          onEditAssetInObjectMaker={(assetId) => store.openObjectMaker(assetId)}
+          onCreateNewObject={() => store.openObjectMaker()}
+          onSwitchToLevelPanel={() => setLeftPanel('level')}
+          onCollapseLeftPanel={() => setLeftPanel('hidden')}
+        />
+      )}
+
+      {leftPanelMode === 'level' && (
+        <aside className="w-full lg:w-76 shrink-0 lg:h-full lg:min-h-0 bg-white dark:bg-[#171A23] border-b lg:border-b-0 lg:border-r border-slate-200/80 dark:border-white/[0.08] lg:overflow-y-auto maker-scroll p-4 space-y-5">
+          {/* Top Panel Mode Switcher: Level | Assets | Hide */}
+          <div className="flex items-center gap-1.5 -mt-1">
+            <div className="flex-1 grid grid-cols-2 gap-1 p-0.5 rounded-xl bg-slate-200/70 dark:bg-[#1C212E]">
+              <button
+                type="button"
+                className="py-1 px-2 rounded-lg text-[11px] font-extrabold bg-white dark:bg-[#272E3F] text-[#7C5CFF] dark:text-white shadow-xs"
+              >
+                Level
+              </button>
+              <button
+                type="button"
+                onClick={() => setLeftPanel('assets')}
+                className="py-1 px-2 rounded-lg text-[11px] font-bold text-slate-600 dark:text-[#9FA8BE] hover:text-slate-900 dark:hover:text-white transition-colors"
+              >
+                Assets ({store.customAssets.length})
+              </button>
+            </div>
+            <button
+              type="button"
+              onClick={() => setShowingMap(true)}
+              title="Open 2D Top-Down Level Map"
+              className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-xl bg-[#7C5CFF]/15 text-[#7C5CFF] text-[11px] font-bold hover:bg-[#7C5CFF]/25"
+            >
+              <MapIcon size={12} />
+              <span>Map</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => setLeftPanel('hidden')}
+              title="Hide left panel to expand the 3D viewport & bottom tools"
+              className="inline-flex items-center gap-1 px-2 py-1.5 rounded-xl bg-slate-100 dark:bg-[#1F2430] text-slate-600 dark:text-[#949BB0] hover:text-slate-900 dark:hover:text-white text-xs font-bold transition-colors"
+            >
+              <PanelLeftClose size={13} />
+            </button>
+          </div>
+
+          <div className="flex items-center justify-between gap-2">
+            <h2 className="text-base font-extrabold">Level world</h2>
+          </div>
 
         {/* Level name */}
         <div className="space-y-1.5">
@@ -1925,10 +2319,15 @@ export const WorldStage: React.FC<{ store: MakerStore }> = ({ store }) => {
             </button>
           )}
         </div>
-      </aside>
+        </aside>
+      )}
 
       {/* Center: 3D Viewport + Tools */}
-      <main className="shrink-0 lg:shrink lg:flex-1 lg:h-full lg:min-h-0 lg:min-w-0 flex flex-col p-3 sm:p-4 gap-3 lg:overflow-hidden">
+      <main
+        className={`shrink-0 lg:shrink lg:flex-1 lg:h-full lg:min-h-0 lg:min-w-0 flex flex-col lg:overflow-hidden ${
+          showLeftPanel ? 'p-3 sm:p-4 gap-3' : 'p-2 sm:p-2.5 gap-2'
+        }`}
+      >
         <div className="h-[340px] sm:h-[420px] lg:h-auto lg:flex-1 min-h-[240px] rounded-2xl overflow-hidden border border-slate-200/80 dark:border-white/[0.1] shadow-sm relative bg-[#0B0F1A]">
           {!store.isPlaying && (
             <WorldViewport3D
@@ -1945,22 +2344,59 @@ export const WorldStage: React.FC<{ store: MakerStore }> = ({ store }) => {
               isPlacingBuildingBlock={
                 activeTool === 'add' && addPaletteMode === 'blocks' && !activePlaceFxTemplate
               }
+              placementGhostSize={placementGhostSize}
+              placementGhostRotation={placementGhostRotation}
               resolutionScale={store.viewportResolutionScale}
               shadowQuality={store.viewportShadowQuality}
               renderPaused={
                 showingCanopyEngine ||
                 showingTextureStudio ||
+                store.objectMakerOpen ||
                 vertexPaintTargetId !== null ||
                 showingMap
               }
+              buildingCurveGuide={
+                activeTool === 'add' && addPaletteMode === 'blocks' && curveGuideEnabled
+                  ? {
+                      enabled: true,
+                      curve: buildingCurve,
+                      blockCount: curveBlockCount,
+                      blockSize: placementGhostSize,
+                      elevationY: 0,
+                      pickMode: curvePickMode,
+                    }
+                  : null
+              }
+              onPickBuildingCurvePoint={handlePickBuildingCurvePoint}
+              onDropCustomAsset={placeCustomAssetAtPoint}
               onSelectEntity={(id) => store.setSelectedEntityID(id)}
               onMoveEntity={(id, pos, elev) => store.moveEntity(id, pos, false, elev)}
-              onRotateEntity={(id, deg) =>
-                store.updateEntity(id, 'rotate item', (e) => ({ ...e, rotation: Math.round(deg) }), false)
-              }
-              onScaleEntity={(id, sc) =>
-                store.updateEntity(id, 'resize item', (e) => ({ ...e, scale: sc }), false)
-              }
+              onRotateEntity={(id, deg) => {
+                const rounded = Math.round(deg);
+                store.updateEntity(id, 'rotate item', (e) => ({ ...e, rotation: rounded }), false);
+                if (keepToolAdjustments && id === store.selectedEntityID) {
+                  const ent = currentLevel.entities.find((item) => item.id === id);
+                  if (ent && (ent.buildingBlock || ent.kind === 'door')) {
+                    setActiveBlockAdjustments((prev) => ({ ...prev, rotation: rounded }));
+                  }
+                }
+              }}
+              onRotateActiveTool={(deltaDeg) => {
+                if (!keepToolAdjustments) setKeepToolAdjustments(true);
+                setActiveBlockAdjustments((prev) => ({
+                  ...prev,
+                  rotation: (Math.round((prev.rotation + deltaDeg) / 45) * 45 + 360) % 360,
+                }));
+              }}
+              onScaleEntity={(id, sc) => {
+                store.updateEntity(id, 'resize item', (e) => ({ ...e, scale: sc }), false);
+                if (keepToolAdjustments && id === store.selectedEntityID) {
+                  const ent = currentLevel.entities.find((item) => item.id === id);
+                  if (ent && (ent.buildingBlock || ent.kind === 'door')) {
+                    setActiveBlockAdjustments((prev) => ({ ...prev, scale: sc }));
+                  }
+                }
+              }}
               onBrushStroke={(x, z, meta) =>
                 store.applyBrush(
                   brush,
@@ -1996,20 +2432,65 @@ export const WorldStage: React.FC<{ store: MakerStore }> = ({ store }) => {
                   store.addFxTemplateAtPoint(activePlaceFxTemplate, pos);
                   setPlaceFxTemplateId(null);
                   setTool('move');
+                } else if (activePlacementAssetId) {
+                  placeCustomAssetAtPoint(activePlacementAssetId, pos, elev);
                 } else if (addPaletteMode === 'blocks') {
-                  store.addBuildingBlockEntity(activeBuildShape, activeBuildMaterial, pos, {
-                    elevationY: elev,
-                  });
+                  if (keepToolAdjustments) {
+                    const isDoor = activeBuildShape === 'door' || activeBuildShape === 'rusticDoor';
+                    const bbPatch: Partial<BuildingBlockConfig> = !isDoor
+                      ? {
+                          ...(activeBlockAdjustments.scaleX !== 1 ? { scaleX: activeBlockAdjustments.scaleX } : {}),
+                          ...(activeBlockAdjustments.scaleY !== 1 ? { scaleY: activeBlockAdjustments.scaleY } : {}),
+                          ...(activeBlockAdjustments.scaleZ !== 1 ? { scaleZ: activeBlockAdjustments.scaleZ } : {}),
+                          ...(activeBlockAdjustments.edgeWear > 0 || activeBuildMaterial === 'sandstone'
+                            ? { edgeWear: activeBlockAdjustments.edgeWear }
+                            : {}),
+                          ...(activeBuildShape === 'archway' && activeBlockAdjustments.archStyle
+                            ? { archStyle: activeBlockAdjustments.archStyle }
+                            : {}),
+                          ...(activeBuildShape === 'windowWall' && activeBlockAdjustments.windowStyle
+                            ? { windowStyle: activeBlockAdjustments.windowStyle }
+                            : {}),
+                          ...((activeBuildShape === 'roofAFrame' || activeBuildShape === 'roofSlope')
+                            ? {
+                                ...(activeBlockAdjustments.roofStyle ? { roofStyle: activeBlockAdjustments.roofStyle } : {}),
+                                ...(activeBlockAdjustments.roofMedievalTruss !== undefined
+                                  ? { roofMedievalTruss: activeBlockAdjustments.roofMedievalTruss }
+                                  : {}),
+                              }
+                            : {}),
+                          ...(activeBuildShape === 'roofGable' && activeBlockAdjustments.roofMedievalTruss !== undefined
+                            ? { roofMedievalTruss: activeBlockAdjustments.roofMedievalTruss }
+                            : {}),
+                          ...(activeBuildShape === 'fence' && activeBlockAdjustments.fenceStyle
+                            ? { fenceStyle: activeBlockAdjustments.fenceStyle }
+                            : {}),
+                          ...((activeBuildShape === 'beamLarge' ||
+                            activeBuildShape === 'beamSmall' ||
+                            activeBuildShape === 'plankTrim') &&
+                          activeBlockAdjustments.beamOrientation
+                            ? { beamOrientation: activeBlockAdjustments.beamOrientation }
+                            : {}),
+                        }
+                      : {};
+                    store.addBuildingBlockEntity(activeBuildShape, activeBuildMaterial, pos, {
+                      elevationY: elev,
+                      rotation: activeBlockAdjustments.rotation,
+                      scale: activeBlockAdjustments.scale,
+                      ...(isDoor && activeBlockAdjustments.doorConfig
+                        ? { doorConfig: { ...activeBlockAdjustments.doorConfig, frameMaterial: activeBuildMaterial } }
+                        : { buildingBlockPatch: bbPatch }),
+                      ...(activeBlockAdjustments.materialVariant
+                        ? { materialVariant: { ...activeBlockAdjustments.materialVariant } }
+                        : {}),
+                    });
+                  } else {
+                    store.addBuildingBlockEntity(activeBuildShape, activeBuildMaterial, pos, {
+                      elevationY: elev,
+                    });
+                  }
                 } else if (dropCustomAssetId) {
-                  const asset = store.customAssets.find((a) => a.id === dropCustomAssetId);
-                  const kind: EntityKind =
-                    asset?.category === 'character'
-                      ? 'npc'
-                      : asset?.category === 'scenery'
-                      ? 'scenery'
-                      : 'prop';
-                  store.addEntity(kind, asset?.name ?? 'Custom 3D', pos, dropCustomAssetId);
-                  setTool('move');
+                  placeCustomAssetAtPoint(dropCustomAssetId, pos, elev);
                 } else {
                   const meta = EntityKindMeta[dropKind];
                   store.addEntity(dropKind, meta.defaultName, pos);
@@ -2030,14 +2511,26 @@ export const WorldStage: React.FC<{ store: MakerStore }> = ({ store }) => {
             {activeTool === 'add' &&
               (activePlaceFxTemplate
                 ? `Click anywhere in the scene to stamp ${activePlaceFxTemplate.name}`
+                : activePlacementAssetId
+                ? `Click in the 3D scene to place ${
+                    store.customAssets.find((a) => a.id === activePlacementAssetId)?.name ?? 'asset'
+                  }`
+                : addPaletteMode === 'blocks' && curveGuideEnabled && curvePickMode
+                ? 'Curve Pick Mode: Click terrain points to trace your building curve · Click Stamp when ready'
                 : addPaletteMode === 'blocks'
                 ? `Click to place ${
                     activeBuildShape === 'door'
                       ? 'Modular Door'
+                      : activeBuildShape === 'rusticDoor'
+                      ? 'Rustic Wood Door'
                       : BUILDING_SHAPES.find((s) => s.id === activeBuildShape)?.label ?? 'Block'
                   } (${
                     BUILDING_MATERIALS.find((m) => m.id === activeBuildMaterial)?.label ?? 'Stone'
-                  }) · Click tops to stack · R turns 90°`
+                  })${
+                    keepToolAdjustments
+                      ? ` · Kept: ${placementGhostSize[0].toFixed(1)}×${placementGhostSize[1].toFixed(1)}×${placementGhostSize[2].toFixed(1)}m @ ${Math.round(placementGhostRotation)}°`
+                      : ''
+                  } · Hover sides/edges to snap · Alt+Click picks block · R turns`
                 : dropCustomAssetId
                 ? `Click anywhere in the scene to drop ${
                     store.customAssets.find((a) => a.id === dropCustomAssetId)?.name ?? 'model'
@@ -2061,10 +2554,55 @@ export const WorldStage: React.FC<{ store: MakerStore }> = ({ store }) => {
         </div>
 
         {/* Bottom Tool Controls */}
-        <div className="shrink-0 space-y-2">
-          <div className="flex flex-wrap items-center justify-between gap-2">
-            <div className="flex flex-wrap items-center gap-2">
-              <div className="inline-flex items-center gap-1 p-1 rounded-xl bg-white dark:bg-[#171A23] border border-slate-200/80 dark:border-white/[0.08]">
+        <div className={`shrink-0 ${showLeftPanel ? 'space-y-2' : 'space-y-1.5'}`}>
+          <div
+            className={`flex flex-wrap items-center justify-between ${
+              showLeftPanel ? 'gap-2' : 'gap-1.5'
+            }`}
+          >
+            <div
+              className={`flex flex-wrap items-center ${
+                showLeftPanel ? 'gap-2' : 'gap-1.5'
+              }`}
+            >
+              {showLeftPanel ? (
+                <button
+                  type="button"
+                  onClick={() => setLeftPanel('hidden')}
+                  title="Hide left panel to widen viewport & shallow bottom tools"
+                  className="inline-flex items-center gap-1.5 rounded-xl text-xs font-extrabold border transition-colors whitespace-nowrap px-3 py-2 bg-white dark:bg-[#171A23] border-slate-200/80 dark:border-white/[0.08] text-slate-700 dark:text-[#C8D0E4] hover:border-[#7C5CFF]"
+                >
+                  <PanelLeftClose size={13} />
+                  <span>Hide Panel</span>
+                </button>
+              ) : (
+                <div className="inline-flex items-center gap-1 p-0.5 rounded-xl bg-white dark:bg-[#171A23] border border-[#7C5CFF]/50">
+                  <button
+                    type="button"
+                    onClick={() => setLeftPanel('level')}
+                    title="Show Level Settings panel"
+                    className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs font-extrabold bg-[#7C5CFF]/15 text-[#7C5CFF] hover:bg-[#7C5CFF]/25"
+                  >
+                    <PanelLeftOpen size={12} />
+                    <span>Level</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setLeftPanel('assets')}
+                    title="Show Assets Library panel (drag & drop onto world)"
+                    className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs font-extrabold text-slate-600 dark:text-[#C8D0E4] hover:bg-[#7C5CFF]/15 hover:text-[#7C5CFF]"
+                  >
+                    <Shapes size={12} />
+                    <span>Assets ({store.customAssets.length})</span>
+                  </button>
+                </div>
+              )}
+
+              <div
+                className={`inline-flex items-center gap-1 rounded-xl bg-white dark:bg-[#171A23] border border-slate-200/80 dark:border-white/[0.08] ${
+                  showLeftPanel ? 'p-1' : 'p-0.5'
+                }`}
+              >
                 {tools.map((t) => {
                   const active = activeTool === t.id;
                   return (
@@ -2073,9 +2611,14 @@ export const WorldStage: React.FC<{ store: MakerStore }> = ({ store }) => {
                       type="button"
                       onClick={() => {
                         setTool(t.id);
-                        if (t.id !== 'add') setPlaceFxTemplateId(null);
+                        if (t.id !== 'add') {
+                          setPlaceFxTemplateId(null);
+                          setActivePlacementAssetId(null);
+                        }
                       }}
-                      className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold transition-colors ${
+                      className={`inline-flex items-center gap-1.5 rounded-lg text-xs font-bold transition-colors ${
+                        showLeftPanel ? 'px-3 py-1.5' : 'px-2.5 py-1'
+                      } ${
                         active
                           ? 'bg-[#7C5CFF] text-white'
                           : 'text-slate-600 dark:text-[#949BB0] hover:text-slate-900 dark:hover:text-white'
@@ -2092,10 +2635,13 @@ export const WorldStage: React.FC<{ store: MakerStore }> = ({ store }) => {
                 type="button"
                 onClick={() => {
                   setPlaceFxTemplateId(null);
+                  setActivePlacementAssetId(null);
                   setAddPaletteMode('blocks');
                   setTool('add');
                 }}
-                className={`inline-flex items-center gap-1.5 px-3 py-2 rounded-xl text-xs font-extrabold border transition-colors whitespace-nowrap ${
+                className={`inline-flex items-center gap-1.5 rounded-xl text-xs font-extrabold border transition-colors whitespace-nowrap ${
+                  showLeftPanel ? 'px-3 py-2' : 'px-2.5 py-1.5'
+                } ${
                   activeTool === 'add' && addPaletteMode === 'blocks' && !activePlaceFxTemplate
                     ? 'bg-[#F59E0B]/18 border-[#F59E0B] text-[#F59E0B]'
                     : 'bg-white dark:bg-[#171A23] border-slate-200/80 dark:border-white/[0.08] text-slate-700 dark:text-[#C8D0E4] hover:border-[#F59E0B]'
@@ -2105,14 +2651,41 @@ export const WorldStage: React.FC<{ store: MakerStore }> = ({ store }) => {
                 <span>Build Kit</span>
               </button>
 
+              <button
+                type="button"
+                onClick={() => toggleKeepToolAdjustments()}
+                title="When ON, size, width/height/length, rotation & style adjustments made in the side panel carry onto your active Build Kit placement tool. When OFF, placements default to normal size and features."
+                className={`inline-flex items-center gap-1.5 rounded-xl text-xs font-extrabold border transition-colors whitespace-nowrap ${
+                  showLeftPanel ? 'px-3 py-2' : 'px-2.5 py-1.5'
+                } ${
+                  keepToolAdjustments
+                    ? 'bg-[#7C5CFF] border-[#7C5CFF] text-white shadow-sm'
+                    : 'bg-white dark:bg-[#171A23] border-slate-200/80 dark:border-white/[0.08] text-slate-700 dark:text-[#C8D0E4] hover:border-[#7C5CFF]'
+                }`}
+              >
+                <SlidersHorizontal size={13} />
+                <span>Keep Adjustments</span>
+                <span
+                  className={`px-1.5 py-0.2 rounded text-[10px] font-black ${
+                    keepToolAdjustments
+                      ? 'bg-white/20 text-white'
+                      : 'bg-slate-100 dark:bg-[#1F2430] text-slate-400 dark:text-[#7D859B]'
+                  }`}
+                >
+                  {keepToolAdjustments ? 'ON' : 'OFF'}
+                </span>
+              </button>
+
               <div
-                className="inline-flex items-center gap-0.5 p-1 rounded-xl bg-white dark:bg-[#171A23] border border-slate-200/80 dark:border-white/[0.08]"
+                className={`inline-flex items-center gap-0.5 rounded-xl bg-white dark:bg-[#171A23] border border-slate-200/80 dark:border-white/[0.08] ${
+                  showLeftPanel ? 'p-1' : 'p-0.5'
+                }`}
                 title="Grid Snap spacing for placing and dragging blocks"
               >
                 <span className="px-1.5 text-[10px] font-bold uppercase tracking-wider text-slate-400 dark:text-[#7D859B]">
                   Snap
                 </span>
-                {([0, 1, 2] as const).map((snapVal) => {
+                {([0, 0.5, 1, 2] as const).map((snapVal) => {
                   const active = store.worldGridSnap === snapVal;
                   return (
                     <button
@@ -2134,7 +2707,9 @@ export const WorldStage: React.FC<{ store: MakerStore }> = ({ store }) => {
               <button
                 type="button"
                 onClick={() => setShowingFxLibrary((open) => !open)}
-                className={`inline-flex items-center gap-1.5 px-3 py-2 rounded-xl text-xs font-extrabold border transition-colors whitespace-nowrap ${
+                className={`inline-flex items-center gap-1.5 rounded-xl text-xs font-extrabold border transition-colors whitespace-nowrap ${
+                  showLeftPanel ? 'px-3 py-2' : 'px-2.5 py-1.5'
+                } ${
                   showingFxLibrary
                     ? 'bg-[#7C5CFF]/15 border-[#7C5CFF] text-[#7C5CFF]'
                     : 'bg-white dark:bg-[#171A23] border-slate-200/80 dark:border-white/[0.08] text-slate-700 dark:text-[#C8D0E4] hover:border-[#7C5CFF]'
@@ -2150,7 +2725,9 @@ export const WorldStage: React.FC<{ store: MakerStore }> = ({ store }) => {
               <button
                 type="button"
                 onClick={() => setShowingCanopyEngine(true)}
-                className={`inline-flex items-center gap-1.5 px-3 py-2 rounded-xl text-xs font-extrabold border transition-colors whitespace-nowrap ${
+                className={`inline-flex items-center gap-1.5 rounded-xl text-xs font-extrabold border transition-colors whitespace-nowrap ${
+                  showLeftPanel ? 'px-3 py-2' : 'px-2.5 py-1.5'
+                } ${
                   currentLevel.canopyEngine?.enabled
                     ? 'bg-[#20B46A]/15 border-[#20B46A] text-[#20B46A]'
                     : 'bg-white dark:bg-[#171A23] border-slate-200/80 dark:border-white/[0.08] text-slate-700 dark:text-[#C8D0E4] hover:border-[#20B46A]'
@@ -2163,6 +2740,18 @@ export const WorldStage: React.FC<{ store: MakerStore }> = ({ store }) => {
                 )}
               </button>
 
+              <button
+                type="button"
+                onClick={() => store.openObjectMaker()}
+                title="Open Breakaway Object Maker (Sculpt, CSG Booleans, Curve Guide & Mechanics)"
+                className={`inline-flex items-center gap-1.5 rounded-xl text-xs font-extrabold border transition-colors whitespace-nowrap ${
+                  showLeftPanel ? 'px-3 py-2' : 'px-2.5 py-1.5'
+                } bg-[#7C5CFF]/15 border-[#7C5CFF]/60 text-[#7C5CFF] hover:bg-[#7C5CFF] hover:text-white`}
+              >
+                <Shapes size={13} />
+                <span>Object Maker</span>
+              </button>
+
               {(() => {
                 const activeTexCount = Object.values(currentLevel.sceneryTextures ?? {}).filter(
                   (s) => s?.enabled && s?.textureId
@@ -2171,7 +2760,9 @@ export const WorldStage: React.FC<{ store: MakerStore }> = ({ store }) => {
                   <button
                     type="button"
                     onClick={() => setShowingTextureStudio(true)}
-                    className={`inline-flex items-center gap-1.5 px-3 py-2 rounded-xl text-xs font-extrabold border transition-colors whitespace-nowrap ${
+                    className={`inline-flex items-center gap-1.5 rounded-xl text-xs font-extrabold border transition-colors whitespace-nowrap ${
+                      showLeftPanel ? 'px-3 py-2' : 'px-2.5 py-1.5'
+                    } ${
                       activeTexCount > 0
                         ? 'bg-[#7C5CFF]/15 border-[#7C5CFF] text-[#7C5CFF]'
                         : 'bg-white dark:bg-[#171A23] border-slate-200/80 dark:border-white/[0.08] text-slate-700 dark:text-[#C8D0E4] hover:border-[#7C5CFF]'
@@ -2206,7 +2797,9 @@ export const WorldStage: React.FC<{ store: MakerStore }> = ({ store }) => {
                         setVertexPaintTargetId('forestTree');
                       }
                     }}
-                    className={`inline-flex items-center gap-1.5 px-3 py-2 rounded-xl text-xs font-extrabold border transition-colors whitespace-nowrap ${
+                    className={`inline-flex items-center gap-1.5 rounded-xl text-xs font-extrabold border transition-colors whitespace-nowrap ${
+                      showLeftPanel ? 'px-3 py-2' : 'px-2.5 py-1.5'
+                    } ${
                       paintedCount > 0
                         ? 'bg-[#EC4899]/15 border-[#EC4899] text-[#EC4899]'
                         : 'bg-white dark:bg-[#171A23] border-slate-200/80 dark:border-white/[0.08] text-slate-700 dark:text-[#C8D0E4] hover:border-[#EC4899]'
@@ -2297,7 +2890,9 @@ export const WorldStage: React.FC<{ store: MakerStore }> = ({ store }) => {
                       }
                       setBrush(b.id);
                     }}
-                    className={`px-3 py-1.5 rounded-xl text-xs font-bold border transition-colors ${
+                    className={`rounded-xl text-xs font-bold border transition-colors ${
+                      showLeftPanel ? 'px-3 py-1.5' : 'px-2.5 py-1'
+                    } ${
                       active
                         ? 'bg-[#F59E0B] text-white border-[#F59E0B]'
                         : 'bg-white dark:bg-[#171A23] border-slate-200/80 dark:border-white/[0.08] hover:border-[#F59E0B]'
@@ -2320,7 +2915,9 @@ export const WorldStage: React.FC<{ store: MakerStore }> = ({ store }) => {
                       ),
                     }))
                   }
-                  className="px-3 py-1.5 rounded-xl bg-[#20B46A]/15 hover:bg-[#20B46A]/25 border border-[#20B46A]/40 text-[#20B46A] text-xs font-extrabold transition-colors"
+                  className={`rounded-xl bg-[#20B46A]/15 hover:bg-[#20B46A]/25 border border-[#20B46A]/40 text-[#20B46A] text-xs font-extrabold transition-colors ${
+                    showLeftPanel ? 'px-3 py-1.5' : 'px-2.5 py-1'
+                  }`}
                 >
                   Auto-Weather Cliffs
                 </button>
@@ -2330,7 +2927,9 @@ export const WorldStage: React.FC<{ store: MakerStore }> = ({ store }) => {
                 <select
                   value={activeScatterAssetId}
                   onChange={(e) => setScatterAssetId(e.target.value)}
-                  className="px-3 py-1.5 rounded-xl bg-white dark:bg-[#171A23] border border-[#7C5CFF]/50 text-xs font-bold"
+                  className={`rounded-xl bg-white dark:bg-[#171A23] border border-[#7C5CFF]/50 text-xs font-bold ${
+                    showLeftPanel ? 'px-3 py-1.5' : 'px-2.5 py-1'
+                  }`}
                 >
                   {store.customAssets.map((a) => (
                     <option key={a.id} value={a.id}>
@@ -2343,16 +2942,25 @@ export const WorldStage: React.FC<{ store: MakerStore }> = ({ store }) => {
           )}
 
           {activeTool === 'add' && (
-            <div className="space-y-2 p-2.5 rounded-2xl bg-white dark:bg-[#171A23] border border-slate-200/80 dark:border-white/[0.08]">
-              <div className="flex flex-wrap items-center justify-between gap-2">
-                <div className="inline-flex items-center gap-1 p-0.5 rounded-xl bg-slate-100 dark:bg-[#1F2430]">
+            <div
+              className={`rounded-2xl bg-white dark:bg-[#171A23] border border-slate-200/80 dark:border-white/[0.08] ${
+                showLeftPanel ? 'space-y-2 p-2.5' : 'space-y-1.5 p-2'
+              }`}
+            >
+              <div
+                className={`flex flex-wrap items-center ${
+                  showLeftPanel ? 'justify-between gap-2' : 'gap-1.5'
+                }`}
+              >
+                <div className="inline-flex items-center gap-1 p-0.5 rounded-xl bg-slate-100 dark:bg-[#1F2430] shrink-0">
                   <button
                     type="button"
                     onClick={() => {
                       setPlaceFxTemplateId(null);
+                      setActivePlacementAssetId(null);
                       setAddPaletteMode('blocks');
                     }}
-                    className={`px-3 py-1 rounded-lg text-[11px] font-extrabold transition-colors ${
+                    className={`px-2.5 py-1 rounded-lg text-[11px] font-extrabold transition-colors ${
                       addPaletteMode === 'blocks'
                         ? 'bg-[#F59E0B] text-white'
                         : 'text-slate-600 dark:text-[#949BB0]'
@@ -2366,7 +2974,7 @@ export const WorldStage: React.FC<{ store: MakerStore }> = ({ store }) => {
                       setPlaceFxTemplateId(null);
                       setAddPaletteMode('entities');
                     }}
-                    className={`px-3 py-1 rounded-lg text-[11px] font-extrabold transition-colors ${
+                    className={`px-2.5 py-1 rounded-lg text-[11px] font-extrabold transition-colors ${
                       addPaletteMode === 'entities'
                         ? 'bg-[#7C5CFF] text-white'
                         : 'text-slate-600 dark:text-[#949BB0]'
@@ -2377,16 +2985,38 @@ export const WorldStage: React.FC<{ store: MakerStore }> = ({ store }) => {
                 </div>
 
                 {addPaletteMode === 'blocks' && (
-                  <div className="flex flex-wrap items-center gap-1">
+                  <div className="flex flex-wrap items-center gap-1 flex-1 min-w-0">
                     {BUILDING_MATERIALS.map((mat) => {
                       const active = activeBuildMaterial === mat.id;
                       return (
                         <button
                           key={mat.id}
                           type="button"
-                          onClick={() => setActiveBuildMaterial(mat.id)}
-                          title={`${mat.label} (${mat.category})`}
-                          className={`inline-flex items-center gap-1.5 px-2 py-1 rounded-lg text-[10px] font-bold border transition-colors ${
+                          onClick={() => {
+                            setActiveBuildMaterial(mat.id);
+                            if (mat.id === 'sandstone') {
+                              if (activeBuildShape !== 'wallCube' && activeBuildShape !== 'wallCubeHalf') {
+                                setActiveBuildShape('wallCube');
+                                setActiveBlockAdjustments((prev) => ({
+                                  ...prev,
+                                  scaleX: 1,
+                                  scaleY: 1,
+                                  scaleZ: 1,
+                                  edgeWear: prev.edgeWear > 0 ? prev.edgeWear : 0.35,
+                                }));
+                              } else if (activeBlockAdjustments.edgeWear === 0) {
+                                setActiveBlockAdjustments((prev) => ({ ...prev, edgeWear: 0.35 }));
+                              }
+                            }
+                          }}
+                          title={
+                            mat.id === 'sandstone'
+                              ? 'Sandstone — Organic beveled cube (no grid pattern)'
+                              : `${mat.label} (${mat.category})`
+                          }
+                          className={`inline-flex items-center gap-1 rounded-lg text-[10px] font-bold border transition-colors ${
+                            showLeftPanel ? 'px-2 py-1' : 'px-1.5 py-0.5'
+                          } ${
                             active
                               ? 'border-[#F59E0B] bg-[#F59E0B]/15 text-[#D97706] dark:text-[#FBBF24]'
                               : 'border-transparent bg-slate-100 dark:bg-[#1F2430] text-slate-600 dark:text-[#949BB0] hover:text-slate-900 dark:hover:text-white'
@@ -2413,8 +3043,43 @@ export const WorldStage: React.FC<{ store: MakerStore }> = ({ store }) => {
                         key={shape.id}
                         type="button"
                         title={shape.blurb}
-                        onClick={() => setActiveBuildShape(shape.id)}
-                        className={`shrink-0 inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-bold border transition-colors ${
+                        onClick={() => {
+                          if (shape.id !== activeBuildShape) {
+                            setActiveBlockAdjustments((prev) => ({
+                              ...prev,
+                              scaleX: 1,
+                              scaleY: 1,
+                              scaleZ: 1,
+                            }));
+                          }
+                          setActiveBuildShape(shape.id);
+                          const curMatMeta = BUILDING_MATERIALS.find((m) => m.id === activeBuildMaterial);
+                          const defMatMeta = BUILDING_MATERIALS.find((m) => m.id === shape.defaultMaterial);
+                          const isCubeShape = shape.id === 'wallCube' || shape.id === 'wallCubeHalf';
+                          const isRoofShape = shape.id === 'roofAFrame' || shape.id === 'roofSlope';
+                          const isWoodShape =
+                            shape.id === 'fence' ||
+                            shape.id === 'porchSteps' ||
+                            shape.id === 'beamLarge' ||
+                            shape.id === 'beamSmall' ||
+                            shape.id === 'plankTrim';
+                          if (activeBuildMaterial === 'sandstone' && !isCubeShape) {
+                            setActiveBuildMaterial(shape.defaultMaterial);
+                          } else if (isRoofShape) {
+                            if (curMatMeta?.category !== 'roof' && activeBuildMaterial !== 'weatheredSlats') {
+                              setActiveBuildMaterial(shape.defaultMaterial);
+                            }
+                          } else if (isWoodShape) {
+                            if (curMatMeta?.category !== 'wood' && !(shape.id === 'porchSteps' && curMatMeta?.category === 'stone')) {
+                              setActiveBuildMaterial(shape.defaultMaterial);
+                            }
+                          } else if (defMatMeta && curMatMeta?.category === 'roof') {
+                            setActiveBuildMaterial(shape.defaultMaterial);
+                          }
+                        }}
+                        className={`shrink-0 inline-flex items-center gap-1.5 rounded-xl text-xs font-bold border transition-colors ${
+                          showLeftPanel ? 'px-3 py-1.5' : 'px-2.5 py-1'
+                        } ${
                           active
                             ? 'bg-[#7C5CFF] text-white border-[#7C5CFF]'
                             : 'bg-slate-100 dark:bg-[#1F2430] border-transparent text-slate-700 dark:text-[#C8D0E4] hover:border-[#7C5CFF]'
@@ -2427,9 +3092,53 @@ export const WorldStage: React.FC<{ store: MakerStore }> = ({ store }) => {
                   })}
                   <button
                     type="button"
+                    title="Rustic plank & Z-brace wood front door (switch Rectangular or Arched in Inspector)"
+                    onClick={() => {
+                      if (activeBuildShape !== 'rusticDoor') {
+                        setActiveBlockAdjustments((prev) => ({
+                          ...prev,
+                          scaleX: 1,
+                          scaleY: 1,
+                          scaleZ: 1,
+                        }));
+                      }
+                      setActiveBuildShape('rusticDoor');
+                      const curMatMeta = BUILDING_MATERIALS.find((m) => m.id === activeBuildMaterial);
+                      if (curMatMeta?.category !== 'wood') {
+                        setActiveBuildMaterial('timberPlank');
+                      }
+                    }}
+                    className={`shrink-0 inline-flex items-center gap-1.5 rounded-xl text-xs font-bold border transition-colors ${
+                      showLeftPanel ? 'px-3 py-1.5' : 'px-2.5 py-1'
+                    } ${
+                      activeBuildShape === 'rusticDoor'
+                        ? 'bg-[#F59E0B] text-white border-[#F59E0B]'
+                        : 'bg-slate-100 dark:bg-[#1F2430] border-transparent text-slate-700 dark:text-[#C8D0E4] hover:border-[#F59E0B]'
+                    }`}
+                  >
+                    <Layers size={12} />
+                    <span className="whitespace-nowrap">Rustic Door</span>
+                  </button>
+                  <button
+                    type="button"
                     title="Interactive doorway with arched/rectangular frame, plank/metal/bar/cage leaves & peep slots"
-                    onClick={() => setActiveBuildShape('door')}
-                    className={`shrink-0 inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-bold border transition-colors ${
+                    onClick={() => {
+                      if (activeBuildShape !== 'door') {
+                        setActiveBlockAdjustments((prev) => ({
+                          ...prev,
+                          scaleX: 1,
+                          scaleY: 1,
+                          scaleZ: 1,
+                        }));
+                      }
+                      setActiveBuildShape('door');
+                      if (activeBuildMaterial === 'sandstone') {
+                        setActiveBuildMaterial('hewnStone');
+                      }
+                    }}
+                    className={`shrink-0 inline-flex items-center gap-1.5 rounded-xl text-xs font-bold border transition-colors ${
+                      showLeftPanel ? 'px-3 py-1.5' : 'px-2.5 py-1'
+                    } ${
                       activeBuildShape === 'door'
                         ? 'bg-[#20B46A] text-white border-[#20B46A]'
                         : 'bg-slate-100 dark:bg-[#1F2430] border-transparent text-slate-700 dark:text-[#C8D0E4] hover:border-[#20B46A]'
@@ -2450,15 +3159,18 @@ export const WorldStage: React.FC<{ store: MakerStore }> = ({ store }) => {
                         type="button"
                         onClick={() => {
                           setDropCustomAssetId('');
+                          setActivePlacementAssetId(null);
                           setDropKind(k);
                         }}
-                        className={`shrink-0 inline-flex items-center gap-2 pl-1.5 pr-3 py-1 rounded-xl text-xs font-bold border transition-colors ${
+                        className={`shrink-0 inline-flex items-center gap-2 pl-1.5 pr-3 rounded-xl text-xs font-bold border transition-colors ${
+                          showLeftPanel ? 'py-1' : 'py-0.5'
+                        } ${
                           active
                             ? 'bg-[#7C5CFF] text-white border-[#7C5CFF]'
                             : 'bg-slate-100 dark:bg-[#1F2430] border-transparent hover:border-[#7C5CFF]'
                         }`}
                       >
-                        <AssetThumbnail kind={k} size={26} rounded="rounded-lg" />
+                        <AssetThumbnail kind={k} size={showLeftPanel ? 26 : 22} rounded="rounded-lg" />
                         <span className="whitespace-nowrap">{meta.defaultName}</span>
                       </button>
                     );
@@ -2470,18 +3182,181 @@ export const WorldStage: React.FC<{ store: MakerStore }> = ({ store }) => {
                       <button
                         key={asset.id}
                         type="button"
-                        onClick={() => setDropCustomAssetId(asset.id)}
-                        className={`shrink-0 inline-flex items-center gap-2 pl-1.5 pr-3 py-1 rounded-xl text-xs font-bold border transition-colors ${
+                        onClick={() => {
+                          setDropCustomAssetId(asset.id);
+                          setActivePlacementAssetId(asset.id);
+                        }}
+                        className={`shrink-0 inline-flex items-center gap-2 pl-1.5 pr-3 rounded-xl text-xs font-bold border transition-colors ${
+                          showLeftPanel ? 'py-1' : 'py-0.5'
+                        } ${
                           active
                             ? 'bg-[#20B46A] text-white border-[#20B46A]'
                             : 'bg-slate-100 dark:bg-[#1F2430] border-transparent hover:border-[#20B46A]'
                         }`}
                       >
-                        <AssetThumbnail customAsset={asset} size={26} rounded="rounded-lg" />
+                        <AssetThumbnail
+                          customAsset={asset}
+                          size={showLeftPanel ? 26 : 22}
+                          rounded="rounded-lg"
+                        />
                         <span className="whitespace-nowrap">{asset.name}</span>
                       </button>
                     );
                   })}
+                </div>
+              )}
+
+              {/* Building Curve Guide Strip (walls, fences, beams, sandstone along a curve) */}
+              {addPaletteMode === 'blocks' && (
+                <div className="pt-1.5 border-t border-slate-200/70 dark:border-white/[0.06] flex flex-wrap items-center gap-1.5">
+                  <button
+                    type="button"
+                    onClick={() => setCurveGuideEnabled((v) => !v)}
+                    className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-lg text-[11px] font-extrabold border transition-colors ${
+                      curveGuideEnabled
+                        ? 'bg-[#0EA5E9] border-[#0EA5E9] text-white'
+                        : 'bg-slate-100 dark:bg-[#1F2430] border-transparent text-slate-600 dark:text-[#949BB0] hover:border-[#0EA5E9]'
+                    }`}
+                  >
+                    <Spline size={12} />
+                    <span>Curve Guide</span>
+                  </button>
+
+                  {curveGuideEnabled && (
+                    <>
+                      <div className="inline-flex items-center gap-0.5 p-0.5 rounded-lg bg-slate-100 dark:bg-[#1F2430]">
+                        {(
+                          [
+                            { id: 'arc', label: 'Arc' },
+                            { id: 'sCurve', label: 'S-Curve' },
+                            { id: 'semiCircle', label: 'Half-Ring' },
+                            { id: 'circle', label: 'Ring' },
+                            { id: 'free', label: 'Click Points' },
+                          ] as { id: CurveGuidePresetId; label: string }[]
+                        ).map((p) => (
+                          <button
+                            key={p.id}
+                            type="button"
+                            onClick={() => applyBuildingCurvePreset(p.id)}
+                            className={`px-2 py-0.5 rounded-md text-[10px] font-bold transition-colors ${
+                              buildingCurve.preset === p.id
+                                ? 'bg-[#0EA5E9] text-white'
+                                : 'text-slate-600 dark:text-[#949BB0] hover:text-slate-900 dark:hover:text-white'
+                            }`}
+                          >
+                            {p.label}
+                          </button>
+                        ))}
+                      </div>
+
+                      {buildingCurve.preset !== 'free' && (
+                        <>
+                          <label className="inline-flex items-center gap-1 px-2 py-0.5 rounded-lg bg-slate-100 dark:bg-[#1F2430] text-[10px] font-bold">
+                            <span className="text-slate-500 dark:text-[#949BB0]">Span</span>
+                            <input
+                              type="range"
+                              min={4}
+                              max={28}
+                              step={1}
+                              value={curveSpan}
+                              onChange={(e) => {
+                                const v = Number(e.target.value);
+                                setCurveSpan(v);
+                                applyBuildingCurvePreset(buildingCurve.preset, v, curveBend);
+                              }}
+                              className="w-16 accent-[#0EA5E9]"
+                            />
+                            <span className="tabular-nums">{curveSpan}m</span>
+                          </label>
+                          <label className="inline-flex items-center gap-1 px-2 py-0.5 rounded-lg bg-slate-100 dark:bg-[#1F2430] text-[10px] font-bold">
+                            <span className="text-slate-500 dark:text-[#949BB0]">Bend</span>
+                            <input
+                              type="range"
+                              min={-10}
+                              max={10}
+                              step={0.5}
+                              value={curveBend}
+                              onChange={(e) => {
+                                const v = Number(e.target.value);
+                                setCurveBend(v);
+                                applyBuildingCurvePreset(buildingCurve.preset, curveSpan, v);
+                              }}
+                              className="w-16 accent-[#0EA5E9]"
+                            />
+                            <span className="tabular-nums">{curveBend.toFixed(1)}m</span>
+                          </label>
+                        </>
+                      )}
+
+                      {buildingCurve.preset === 'free' && (
+                        <>
+                          <button
+                            type="button"
+                            onClick={() => setCurvePickMode((v) => !v)}
+                            className={`px-2 py-1 rounded-lg text-[10px] font-extrabold ${
+                              curvePickMode
+                                ? 'bg-[#F59E0B] text-white'
+                                : 'bg-slate-100 dark:bg-[#1F2430] text-slate-600 dark:text-[#949BB0]'
+                            }`}
+                          >
+                            {curvePickMode ? 'Clicking Terrain…' : 'Pick Points'}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() =>
+                              setBuildingCurve((prev) => ({
+                                ...prev,
+                                preset: 'free',
+                                points: [],
+                              }))
+                            }
+                            className="px-2 py-1 rounded-lg bg-slate-100 dark:bg-[#1F2430] text-[10px] font-bold text-slate-600 dark:text-[#949BB0] hover:text-[#F2545B]"
+                          >
+                            Clear ({buildingCurve.points.length})
+                          </button>
+                        </>
+                      )}
+
+                      <label className="inline-flex items-center gap-1 px-2 py-0.5 rounded-lg bg-slate-100 dark:bg-[#1F2430] text-[10px] font-bold">
+                        <span className="text-slate-500 dark:text-[#949BB0]">Blocks</span>
+                        <input
+                          type="number"
+                          min={2}
+                          max={36}
+                          value={curveBlockCount}
+                          onChange={(e) =>
+                            setCurveBlockCount(Math.max(2, Math.min(36, Number(e.target.value) || 2)))
+                          }
+                          className="w-10 bg-transparent text-center font-extrabold tabular-nums focus:outline-none"
+                        />
+                      </label>
+
+                      <button
+                        type="button"
+                        onClick={() => {
+                          if (buildingCurve.points.length < 2) return;
+                          const len = computeCurveLength(buildingCurve);
+                          const blockWidth = Math.max(0.4, placementGhostSize[0]);
+                          setCurveBlockCount(
+                            Math.max(2, Math.min(36, Math.round(len / blockWidth) + (buildingCurve.closed ? 0 : 1)))
+                          );
+                        }}
+                        title="Auto-calculate block count to fit edge-to-edge along curve length"
+                        className="px-2 py-1 rounded-lg bg-slate-100 dark:bg-[#1F2430] hover:bg-[#0EA5E9]/15 text-[10px] font-bold text-slate-700 dark:text-[#C8D0E4]"
+                      >
+                        Auto-Fit
+                      </button>
+
+                      <button
+                        type="button"
+                        disabled={buildingCurve.points.length < 2}
+                        onClick={handleStampBuildingCurveBlocks}
+                        className="px-2.5 py-1 rounded-lg bg-[#20B46A] hover:bg-[#1A9A59] disabled:opacity-40 text-white text-[10px] font-extrabold"
+                      >
+                        Stamp {curveBlockCount} Along Curve
+                      </button>
+                    </>
+                  )}
                 </div>
               )}
             </div>
@@ -2490,6 +3365,7 @@ export const WorldStage: React.FC<{ store: MakerStore }> = ({ store }) => {
             <FxLibraryPanel
               templates={allFxTemplates}
               activePlaceTemplateId={placeFxTemplateId}
+              wideMode={!showLeftPanel}
               onSelectPlaceTemplate={(tpl) => {
                 if (tpl) {
                   setPlaceFxTemplateId(tpl.id);
@@ -2553,12 +3429,16 @@ export const WorldStage: React.FC<{ store: MakerStore }> = ({ store }) => {
                   <div className="flex items-center gap-1">
                     <button
                       type="button"
-                      onClick={() =>
+                      onClick={() => {
+                        const nextRot = (Math.round((currentEntity.rotation - 90) / 45) * 45 + 360) % 360;
                         store.updateEntity(currentEntity.id, 'rotate -90°', (ent) => ({
                           ...ent,
-                          rotation: (Math.round((ent.rotation - 90) / 90) * 90 + 360) % 360,
-                        }))
-                      }
+                          rotation: nextRot,
+                        }));
+                        if (keepToolAdjustments && (currentEntity.buildingBlock || currentEntity.kind === 'door')) {
+                          setActiveBlockAdjustments((prev) => ({ ...prev, rotation: nextRot }));
+                        }
+                      }}
                       className="px-1.5 py-0.5 rounded bg-slate-100 dark:bg-[#1F2430] hover:bg-[#7C5CFF]/20 text-[10px] font-bold"
                       title="Turn -90°"
                     >
@@ -2566,12 +3446,50 @@ export const WorldStage: React.FC<{ store: MakerStore }> = ({ store }) => {
                     </button>
                     <button
                       type="button"
-                      onClick={() =>
+                      onClick={() => {
+                        const nextRot = (Math.round((currentEntity.rotation - 45) / 45) * 45 + 360) % 360;
+                        store.updateEntity(currentEntity.id, 'rotate -45°', (ent) => ({
+                          ...ent,
+                          rotation: nextRot,
+                        }));
+                        if (keepToolAdjustments && (currentEntity.buildingBlock || currentEntity.kind === 'door')) {
+                          setActiveBlockAdjustments((prev) => ({ ...prev, rotation: nextRot }));
+                        }
+                      }}
+                      className="px-1.5 py-0.5 rounded bg-slate-100 dark:bg-[#1F2430] hover:bg-[#7C5CFF]/20 text-[10px] font-bold"
+                      title="Turn -45°"
+                    >
+                      -45°
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const nextRot = (Math.round((currentEntity.rotation + 45) / 45) * 45 + 360) % 360;
+                        store.updateEntity(currentEntity.id, 'rotate +45°', (ent) => ({
+                          ...ent,
+                          rotation: nextRot,
+                        }));
+                        if (keepToolAdjustments && (currentEntity.buildingBlock || currentEntity.kind === 'door')) {
+                          setActiveBlockAdjustments((prev) => ({ ...prev, rotation: nextRot }));
+                        }
+                      }}
+                      className="px-1.5 py-0.5 rounded bg-slate-100 dark:bg-[#1F2430] hover:bg-[#7C5CFF]/20 text-[10px] font-bold"
+                      title="Turn +45°"
+                    >
+                      +45°
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const nextRot = (Math.round((currentEntity.rotation + 90) / 45) * 45 + 360) % 360;
                         store.updateEntity(currentEntity.id, 'rotate +90°', (ent) => ({
                           ...ent,
-                          rotation: (Math.round((ent.rotation + 90) / 90) * 90 + 360) % 360,
-                        }))
-                      }
+                          rotation: nextRot,
+                        }));
+                        if (keepToolAdjustments && (currentEntity.buildingBlock || currentEntity.kind === 'door')) {
+                          setActiveBlockAdjustments((prev) => ({ ...prev, rotation: nextRot }));
+                        }
+                      }}
                       className="px-1.5 py-0.5 rounded bg-slate-100 dark:bg-[#1F2430] hover:bg-[#7C5CFF]/20 text-[10px] font-bold"
                       title="Turn +90° (or press R)"
                     >
@@ -2587,14 +3505,18 @@ export const WorldStage: React.FC<{ store: MakerStore }> = ({ store }) => {
                   min={0}
                   max={360}
                   value={currentEntity.rotation}
-                  onChange={(e) =>
+                  onChange={(e) => {
+                    const nextRot = Number(e.target.value);
                     store.updateEntity(
                       currentEntity.id,
                       'rotate',
-                      (ent) => ({ ...ent, rotation: Number(e.target.value) }),
+                      (ent) => ({ ...ent, rotation: nextRot }),
                       false
-                    )
-                  }
+                    );
+                    if (keepToolAdjustments && (currentEntity.buildingBlock || currentEntity.kind === 'door')) {
+                      setActiveBlockAdjustments((prev) => ({ ...prev, rotation: nextRot }));
+                    }
+                  }}
                   className="w-full accent-[#7C5CFF]"
                 />
               </div>
@@ -2632,6 +3554,22 @@ export const WorldStage: React.FC<{ store: MakerStore }> = ({ store }) => {
                     </button>
                   ))}
                 </div>
+                <input
+                  type="range"
+                  min={-2}
+                  max={8}
+                  step={0.05}
+                  value={currentEntity.elevationY ?? 0}
+                  onChange={(e) =>
+                    store.updateEntity(
+                      currentEntity.id,
+                      'fine elevation',
+                      (ent) => ({ ...ent, elevationY: Number(e.target.value) }),
+                      false
+                    )
+                  }
+                  className="w-full accent-[#F59E0B]"
+                />
               </div>
 
               <div className="space-y-1">
@@ -2647,14 +3585,18 @@ export const WorldStage: React.FC<{ store: MakerStore }> = ({ store }) => {
                   max={2.4}
                   step={0.1}
                   value={currentEntity.scale}
-                  onChange={(e) =>
+                  onChange={(e) => {
+                    const nextScale = Number(e.target.value);
                     store.updateEntity(
                       currentEntity.id,
                       'resize',
-                      (ent) => ({ ...ent, scale: Number(e.target.value) }),
+                      (ent) => ({ ...ent, scale: nextScale }),
                       false
-                    )
-                  }
+                    );
+                    if (keepToolAdjustments && (currentEntity.buildingBlock || currentEntity.kind === 'door')) {
+                      setActiveBlockAdjustments((prev) => ({ ...prev, scale: nextScale }));
+                    }
+                  }}
                   className="w-full accent-[#7C5CFF]"
                 />
               </div>
@@ -2662,18 +3604,71 @@ export const WorldStage: React.FC<{ store: MakerStore }> = ({ store }) => {
 
             {currentEntity.buildingBlock && (() => {
               const bb = currentEntity.buildingBlock!;
-              const patchBb = (label: string, patch: Partial<typeof bb>) =>
-                store.updateEntity(currentEntity.id, label, (ent) => ({
-                  ...ent,
-                  buildingBlock: { ...(ent.buildingBlock ?? bb), ...patch },
-                }));
+              const [baseW, baseH, baseD] = getBuildingShapeBaseSize(bb.shape);
+              const curW = Number((baseW * (bb.scaleX ?? 1)).toFixed(2));
+              const curH = Number((baseH * (bb.scaleY ?? 1)).toFixed(2));
+              const curD = Number((baseD * (bb.scaleZ ?? 1)).toFixed(2));
+              const patchBb = (label: string, patch: Partial<typeof bb>, recordUndo = true) => {
+                store.updateEntity(
+                  currentEntity.id,
+                  label,
+                  (ent) => ({
+                    ...ent,
+                    buildingBlock: { ...(ent.buildingBlock ?? bb), ...patch },
+                  }),
+                  recordUndo
+                );
+                if (keepToolAdjustments) {
+                  if (patch.shape) setActiveBuildShape(patch.shape);
+                  if (patch.material) setActiveBuildMaterial(patch.material);
+                  setActiveBlockAdjustments((prev) => ({
+                    ...prev,
+                    ...(patch.scaleX !== undefined ? { scaleX: patch.scaleX } : {}),
+                    ...(patch.scaleY !== undefined ? { scaleY: patch.scaleY } : {}),
+                    ...(patch.scaleZ !== undefined ? { scaleZ: patch.scaleZ } : {}),
+                    ...(patch.edgeWear !== undefined ? { edgeWear: patch.edgeWear } : {}),
+                    ...(patch.archStyle !== undefined ? { archStyle: patch.archStyle } : {}),
+                    ...(patch.windowStyle !== undefined ? { windowStyle: patch.windowStyle } : {}),
+                    ...(patch.roofStyle !== undefined ? { roofStyle: patch.roofStyle } : {}),
+                    ...(patch.roofMedievalTruss !== undefined ? { roofMedievalTruss: patch.roofMedievalTruss } : {}),
+                    ...(patch.beamOrientation !== undefined ? { beamOrientation: patch.beamOrientation } : {}),
+                    ...(patch.fenceStyle !== undefined ? { fenceStyle: patch.fenceStyle } : {}),
+                  }));
+                }
+              };
+              const isWallLike =
+                bb.shape === 'wallCube' || bb.shape === 'wallCubeHalf' || bb.shape === 'halfWall';
               return (
                 <div className="p-2.5 rounded-xl bg-slate-100 dark:bg-[#1F2430] space-y-2.5">
-                  <div className="flex items-center justify-between">
+                  <div className="flex items-center justify-between gap-1">
                     <span className="text-[10px] font-bold uppercase tracking-wider text-slate-500 dark:text-[#949BB0]">
                       Building Block
                     </span>
-                    <span className="text-[10px] font-bold text-[#F59E0B]">2m Grid Kit</span>
+                    <div className="flex items-center gap-1">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          if (!keepToolAdjustments) setKeepToolAdjustments(true);
+                          captureEntityIntoActiveTool(currentEntity);
+                        }}
+                        title="Copy this block's exact size, rotation & style to the active placement tool"
+                        className="px-2 py-0.5 rounded-md text-[10px] font-extrabold bg-[#F59E0B]/15 text-[#D97706] dark:text-[#FBBF24] hover:bg-[#F59E0B]/25 transition-colors"
+                      >
+                        Use on Tool
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => toggleKeepToolAdjustments()}
+                        title="Keep these adjustments on the active placement tool"
+                        className={`px-2 py-0.5 rounded-md text-[10px] font-extrabold transition-colors ${
+                          keepToolAdjustments
+                            ? 'bg-[#7C5CFF] text-white'
+                            : 'bg-white dark:bg-[#171A23] text-slate-500 dark:text-[#949BB0] hover:text-[#7C5CFF]'
+                        }`}
+                      >
+                        Keep: {keepToolAdjustments ? 'ON' : 'OFF'}
+                      </button>
+                    </div>
                   </div>
 
                   <label className="block space-y-1">
@@ -2682,9 +3677,17 @@ export const WorldStage: React.FC<{ store: MakerStore }> = ({ store }) => {
                     </span>
                     <select
                       value={bb.shape}
-                      onChange={(e) =>
-                        patchBb('change block shape', { shape: e.target.value as BuildingShapeId })
-                      }
+                      onChange={(e) => {
+                        const nextShape = e.target.value as BuildingShapeId;
+                        const isCube = nextShape === 'wallCube' || nextShape === 'wallCubeHalf';
+                        if (bb.material === 'sandstone' && !isCube) {
+                          const defMat =
+                            BUILDING_SHAPES.find((s) => s.id === nextShape)?.defaultMaterial ?? 'hewnStone';
+                          patchBb('change block shape', { shape: nextShape, material: defMat });
+                        } else {
+                          patchBb('change block shape', { shape: nextShape });
+                        }
+                      }}
                       className="w-full px-2.5 py-1.5 rounded-lg bg-white dark:bg-[#171A23] text-xs font-semibold"
                     >
                       {BUILDING_SHAPES.map((s) => (
@@ -2694,6 +3697,134 @@ export const WorldStage: React.FC<{ store: MakerStore }> = ({ store }) => {
                       ))}
                     </select>
                   </label>
+
+                  {/* Per-axis Width / Height / Length reshaping */}
+                  <div className="p-2 rounded-lg bg-white/80 dark:bg-[#171A23]/80 space-y-2">
+                    <div className="flex items-center justify-between">
+                      <span className="text-[10px] font-bold uppercase tracking-wider text-slate-500 dark:text-[#949BB0]">
+                        Dimensions (W × H × L)
+                      </span>
+                      <div className="flex items-center gap-1.5">
+                        <span className="text-[10px] font-bold tabular-nums text-[#F59E0B]">
+                          {curW.toFixed(2)}×{curH.toFixed(2)}×{curD.toFixed(2)}m
+                        </span>
+                        {((bb.scaleX ?? 1) !== 1 || (bb.scaleY ?? 1) !== 1 || (bb.scaleZ ?? 1) !== 1) && (
+                          <button
+                            type="button"
+                            onClick={() =>
+                              patchBb('reset block dimensions', { scaleX: 1, scaleY: 1, scaleZ: 1 })
+                            }
+                            className="text-[10px] font-bold text-[#7C5CFF] hover:underline"
+                          >
+                            Reset
+                          </button>
+                        )}
+                      </div>
+                    </div>
+
+                    <div className="space-y-1.5">
+                      <div className="space-y-0.5">
+                        <div className="flex justify-between text-[10px] font-semibold">
+                          <span>Width (X)</span>
+                          <span className="tabular-nums text-slate-500 dark:text-[#949BB0]">
+                            {curW.toFixed(2)}m
+                          </span>
+                        </div>
+                        <input
+                          type="range"
+                          min={0.2}
+                          max={6.0}
+                          step={0.05}
+                          value={curW}
+                          onChange={(e) => {
+                            const meters = Number(e.target.value);
+                            patchBb('resize width', { scaleX: Number((meters / baseW).toFixed(3)) }, false);
+                          }}
+                          className="w-full accent-[#7C5CFF]"
+                        />
+                      </div>
+
+                      <div className="space-y-0.5">
+                        <div className="flex justify-between text-[10px] font-semibold">
+                          <span>Height (Y)</span>
+                          <span className="tabular-nums text-slate-500 dark:text-[#949BB0]">
+                            {curH.toFixed(2)}m
+                          </span>
+                        </div>
+                        <input
+                          type="range"
+                          min={0.2}
+                          max={6.0}
+                          step={0.05}
+                          value={curH}
+                          onChange={(e) => {
+                            const meters = Number(e.target.value);
+                            patchBb('resize height', { scaleY: Number((meters / baseH).toFixed(3)) }, false);
+                          }}
+                          className="w-full accent-[#7C5CFF]"
+                        />
+                      </div>
+
+                      <div className="space-y-0.5">
+                        <div className="flex justify-between text-[10px] font-semibold">
+                          <span>Length / Thick (Z)</span>
+                          <span className="tabular-nums text-slate-500 dark:text-[#949BB0]">
+                            {curD.toFixed(2)}m
+                          </span>
+                        </div>
+                        <input
+                          type="range"
+                          min={0.2}
+                          max={6.0}
+                          step={0.05}
+                          value={curD}
+                          onChange={(e) => {
+                            const meters = Number(e.target.value);
+                            patchBb('resize length', { scaleZ: Number((meters / baseD).toFixed(3)) }, false);
+                          }}
+                          className="w-full accent-[#7C5CFF]"
+                        />
+                      </div>
+                    </div>
+
+                    {isWallLike && (
+                      <div className="grid grid-cols-4 gap-1 pt-0.5">
+                        {(
+                          [
+                            { label: 'Slim .5m', w: 2.0, h: 2.0, d: 0.5 },
+                            { label: '1m Thick', w: 2.0, h: 2.0, d: 1.0 },
+                            { label: '1×1×1m', w: 1.0, h: 1.0, d: 1.0 },
+                            { label: '2×2×2m', w: 2.0, h: 2.0, d: 2.0 },
+                          ] as const
+                        ).map((preset) => {
+                          const active =
+                            Math.abs(curW - preset.w) < 0.06 &&
+                            Math.abs(curH - preset.h) < 0.06 &&
+                            Math.abs(curD - preset.d) < 0.06;
+                          return (
+                            <button
+                              key={preset.label}
+                              type="button"
+                              onClick={() =>
+                                patchBb(`preset wall ${preset.label}`, {
+                                  scaleX: Number((preset.w / baseW).toFixed(3)),
+                                  scaleY: Number((preset.h / baseH).toFixed(3)),
+                                  scaleZ: Number((preset.d / baseD).toFixed(3)),
+                                })
+                              }
+                              className={`py-1 rounded text-[9px] font-bold transition-colors ${
+                                active
+                                  ? 'bg-[#F59E0B] text-white'
+                                  : 'bg-slate-100 dark:bg-[#1F2430] text-slate-600 dark:text-[#949BB0] hover:text-slate-900 dark:hover:text-white'
+                              }`}
+                            >
+                              {preset.label}
+                            </button>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
 
                   <div className="space-y-1">
                     <span className="text-[10px] font-bold text-slate-500 dark:text-[#949BB0] block">
@@ -2706,7 +3837,28 @@ export const WorldStage: React.FC<{ store: MakerStore }> = ({ store }) => {
                           <button
                             key={mat.id}
                             type="button"
-                            onClick={() => patchBb('change block material', { material: mat.id })}
+                            onClick={() => {
+                              const patch: Partial<typeof bb> = { material: mat.id };
+                              if (mat.id === 'sandstone') {
+                                if (bb.shape !== 'wallCube' && bb.shape !== 'wallCubeHalf') {
+                                  patch.shape = 'wallCube';
+                                }
+                                if (bb.edgeWear === undefined) {
+                                  patch.edgeWear = 0.35;
+                                }
+                              } else if (
+                                (bb.shape === 'roofAFrame' || bb.shape === 'roofSlope') &&
+                                (mat.category === 'roof' || mat.id === 'weatheredSlats')
+                              ) {
+                                patch.roofStyle = inferRoofStyleFromMaterial(mat.id);
+                              }
+                              patchBb('change block material', patch);
+                            }}
+                            title={
+                              mat.id === 'sandstone'
+                                ? 'Sandstone — Organic beveled cube (no pattern)'
+                                : mat.label
+                            }
                             className={`flex items-center gap-1 px-1.5 py-1 rounded-lg text-[10px] font-bold border transition-colors ${
                               active
                                 ? 'border-[#F59E0B] bg-[#F59E0B]/15 text-[#D97706] dark:text-[#FBBF24]'
@@ -2723,6 +3875,83 @@ export const WorldStage: React.FC<{ store: MakerStore }> = ({ store }) => {
                       })}
                     </div>
                   </div>
+
+                  {(isWallLike || bb.material === 'sandstone') && (() => {
+                    const edgeWearVal = bb.edgeWear ?? (bb.material === 'sandstone' ? 0.35 : 0);
+                    const edgeWearLabel =
+                      edgeWearVal <= 0.02
+                        ? bb.material === 'sandstone'
+                          ? 'Crisp Chamfer'
+                          : 'Sharp Edge'
+                        : edgeWearVal < 0.3
+                        ? 'Light Bevel'
+                        : edgeWearVal < 0.65
+                        ? 'Worn Chamfers'
+                        : edgeWearVal < 0.88
+                        ? 'Chipped Edges'
+                        : 'Heavily Eroded';
+                    return (
+                      <div className="p-2 rounded-lg bg-white/80 dark:bg-[#171A23]/80 space-y-1.5">
+                        <div className="flex items-center justify-between gap-2 text-[10px] font-semibold">
+                          <span className="font-bold uppercase tracking-wider text-slate-500 dark:text-[#949BB0]">
+                            Bevel &amp; Edge Erosion
+                          </span>
+                          <div className="flex items-center gap-1.5">
+                            <span
+                              className={`font-bold ${
+                                edgeWearVal > 0.02
+                                  ? 'text-[#D97706] dark:text-[#FBBF24]'
+                                  : 'text-slate-400 dark:text-[#7D859B]'
+                              }`}
+                            >
+                              {edgeWearLabel}
+                            </span>
+                            <span className="tabular-nums text-slate-500 dark:text-[#949BB0]">
+                              {Math.round(edgeWearVal * 100)}%
+                            </span>
+                          </div>
+                        </div>
+                        <input
+                          type="range"
+                          min={0}
+                          max={1}
+                          step={0.01}
+                          value={edgeWearVal}
+                          aria-label="Bevel and Edge Erosion"
+                          onChange={(e) => {
+                            patchBb('erode block edges & chamfers', { edgeWear: Number(e.target.value) }, false);
+                          }}
+                          className="w-full accent-[#D97706]"
+                        />
+                        <div className="grid grid-cols-4 gap-1">
+                          {(
+                            [
+                              { label: 'Crisp', val: 0.15 },
+                              { label: 'Worn', val: 0.4 },
+                              { label: 'Chipped', val: 0.75 },
+                              { label: 'Ruined', val: 1.0 },
+                            ] as const
+                          ).map((preset) => (
+                            <button
+                              key={preset.label}
+                              type="button"
+                              onClick={() => patchBb(`edge wear ${preset.label}`, { edgeWear: preset.val })}
+                              className={`py-1 rounded text-[9px] font-bold transition-colors ${
+                                Math.abs(edgeWearVal - preset.val) < 0.04
+                                  ? 'bg-[#D97706] text-white'
+                                  : 'bg-slate-100 dark:bg-[#1F2430] text-slate-600 dark:text-[#949BB0] hover:text-slate-900 dark:hover:text-white'
+                              }`}
+                            >
+                              {preset.label}
+                            </button>
+                          ))}
+                        </div>
+                        <p className="text-[9px] text-slate-400 dark:text-[#7D859B] leading-tight">
+                          Tapers &amp; erodes bevels, chamfers, and corners so stacked stones cast natural joint shadows.
+                        </p>
+                      </div>
+                    );
+                  })()}
 
                   {bb.shape === 'archway' && (
                     <div className="space-y-1">
@@ -2753,8 +3982,8 @@ export const WorldStage: React.FC<{ store: MakerStore }> = ({ store }) => {
                       <span className="text-[10px] font-bold text-slate-500 dark:text-[#949BB0] block">
                         Window Style
                       </span>
-                      <div className="grid grid-cols-3 gap-1">
-                        {(['open', 'barred', 'shuttered'] as const).map((wId) => (
+                      <div className="grid grid-cols-2 gap-1">
+                        {(['open', 'barred', 'shuttered', 'paned'] as const).map((wId) => (
                           <button
                             key={wId}
                             type="button"
@@ -2771,17 +4000,196 @@ export const WorldStage: React.FC<{ store: MakerStore }> = ({ store }) => {
                       </div>
                     </div>
                   )}
+
+                  {(bb.shape === 'roofAFrame' || bb.shape === 'roofSlope') && (
+                    <div className="space-y-2">
+                      <div className="space-y-1">
+                        <span className="text-[10px] font-bold text-slate-500 dark:text-[#949BB0] block">
+                          Roof Covering
+                        </span>
+                        <div className="grid grid-cols-2 gap-1">
+                          {(
+                            [
+                              { id: 'thatched', label: 'Thatched' },
+                              { id: 'tiled', label: 'Tiled' },
+                              { id: 'shingled', label: 'Shingled' },
+                              { id: 'woodSlats', label: 'Wood Slats' },
+                            ] as { id: RoofStyleId; label: string }[]
+                          ).map((opt) => {
+                            const activeStyle =
+                              (bb.roofStyle ?? inferRoofStyleFromMaterial(bb.material)) === opt.id;
+                            return (
+                              <button
+                                key={opt.id}
+                                type="button"
+                                onClick={() =>
+                                  patchBb('change roof style', {
+                                    roofStyle: opt.id,
+                                    material: roofStyleToMaterial(opt.id),
+                                  })
+                                }
+                                className={`py-1 rounded-lg text-[10px] font-bold ${
+                                  activeStyle
+                                    ? 'bg-[#F59E0B] text-white'
+                                    : 'bg-white dark:bg-[#171A23] text-slate-600 dark:text-[#949BB0]'
+                                }`}
+                              >
+                                {opt.label}
+                              </button>
+                            );
+                          })}
+                        </div>
+                      </div>
+                      <label className="flex items-center justify-between text-[11px] font-semibold cursor-pointer">
+                        <span>Medieval Timber Truss</span>
+                        <input
+                          type="checkbox"
+                          checked={bb.roofMedievalTruss !== false}
+                          onChange={(e) =>
+                            patchBb('toggle medieval roof truss', {
+                              roofMedievalTruss: e.target.checked,
+                            })
+                          }
+                          className="accent-[#F59E0B] w-4 h-4"
+                        />
+                      </label>
+                    </div>
+                  )}
+
+                  {bb.shape === 'roofGable' && (
+                    <label className="flex items-center justify-between text-[11px] font-semibold cursor-pointer">
+                      <span>Medieval Timber Framing</span>
+                      <input
+                        type="checkbox"
+                        checked={bb.roofMedievalTruss !== false}
+                        onChange={(e) =>
+                          patchBb('toggle gable timber framing', {
+                            roofMedievalTruss: e.target.checked,
+                          })
+                        }
+                        className="accent-[#F59E0B] w-4 h-4"
+                      />
+                    </label>
+                  )}
+
+                  {bb.shape === 'fence' && (
+                    <div className="space-y-1">
+                      <span className="text-[10px] font-bold text-slate-500 dark:text-[#949BB0] block">
+                        Fence Style
+                      </span>
+                      <div className="grid grid-cols-3 gap-1">
+                        {(
+                          [
+                            { id: 'rail', label: 'Split Rail' },
+                            { id: 'picket', label: 'Picket' },
+                            { id: 'medieval', label: 'X-Brace' },
+                          ] as { id: FenceStyleId; label: string }[]
+                        ).map((opt) => (
+                          <button
+                            key={opt.id}
+                            type="button"
+                            onClick={() => patchBb('change fence style', { fenceStyle: opt.id })}
+                            className={`py-1 rounded-lg text-[10px] font-bold ${
+                              (bb.fenceStyle ?? 'rail') === opt.id
+                                ? 'bg-[#7C5CFF] text-white'
+                                : 'bg-white dark:bg-[#171A23] text-slate-600 dark:text-[#949BB0]'
+                            }`}
+                          >
+                            {opt.label}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {bb.shape === 'porchSteps' && (
+                    <div className="space-y-1">
+                      <span className="text-[10px] font-bold text-slate-500 dark:text-[#949BB0] block">
+                        Step Material Preset
+                      </span>
+                      <div className="grid grid-cols-2 gap-1">
+                        <button
+                          type="button"
+                          onClick={() => patchBb('set wood steps', { material: 'timberPlank' })}
+                          className={`py-1 rounded-lg text-[10px] font-bold ${
+                            bb.material === 'timberPlank' ||
+                            bb.material === 'roundLogs' ||
+                            bb.material === 'weatheredSlats'
+                              ? 'bg-[#F59E0B] text-white'
+                              : 'bg-white dark:bg-[#171A23] text-slate-600 dark:text-[#949BB0]'
+                          }`}
+                        >
+                          Wood Steps
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => patchBb('set stone steps', { material: 'hewnStone' })}
+                          className={`py-1 rounded-lg text-[10px] font-bold ${
+                            bb.material !== 'timberPlank' &&
+                            bb.material !== 'roundLogs' &&
+                            bb.material !== 'weatheredSlats'
+                              ? 'bg-[#7C5CFF] text-white'
+                              : 'bg-white dark:bg-[#171A23] text-slate-600 dark:text-[#949BB0]'
+                          }`}
+                        >
+                          Stone Steps
+                        </button>
+                      </div>
+                    </div>
+                  )}
+
+                  {(bb.shape === 'beamLarge' ||
+                    bb.shape === 'beamSmall' ||
+                    bb.shape === 'plankTrim') && (
+                    <div className="space-y-1">
+                      <span className="text-[10px] font-bold text-slate-500 dark:text-[#949BB0] block">
+                        Beam Angle / Pose
+                      </span>
+                      <div className="grid grid-cols-2 gap-1">
+                        {(
+                          [
+                            { id: 'horizontal', label: 'Flat (0°)' },
+                            { id: 'vertical', label: 'Upright (90°)' },
+                            { id: 'diag45', label: 'Brace (+45°)' },
+                            { id: 'diagNeg45', label: 'Brace (-45°)' },
+                          ] as { id: BeamOrientation; label: string }[]
+                        ).map((opt) => (
+                          <button
+                            key={opt.id}
+                            type="button"
+                            onClick={() =>
+                              patchBb('change beam angle', { beamOrientation: opt.id })
+                            }
+                            className={`py-1 rounded-lg text-[10px] font-bold ${
+                              (bb.beamOrientation ?? 'horizontal') === opt.id
+                                ? 'bg-[#F59E0B] text-white'
+                                : 'bg-white dark:bg-[#171A23] text-slate-600 dark:text-[#949BB0]'
+                            }`}
+                          >
+                            {opt.label}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  )}
                 </div>
               );
             })()}
 
             {currentEntity.kind === 'door' && (() => {
               const dc = currentEntity.doorConfig;
-              const patchDoor = (label: string, patch: Partial<DoorConfig>) =>
+              const patchDoor = (label: string, patch: Partial<DoorConfig>) => {
+                const nextDc = { ...(dc ?? DEFAULT_DOOR_CONFIG), ...patch };
                 store.updateEntity(currentEntity.id, label, (ent) => ({
                   ...ent,
                   doorConfig: { ...(ent.doorConfig ?? DEFAULT_DOOR_CONFIG), ...patch },
                 }));
+                if (keepToolAdjustments) {
+                  setActiveBuildShape(nextDc.leafStyle === 'rusticWood' ? 'rusticDoor' : 'door');
+                  if (nextDc.frameMaterial) setActiveBuildMaterial(nextDc.frameMaterial);
+                  setActiveBlockAdjustments((prev) => ({ ...prev, doorConfig: nextDc }));
+                }
+              };
               return (
                 <div className="p-2.5 rounded-xl bg-slate-100 dark:bg-[#1F2430] space-y-2.5">
                   <div className="flex items-center justify-between">
@@ -2853,6 +4261,7 @@ export const WorldStage: React.FC<{ store: MakerStore }> = ({ store }) => {
                             }
                             className="w-full px-2 py-1 rounded-lg bg-white dark:bg-[#171A23] text-[11px] font-semibold"
                           >
+                            <option value="rusticWood">Rustic Wood</option>
                             <option value="woodPlank">Wooden Plank</option>
                             <option value="solidMetal">Solid Iron</option>
                             <option value="ironBars">Metal Bars</option>
@@ -2892,13 +4301,52 @@ export const WorldStage: React.FC<{ store: MakerStore }> = ({ store }) => {
                           }
                           className="w-full px-2 py-1 rounded-lg bg-white dark:bg-[#171A23] text-[11px] font-semibold"
                         >
-                          {BUILDING_MATERIALS.map((mat) => (
+                          {BUILDING_MATERIALS.filter((m) => m.id !== 'sandstone').map((mat) => (
                             <option key={mat.id} value={mat.id}>
                               {mat.label}
                             </option>
                           ))}
                         </select>
                       </label>
+
+                      <div className="grid grid-cols-2 gap-1">
+                        <button
+                          type="button"
+                          onClick={() =>
+                            patchDoor('preset rustic wood rect door', {
+                              leafStyle: 'rusticWood',
+                              frameShape: 'rectangular',
+                              openMode: 'hingedSide',
+                              frameMaterial: 'timberPlank',
+                            })
+                          }
+                          className={`py-1 rounded-lg text-[10px] font-bold ${
+                            dc.leafStyle === 'rusticWood' && dc.frameShape === 'rectangular'
+                              ? 'bg-[#F59E0B] text-white'
+                              : 'bg-white dark:bg-[#171A23] text-slate-600 dark:text-[#949BB0]'
+                          }`}
+                        >
+                          Rustic Wood (Rect)
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() =>
+                            patchDoor('preset rustic wood arched door', {
+                              leafStyle: 'rusticWood',
+                              frameShape: 'arched',
+                              openMode: 'hingedSide',
+                              frameMaterial: 'timberPlank',
+                            })
+                          }
+                          className={`py-1 rounded-lg text-[10px] font-bold ${
+                            dc.leafStyle === 'rusticWood' && dc.frameShape === 'arched'
+                              ? 'bg-[#F59E0B] text-white'
+                              : 'bg-white dark:bg-[#171A23] text-slate-600 dark:text-[#949BB0]'
+                          }`}
+                        >
+                          Rustic Wood (Arched)
+                        </button>
+                      </div>
 
                       <label className="flex items-center justify-between text-xs font-semibold cursor-pointer pt-0.5">
                         <span>Requires Key to Unlock</span>
@@ -3040,12 +4488,15 @@ export const WorldStage: React.FC<{ store: MakerStore }> = ({ store }) => {
                     {currentEntity.materialVariant && (
                       <button
                         type="button"
-                        onClick={() =>
+                        onClick={() => {
                           store.updateEntity(currentEntity.id, 'reset material variant', (ent) => ({
                             ...ent,
                             materialVariant: undefined,
-                          }))
-                        }
+                          }));
+                          if (keepToolAdjustments && (currentEntity.buildingBlock || currentEntity.kind === 'door')) {
+                            setActiveBlockAdjustments((prev) => ({ ...prev, materialVariant: undefined }));
+                          }
+                        }}
                         className="text-[10px] font-bold text-[#7C5CFF] hover:underline"
                       >
                         Reset
@@ -3073,21 +4524,33 @@ export const WorldStage: React.FC<{ store: MakerStore }> = ({ store }) => {
                             }),
                             false
                           );
+                          if (keepToolAdjustments && (currentEntity.buildingBlock || currentEntity.kind === 'door')) {
+                            setActiveBlockAdjustments((prev) => ({
+                              ...prev,
+                              materialVariant: { ...prev.materialVariant, colorHex: hex },
+                            }));
+                          }
                         }}
                         className="w-7 h-6 rounded border border-slate-300 dark:border-white/15 bg-transparent cursor-pointer"
                       />
                       {currentEntity.materialVariant?.colorHex && (
                         <button
                           type="button"
-                          onClick={() =>
+                          onClick={() => {
                             store.updateEntity(currentEntity.id, 'clear material tint', (ent) => ({
                               ...ent,
                               materialVariant: {
                                 ...ent.materialVariant,
                                 colorHex: undefined,
                               },
-                            }))
-                          }
+                            }));
+                            if (keepToolAdjustments && (currentEntity.buildingBlock || currentEntity.kind === 'door')) {
+                              setActiveBlockAdjustments((prev) => ({
+                                ...prev,
+                                materialVariant: { ...prev.materialVariant, colorHex: undefined },
+                              }));
+                            }
+                          }}
                           className="px-1.5 py-0.5 rounded bg-white dark:bg-[#171A23] text-[10px] font-semibold"
                         >
                           Clear
@@ -3123,6 +4586,12 @@ export const WorldStage: React.FC<{ store: MakerStore }> = ({ store }) => {
                           }),
                           false
                         );
+                        if (keepToolAdjustments && (currentEntity.buildingBlock || currentEntity.kind === 'door')) {
+                          setActiveBlockAdjustments((prev) => ({
+                            ...prev,
+                            materialVariant: { ...prev.materialVariant, roughness },
+                          }));
+                        }
                       }}
                       className="w-full accent-[#7C5CFF]"
                     />
@@ -3155,6 +4624,12 @@ export const WorldStage: React.FC<{ store: MakerStore }> = ({ store }) => {
                           }),
                           false
                         );
+                        if (keepToolAdjustments && (currentEntity.buildingBlock || currentEntity.kind === 'door')) {
+                          setActiveBlockAdjustments((prev) => ({
+                            ...prev,
+                            materialVariant: { ...prev.materialVariant, diffuseRoughness },
+                          }));
+                        }
                       }}
                       className="w-full accent-[#20B46A]"
                     />
@@ -3213,6 +4688,12 @@ export const WorldStage: React.FC<{ store: MakerStore }> = ({ store }) => {
                                 }),
                                 false
                               );
+                              if (keepToolAdjustments && (currentEntity.buildingBlock || currentEntity.kind === 'door')) {
+                                setActiveBlockAdjustments((prev) => ({
+                                  ...prev,
+                                  materialVariant: { ...prev.materialVariant, wearFactor },
+                                }));
+                              }
                             }}
                             className="w-full accent-[#D97706]"
                           />
@@ -3237,7 +4718,7 @@ export const WorldStage: React.FC<{ store: MakerStore }> = ({ store }) => {
                             key={preset.id}
                             type="button"
                             title={preset.shortDesc}
-                            onClick={() =>
+                            onClick={() => {
                               store.updateEntity(currentEntity.id, 'set weathering preset', (ent) => ({
                                 ...ent,
                                 materialVariant: {
@@ -3245,8 +4726,18 @@ export const WorldStage: React.FC<{ store: MakerStore }> = ({ store }) => {
                                   weathering: preset.id,
                                   weatheringIntensity: ent.materialVariant?.weatheringIntensity ?? 0.65,
                                 },
-                              }))
-                            }
+                              }));
+                              if (keepToolAdjustments && (currentEntity.buildingBlock || currentEntity.kind === 'door')) {
+                                setActiveBlockAdjustments((prev) => ({
+                                  ...prev,
+                                  materialVariant: {
+                                    ...prev.materialVariant,
+                                    weathering: preset.id,
+                                    weatheringIntensity: prev.materialVariant?.weatheringIntensity ?? 0.65,
+                                  },
+                                }));
+                              }
+                            }}
                             className={`flex items-center justify-center gap-1 py-1 px-1 rounded-lg text-[10px] font-bold transition-colors ${
                               active
                                 ? 'bg-[#7C5CFF] text-white'
@@ -3292,6 +4783,12 @@ export const WorldStage: React.FC<{ store: MakerStore }> = ({ store }) => {
                             }),
                             false
                           );
+                          if (keepToolAdjustments && (currentEntity.buildingBlock || currentEntity.kind === 'door')) {
+                            setActiveBlockAdjustments((prev) => ({
+                              ...prev,
+                              materialVariant: { ...prev.materialVariant, weatheringIntensity },
+                            }));
+                          }
                         }}
                         className="w-full accent-[#20B46A]"
                       />
@@ -3333,6 +4830,16 @@ export const WorldStage: React.FC<{ store: MakerStore }> = ({ store }) => {
                   </button>
                 );
               })()}
+              {selectedEntityCustom && (
+                <button
+                  type="button"
+                  onClick={() => store.openObjectMaker(selectedEntityCustom.id)}
+                  className="w-full py-2 rounded-xl bg-[#7C5CFF] text-white text-xs font-extrabold hover:bg-[#6A48F5] inline-flex items-center justify-center gap-1.5 shadow-xs"
+                >
+                  <Shapes size={13} />
+                  <span>Edit in Object Maker &amp; Mechanics</span>
+                </button>
+              )}
               {currentEntity.kind !== 'fxEmitter' && (
                 <button
                   type="button"
@@ -3395,6 +4902,149 @@ export const WorldStage: React.FC<{ store: MakerStore }> = ({ store }) => {
               </button>
             </div>
           </>
+        ) : activeTool === 'add' && addPaletteMode === 'blocks' && !activePlaceFxTemplate ? (
+          (() => {
+            const isDoorTool = activeBuildShape === 'door' || activeBuildShape === 'rusticDoor';
+            const [baseW, baseH, baseD] = isDoorTool
+              ? [2.0, 2.4, 0.7]
+              : getBuildingShapeBaseSize(activeBuildShape);
+            const curW = Number((baseW * activeBlockAdjustments.scaleX).toFixed(2));
+            const curH = Number((baseH * activeBlockAdjustments.scaleY).toFixed(2));
+            const curD = Number((baseD * activeBlockAdjustments.scaleZ).toFixed(2));
+            const shapeLabel =
+              activeBuildShape === 'door'
+                ? 'Modular Door'
+                : activeBuildShape === 'rusticDoor'
+                ? 'Rustic Door'
+                : BUILDING_SHAPES.find((s) => s.id === activeBuildShape)?.label ?? 'Block';
+            return (
+              <div className="p-3 rounded-2xl bg-slate-100 dark:bg-[#1F2430] space-y-3">
+                <div className="flex items-center justify-between gap-2">
+                  <div>
+                    <div className="text-[10px] font-bold uppercase tracking-wider text-slate-500 dark:text-[#949BB0]">
+                      Active Placement Tool
+                    </div>
+                    <div className="text-sm font-extrabold text-slate-900 dark:text-white">
+                      {shapeLabel}
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => toggleKeepToolAdjustments()}
+                    className={`px-2 py-1 rounded-lg text-[10px] font-extrabold transition-colors ${
+                      keepToolAdjustments
+                        ? 'bg-[#7C5CFF] text-white'
+                        : 'bg-white dark:bg-[#171A23] text-slate-600 dark:text-[#949BB0] hover:text-[#7C5CFF]'
+                    }`}
+                  >
+                    Keep: {keepToolAdjustments ? 'ON' : 'OFF'}
+                  </button>
+                </div>
+
+                <p className="text-[11px] text-slate-500 dark:text-[#949BB0] leading-snug">
+                  Click in the 3D scene to drop, or tweak dimensions &amp; angle below (auto-enables Keep Adjustments).
+                </p>
+
+                {!isDoorTool && (
+                  <div className="p-2 rounded-xl bg-white/80 dark:bg-[#171A23]/80 space-y-1.5">
+                    <div className="flex items-center justify-between text-[10px] font-bold">
+                      <span className="uppercase tracking-wider text-slate-500 dark:text-[#949BB0]">
+                        Dimensions
+                      </span>
+                      <span className="tabular-nums text-[#F59E0B]">
+                        {curW.toFixed(2)}×{curH.toFixed(2)}×{curD.toFixed(2)}m
+                      </span>
+                    </div>
+                    {(
+                      [
+                        { key: 'scaleX' as const, label: 'Width (X)', val: curW, base: baseW },
+                        { key: 'scaleY' as const, label: 'Height (Y)', val: curH, base: baseH },
+                        { key: 'scaleZ' as const, label: 'Length (Z)', val: curD, base: baseD },
+                      ]
+                    ).map((axis) => (
+                      <div key={axis.key} className="space-y-0.5">
+                        <div className="flex justify-between text-[10px] font-semibold">
+                          <span>{axis.label}</span>
+                          <span className="tabular-nums text-slate-500 dark:text-[#949BB0]">
+                            {axis.val.toFixed(2)}m
+                          </span>
+                        </div>
+                        <input
+                          type="range"
+                          min={0.2}
+                          max={6.0}
+                          step={0.05}
+                          value={axis.val}
+                          onChange={(e) => {
+                            const meters = Number(e.target.value);
+                            if (!keepToolAdjustments) setKeepToolAdjustments(true);
+                            setActiveBlockAdjustments((prev) => ({
+                              ...prev,
+                              [axis.key]: Number((meters / axis.base).toFixed(3)),
+                            }));
+                          }}
+                          className="w-full accent-[#7C5CFF]"
+                        />
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                {!isDoorTool && (activeBuildMaterial === 'sandstone' || activeBuildShape === 'wallCube' || activeBuildShape === 'wallCubeHalf' || activeBuildShape === 'halfWall') && (
+                  <div className="p-2 rounded-xl bg-white/80 dark:bg-[#171A23]/80 space-y-1.5">
+                    <div className="flex items-center justify-between text-[10px] font-bold">
+                      <span className="uppercase tracking-wider text-slate-500 dark:text-[#949BB0]">
+                        Bevel &amp; Edge Erosion
+                      </span>
+                      <span className="tabular-nums text-[#D97706] dark:text-[#FBBF24]">
+                        {Math.round(activeBlockAdjustments.edgeWear * 100)}%
+                      </span>
+                    </div>
+                    <input
+                      type="range"
+                      min={0}
+                      max={1}
+                      step={0.01}
+                      value={activeBlockAdjustments.edgeWear}
+                      onChange={(e) => {
+                        const edgeWear = Number(e.target.value);
+                        if (!keepToolAdjustments) setKeepToolAdjustments(true);
+                        setActiveBlockAdjustments((prev) => ({ ...prev, edgeWear }));
+                      }}
+                      className="w-full accent-[#D97706]"
+                    />
+                  </div>
+                )}
+
+                <div className="space-y-1">
+                  <div className="flex items-center justify-between text-[10px] font-semibold">
+                    <span>Placement Angle</span>
+                    <span className="tabular-nums text-slate-500 dark:text-[#949BB0]">
+                      {Math.round(activeBlockAdjustments.rotation)}°
+                    </span>
+                  </div>
+                  <div className="grid grid-cols-4 gap-1">
+                    {[-90, -45, 45, 90].map((delta) => (
+                      <button
+                        key={delta}
+                        type="button"
+                        onClick={() => {
+                          if (!keepToolAdjustments) setKeepToolAdjustments(true);
+                          setActiveBlockAdjustments((prev) => ({
+                            ...prev,
+                            rotation: (Math.round((prev.rotation + delta) / 45) * 45 + 360) % 360,
+                          }));
+                        }}
+                        className="py-1 rounded-lg bg-white dark:bg-[#171A23] hover:bg-[#7C5CFF]/20 text-[10px] font-bold"
+                      >
+                        {delta > 0 ? `+${delta}°` : `${delta}°`}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            );
+          })()
         ) : (
           <MakerCard padding="p-4" className="!bg-slate-100 dark:!bg-[#1F2430] border-none space-y-2.5">
             <h3 className="text-sm font-extrabold">Nothing selected</h3>
@@ -3485,6 +5135,14 @@ export const WorldStage: React.FC<{ store: MakerStore }> = ({ store }) => {
           store={store}
           initialTarget={chatBubbleTargetId}
           onClose={() => setChatBubbleTargetId(null)}
+        />
+      )}
+
+      {store.objectMakerOpen && (
+        <ObjectMakerModal
+          store={store}
+          initialAssetId={store.objectMakerTargetAssetId}
+          onClose={() => store.setObjectMakerOpen(false)}
         />
       )}
     </div>

@@ -22,7 +22,6 @@ import type { StageTab } from '../../types/maker';
 import { PlayModeView } from '../play/PlayModeView';
 import { ActionsStage } from '../stages/ActionsStage';
 import { CastStage } from '../stages/CastStage';
-import { InteractionStage } from '../stages/InteractionStage';
 import { InterfaceStage } from '../stages/InterfaceStage';
 import { LogicStage } from '../stages/LogicStage';
 import { MotionStage } from '../stages/MotionStage';
@@ -56,7 +55,6 @@ const STAGE_TABS: { id: StageTab; title: string; symbol: string }[] = [
   { id: 'world', title: 'World', symbol: 'map.fill' },
   { id: 'cast', title: 'Cast', symbol: 'person.2.fill' },
   { id: 'motion', title: 'Motion', symbol: 'motion.studio' },
-  { id: 'interact', title: 'Interact', symbol: 'interaction.designer' },
   { id: 'logic', title: 'Logic', symbol: 'arrow.triangle.branch' },
   { id: 'actions', title: 'Actions', symbol: 'figure.run' },
   { id: 'interface', title: 'Interface', symbol: 'slider.horizontal.3' },
@@ -475,7 +473,6 @@ export const EditorShell: React.FC<{ store: MakerStore }> = ({ store }) => {
           {store.selectedTab === 'world' && <WorldStage store={store} />}
           {store.selectedTab === 'cast' && <CastStage store={store} />}
           {store.selectedTab === 'motion' && <MotionStage store={store} />}
-          {store.selectedTab === 'interact' && <InteractionStage store={store} />}
           {store.selectedTab === 'logic' && <LogicStage store={store} />}
           {store.selectedTab === 'actions' && <ActionsStage store={store} />}
           {store.selectedTab === 'interface' && <InterfaceStage store={store} />}

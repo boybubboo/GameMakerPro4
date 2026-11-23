@@ -6,7 +6,7 @@ export type CameraMode = 'front' | 'chase' | 'cozy' | 'isometric' | 'sideScroll'
 
 export type EnvironmentType = 'openWorld' | 'dungeon' | 'castle' | 'sideScroller' | 'scifi';
 
-export type AssetCategory = 'character' | 'prop' | 'scenery';
+export type AssetCategory = 'character' | 'prop' | 'scenery' | 'plant';
 
 export type CustomClipSlot = 'idle' | 'walk' | 'run' | 'jump' | 'swim' | 'attack' | 'interact';
 
@@ -179,12 +179,102 @@ export interface CustomAssetMeta {
   customAnimations?: CustomMotionPreset[];
   savedPoses?: SavedPosePreset[];
   mechanisms?: ObjectMechanism[];
+  objectRecipe?: ObjectMakerDoc;
   defaultSlotPresets?: Partial<Record<CustomClipSlot, string>>;
   groundOffset: number;
   defaultScale: number;
   animSpeed: number;
   thumbnailDataUrl?: string;
   createdAt: string;
+}
+
+export type ObjectPrimitiveShapeId =
+  | 'cube'
+  | 'halfCube'
+  | 'sphere'
+  | 'hemisphere'
+  | 'cylinder'
+  | 'cone'
+  | 'capsule'
+  | 'torus'
+  | 'wedge'
+  | 'arch'
+  | 'prism'
+  | 'plank'
+  | 'beamLarge'
+  | 'beamSmall'
+  | 'stairs'
+  | 'pillar'
+  | 'fence'
+  | 'roofAFrame'
+  | 'roofSlope'
+  | 'csgResult';
+
+export interface ObjectSurfaceFinish {
+  materialId?: BuildingMaterialId;
+  color: string;
+  roughness: number;
+  metalness: number;
+  weathering?: WeatheringPreset;
+  weatheringIntensity?: number;
+}
+
+export interface ObjectGeometryModifiers {
+  bevel: number;
+  chamfer: number;
+  roundness: number;
+  edgeWear: number;
+  segments?: number;
+}
+
+export interface ObjectSerializedGeometry {
+  positions: number[];
+  normals: number[];
+  uvs: number[];
+  indices?: number[];
+}
+
+export interface ObjectPartSpec {
+  id: string;
+  name: string;
+  parentGroupId?: string | null;
+  shape: ObjectPrimitiveShapeId;
+  position: [number, number, number];
+  rotation: [number, number, number];
+  dimensions: [number, number, number];
+  modifiers: ObjectGeometryModifiers;
+  material: ObjectSurfaceFinish;
+  bakedGeometry?: ObjectSerializedGeometry;
+  hidden?: boolean;
+  isCutter?: boolean;
+}
+
+export interface ObjectGroupSpec {
+  id: string;
+  name: string;
+  parentGroupId?: string | null;
+  position: [number, number, number];
+  rotation: [number, number, number];
+  scale: [number, number, number];
+}
+
+export type CurveGuidePresetId = 'arc' | 'sCurve' | 'arch' | 'semiCircle' | 'circle' | 'free';
+
+export interface CurveGuideConfig {
+  preset: CurveGuidePresetId;
+  points: [number, number, number][];
+  closed: boolean;
+  segments: number;
+  radius: number;
+  elevationArch: number;
+  alignToTangent: boolean;
+}
+
+export interface ObjectMakerDoc {
+  version: 1;
+  parts: ObjectPartSpec[];
+  groups: ObjectGroupSpec[];
+  curveGuide?: CurveGuideConfig;
 }
 
 export interface ExportedAssetBundle {
@@ -340,7 +430,6 @@ export type StageTab =
   | 'world'
   | 'cast'
   | 'motion'
-  | 'interact'
   | 'logic'
   | 'actions'
   | 'interface'
@@ -451,6 +540,7 @@ export type GameplayMode = 'adventure' | 'buddies' | 'driving' | 'roguelike';
 
 export type BuildingShapeId =
   | 'wallCube'
+  | 'wallCubeHalf'
   | 'halfWall'
   | 'pillar'
   | 'floorTile'
@@ -459,29 +549,56 @@ export type BuildingShapeId =
   | 'archway'
   | 'windowWall'
   | 'trapdoor'
-  | 'wallTorch';
+  | 'wallTorch'
+  | 'roofAFrame'
+  | 'roofSlope'
+  | 'roofGable'
+  | 'fence'
+  | 'porchSteps'
+  | 'beamLarge'
+  | 'beamSmall'
+  | 'plankTrim';
 
 export type BuildingMaterialId =
   | 'hewnStone'
+  | 'sandstone'
   | 'randomCobble'
   | 'squareFlagstone'
   | 'crackedSlate'
   | 'masonryBrick'
+  | 'wattlePlaster'
   | 'packedDirt'
   | 'timberPlank'
   | 'roundLogs'
+  | 'weatheredSlats'
+  | 'thatchedStraw'
+  | 'clayTile'
+  | 'woodShingle'
   | 'rustedIron';
+
+export type RoofStyleId = 'thatched' | 'tiled' | 'shingled' | 'woodSlats';
+export type BeamOrientation = 'horizontal' | 'vertical' | 'diag45' | 'diagNeg45';
+export type FenceStyleId = 'picket' | 'rail' | 'medieval';
 
 export interface BuildingBlockConfig {
   shape: BuildingShapeId;
   material: BuildingMaterialId;
   archStyle?: 'arched' | 'rectangular';
-  windowStyle?: 'open' | 'barred' | 'shuttered';
+  windowStyle?: 'open' | 'barred' | 'shuttered' | 'paned';
+  roofStyle?: RoofStyleId;
+  roofMedievalTruss?: boolean;
+  beamOrientation?: BeamOrientation;
+  fenceStyle?: FenceStyleId;
+  scaleX?: number;
+  scaleY?: number;
+  scaleZ?: number;
+  /** Organic edge bevel, chamfer & stone-joint erosion intensity (0..1) */
+  edgeWear?: number;
   requiresKey?: boolean;
 }
 
 export type DoorFrameShape = 'rectangular' | 'arched';
-export type DoorLeafStyle = 'woodPlank' | 'solidMetal' | 'ironBars' | 'jailCage';
+export type DoorLeafStyle = 'woodPlank' | 'rusticWood' | 'solidMetal' | 'ironBars' | 'jailCage';
 export type DoorOpenMode = 'hingedSide' | 'doubleSplit' | 'sliding';
 export type DoorSlotStyle = 'none' | 'peepSlot' | 'barredWindow';
 

@@ -1856,9 +1856,16 @@ export function buildEntityMesh(entity: LevelEntity): THREE.Group {
   }
 
   if (entity.buildingBlock) {
-    group.add(buildBuildingBlockMesh(entity.buildingBlock));
+    const bbScale = Math.max(0.35, Math.min(3, entity.scale));
+    let idHash = 2166136261;
+    for (let i = 0; i < entity.id.length; i++) {
+      idHash ^= entity.id.charCodeAt(i);
+      idHash = Math.imul(idHash, 16777619);
+    }
+    const blockSeed = (idHash >>> 0) % 10000;
+    group.add(buildBuildingBlockMesh(entity.buildingBlock, bbScale, blockSeed));
     group.rotation.y = (entity.rotation * Math.PI) / 180;
-    group.scale.setScalar(Math.max(0.35, Math.min(3, entity.scale)));
+    group.scale.setScalar(bbScale);
     return group;
   }
 
@@ -2092,7 +2099,7 @@ export function buildEntityMesh(entity: LevelEntity): THREE.Group {
     case 'door': {
       addShadow(0.95);
       if (entity.doorConfig) {
-        group.add(buildModularDoorMesh(entity.doorConfig));
+        group.add(buildModularDoorMesh(entity.doorConfig, Math.max(0.35, Math.min(3, entity.scale))));
         break;
       }
       const stoneMat = new THREE.MeshStandardMaterial({ color: '#7D828F', roughness: 0.85 });

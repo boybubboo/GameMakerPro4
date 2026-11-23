@@ -6,6 +6,7 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { ClusteredLighting } from 'three/addons/lighting/ClusteredLighting.js';
 import type {
   BoardPoint,
+  CurveGuideConfig,
   CustomAssetMeta,
   LevelEntity,
   GameLevel,
@@ -17,6 +18,7 @@ import type {
   ViewportShadowQuality,
   ViewportTool,
 } from '../../types/maker';
+import { buildCurveInstance, sampleCurveTransforms } from '../../three/curveGuide';
 import { registerDirectorViewportBridge } from '../../utils/directorBridge';
 import {
   getEnvironmentType,
@@ -58,6 +60,7 @@ import {
   subscribeCustomTextureInvalidation,
 } from '../../three/customTextureManager';
 import { FxEmitterRuntime } from '../../three/fxEmitterRuntime';
+import { getBuildingBlockDimensions } from '../../three/buildingBlocks';
 import { PostProcessingPipeline } from '../../three/postProcessingPipeline';
 import { buildEntityMesh, buildHeroModel, buildPortalMarker } from '../../three/proceduralModels';
 import { buildCarModel } from '../../three/vehicleModels';
@@ -72,10 +75,20 @@ import { runDeferredChunks } from '../../utils/deferredLoader';
 import { readJsHeapUsageMB } from '../../utils/resourceMonitor';
 
 import { FX_DRAG_MIME } from './FxLibraryPanel';
+import { MAKER_ASSET_DRAG_MIME } from './LeftAssetsPanel';
 
 export interface TerrainBrushStrokeMeta {
   isStart: boolean;
   sampledHeight: number;
+}
+
+export interface BuildingCurveGuidePreview {
+  enabled: boolean;
+  curve: CurveGuideConfig;
+  blockCount: number;
+  blockSize: [number, number, number];
+  elevationY?: number;
+  pickMode?: boolean;
 }
 
 const HEIGHT_MODIFYING_BRUSHES = new Set<TerrainBrush>([
@@ -153,8 +166,10 @@ interface WorldViewport3DProps {
   brush: TerrainBrush;
   brushRadius: number;
   brushFalloff?: TerrainBrushFalloff;
-  gridSnap?: 0 | 1 | 2;
+  gridSnap?: 0 | 0.5 | 1 | 2;
   isPlacingBuildingBlock?: boolean;
+  placementGhostSize?: [number, number, number];
+  placementGhostRotation?: number;
   resolutionScale?: ViewportResolutionScale;
   shadowQuality?: ViewportShadowQuality;
   addKindName?: string;
@@ -162,13 +177,17 @@ interface WorldViewport3DProps {
   fxPaused?: boolean;
   renderPaused?: boolean;
   draggingFxTemplate?: { id: string; name: string; accentHex: string } | null;
+  buildingCurveGuide?: BuildingCurveGuidePreview | null;
   onSelectEntity: (id: string | null) => void;
   onMoveEntity: (id: string, pos: { x: number; y: number }, elevationY?: number) => void;
   onRotateEntity: (id: string, deg: number) => void;
+  onRotateActiveTool?: (deltaDeg: number) => void;
   onScaleEntity: (id: string, scale: number) => void;
   onBrushStroke: (x: number, z: number, meta?: TerrainBrushStrokeMeta) => void;
   onAddAtPoint: (pos: { x: number; y: number }, elevationY?: number) => void;
   onDropFxTemplate?: (templateId: string, pos: { x: number; y: number }) => void;
+  onDropCustomAsset?: (assetId: string, pos: { x: number; y: number }, elevationY?: number) => void;
+  onPickBuildingCurvePoint?: (worldXZ: [number, number]) => void;
 }
 
 export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
@@ -183,19 +202,25 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
   brushFalloff = 'smooth',
   gridSnap = 0,
   isPlacingBuildingBlock = false,
+  placementGhostSize = [2, 2, 2],
+  placementGhostRotation = 0,
   resolutionScale = 1,
   shadowQuality = 'medium',
   fxBurstSignal = null,
   fxPaused = false,
   renderPaused = false,
   draggingFxTemplate = null,
+  buildingCurveGuide = null,
   onSelectEntity,
   onMoveEntity,
   onRotateEntity,
+  onRotateActiveTool,
   onScaleEntity,
   onBrushStroke,
   onAddAtPoint,
   onDropFxTemplate,
+  onDropCustomAsset,
+  onPickBuildingCurvePoint,
 }) => {
   const mountRef = useRef<HTMLDivElement | null>(null);
   const [texInvalidationTick, setTexInvalidationTick] = useState(0);
@@ -242,6 +267,8 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
     brushFalloff,
     gridSnap,
     isPlacingBuildingBlock,
+    placementGhostSize,
+    placementGhostRotation,
     resolutionScale,
     shadowQuality,
     fxPaused,
@@ -250,10 +277,14 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
     onSelectEntity,
     onMoveEntity,
     onRotateEntity,
+    onRotateActiveTool,
     onScaleEntity,
     onBrushStroke,
     onAddAtPoint,
     onDropFxTemplate,
+    onDropCustomAsset,
+    onPickBuildingCurvePoint,
+    buildingCurveGuide,
   });
   propsRef.current = {
     project,
@@ -266,6 +297,8 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
     brushFalloff,
     gridSnap,
     isPlacingBuildingBlock,
+    placementGhostSize,
+    placementGhostRotation,
     resolutionScale,
     shadowQuality,
     fxPaused,
@@ -274,10 +307,14 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
     onSelectEntity,
     onMoveEntity,
     onRotateEntity,
+    onRotateActiveTool,
     onScaleEntity,
     onBrushStroke,
     onAddAtPoint,
     onDropFxTemplate,
+    onDropCustomAsset,
+    onPickBuildingCurvePoint,
+    buildingCurveGuide,
   };
 
   const sceneRefs = useRef<{
@@ -304,7 +341,10 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
     dropRingMat: THREE.MeshBasicMaterial;
     dropPillarMat: THREE.MeshBasicMaterial;
     snapGhostGroup: THREE.Group;
+    snapGhostPlane: THREE.Mesh;
+    snapGhostWire: THREE.LineSegments;
     buildGridHelper: THREE.GridHelper;
+    curveGuideGroup: THREE.Group;
     entityGroups: Map<string, THREE.Group>;
     floatSpinObjects: THREE.Object3D[];
     torchFlameObjects: Array<{ mesh: THREE.Object3D; baseY: number; phase: number }>;
@@ -508,6 +548,9 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
     snapGhostGroup.visible = false;
     scene.add(snapGhostGroup);
 
+    const curveGuideGroup = new THREE.Group();
+    scene.add(curveGuideGroup);
+
     sceneRefs.current = {
       scene,
       camera,
@@ -532,7 +575,10 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
       dropRingMat,
       dropPillarMat,
       snapGhostGroup,
+      snapGhostPlane: ghostPlane,
+      snapGhostWire: ghostWire,
       buildGridHelper,
+      curveGuideGroup,
       entityGroups: new Map(),
       floatSpinObjects: [],
       torchFlameObjects: [],
@@ -621,17 +667,65 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
       const snap = propsRef.current.gridSnap ?? 0;
       const shouldStack = Boolean(propsRef.current.isPlacingBuildingBlock || excludeEntityId);
 
+      // Dimensions & rotation of the block being placed or dragged
+      let newW = 2;
+      let newH = 2;
+      let newD = 2;
+      let newYaw = 0;
+      const draggedEnt = excludeEntityId
+        ? curLevel.entities.find((item) => item.id === excludeEntityId)
+        : undefined;
+      if (draggedEnt?.buildingBlock) {
+        [newW, newH, newD] = getBuildingBlockDimensions(draggedEnt.buildingBlock, draggedEnt.scale);
+        newYaw = ((draggedEnt.rotation ?? 0) * Math.PI) / 180;
+      } else if (draggedEnt?.kind === 'door') {
+        const ds = Math.max(0.25, draggedEnt.scale ?? 1);
+        [newW, newH, newD] = [2.0 * ds, 2.4 * ds, 0.7 * ds];
+        newYaw = ((draggedEnt.rotation ?? 0) * Math.PI) / 180;
+      } else {
+        const ghost = propsRef.current.placementGhostSize;
+        if (ghost) [newW, newH, newD] = ghost;
+        newYaw = ((propsRef.current.placementGhostRotation ?? 0) * Math.PI) / 180;
+      }
+
+      const getTargetMeta = (ent: LevelEntity) => {
+        const [tx, tz] = levelBoardToWorld(curLevel, ent.position);
+        const ty = ((ent.rotation ?? 0) * Math.PI) / 180;
+        const baseY = sampleLevelHeight(curLevel, tx, tz) + (ent.elevationY ?? 0);
+        const [tw, th, td] = ent.buildingBlock
+          ? getBuildingBlockDimensions(ent.buildingBlock, ent.scale)
+          : (() => {
+              const ds = Math.max(0.25, ent.scale ?? 1);
+              return [2.0 * ds, 2.4 * ds, 0.7 * ds] as [number, number, number];
+            })();
+        const rel = newYaw - ty;
+        const effHalfX = Math.abs(Math.cos(rel)) * (newW * 0.5) + Math.abs(Math.sin(rel)) * (newD * 0.5);
+        const effHalfZ = Math.abs(Math.sin(rel)) * (newW * 0.5) + Math.abs(Math.cos(rel)) * (newD * 0.5);
+        return { tx, tz, ty, cos: Math.cos(ty), sin: Math.sin(ty), baseY, tw, th, td, effHalfX, effHalfZ };
+      };
+
+      const alignAlongAxis = (coord: number, targetHalf: number, newHalf: number): number => {
+        if (Math.abs(targetHalf - newHalf) < 0.18) {
+          return 0;
+        }
+        const edgeShift = Math.abs(targetHalf - newHalf);
+        const candidates = [-edgeShift, 0, edgeShift];
+        for (const cand of candidates) {
+          if (Math.abs(coord - cand) < 0.48) {
+            return cand;
+          }
+        }
+        return snap > 0 ? Math.round(coord / snap) * snap : coord;
+      };
+
       updatePointer(clientX, clientY);
       raycaster.setFromCamera(pointerNdc, camera);
-
-      let rawHit: THREE.Vector3 | null = null;
-      let stackedTopY: number | null = null;
 
       if (shouldStack) {
         const stackTargets: THREE.Object3D[] = [];
         for (const ent of curLevel.entities) {
           if (ent.id === excludeEntityId) continue;
-          if (!ent.buildingBlock && ent.kind !== 'platform') continue;
+          if (!ent.buildingBlock && ent.kind !== 'platform' && ent.kind !== 'door') continue;
           const grp = refs.entityGroups.get(ent.id);
           if (grp) stackTargets.push(grp);
         }
@@ -640,36 +734,142 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
           const worldNormal = new THREE.Vector3();
           for (const h of objHits) {
             if (!h.face) continue;
-            worldNormal.copy(h.face.normal).transformDirection(h.object.matrixWorld);
-            if (worldNormal.y > 0.55) {
-              rawHit = h.point.clone();
-              stackedTopY = h.point.y;
-              break;
+            worldNormal.copy(h.face.normal).transformDirection(h.object.matrixWorld).normalize();
+            let hitEntId: string | null = null;
+            let objCur: THREE.Object3D | null = h.object;
+            while (objCur) {
+              if (objCur.userData?.entityId) {
+                hitEntId = String(objCur.userData.entityId);
+                break;
+              }
+              objCur = objCur.parent;
+            }
+            const targetEnt = hitEntId
+              ? curLevel.entities.find((item) => item.id === hitEntId)
+              : undefined;
+
+            if (targetEnt && (targetEnt.buildingBlock || targetEnt.kind === 'door')) {
+              const m = getTargetMeta(targetEnt);
+              const dx = h.point.x - m.tx;
+              const dz = h.point.z - m.tz;
+              const lx = dx * m.cos - dz * m.sin;
+              const lz = dx * m.sin + dz * m.cos;
+
+              if (worldNormal.y > 0.55) {
+                // Top face hit: align flush along target block's local footprint
+                const snappedLx = alignAlongAxis(lx, m.tw * 0.5, m.effHalfX);
+                const snappedLz = alignAlongAxis(lz, m.td * 0.5, m.effHalfZ);
+                const wx = m.tx + snappedLx * m.cos + snappedLz * m.sin;
+                const wz = m.tz - snappedLx * m.sin + snappedLz * m.cos;
+                const groundY = sampleLevelHeight(curLevel, wx, wz);
+                const rawElev = Math.max(0, h.point.y - groundY);
+                const elevationY =
+                  Math.abs(rawElev - Math.round(rawElev / 2) * 2) < 0.1
+                    ? Math.round(rawElev / 2) * 2
+                    : Number(rawElev.toFixed(3));
+                return { x: wx, y: groundY + elevationY, z: wz, elevationY };
+              }
+
+              if (Math.abs(worldNormal.y) <= 0.55) {
+                // Side face hit: snap seamlessly flush edge-to-edge on target block's side
+                const nLx = worldNormal.x * m.cos - worldNormal.z * m.sin;
+                const nLz = worldNormal.x * m.sin + worldNormal.z * m.cos;
+                let snappedLx = 0;
+                let snappedLz = 0;
+                if (Math.abs(nLx) >= Math.abs(nLz)) {
+                  const dirX = nLx >= 0 ? 1 : -1;
+                  snappedLx = dirX * (m.tw * 0.5 + m.effHalfX);
+                  snappedLz = alignAlongAxis(lz, m.td * 0.5, m.effHalfZ);
+                } else {
+                  const dirZ = nLz >= 0 ? 1 : -1;
+                  snappedLz = dirZ * (m.td * 0.5 + m.effHalfZ);
+                  snappedLx = alignAlongAxis(lx, m.tw * 0.5, m.effHalfX);
+                }
+                const wx = m.tx + snappedLx * m.cos + snappedLz * m.sin;
+                const wz = m.tz - snappedLx * m.sin + snappedLz * m.cos;
+                const groundY = sampleLevelHeight(curLevel, wx, wz);
+                const rawElev = m.baseY - groundY;
+                const elevationY = Math.abs(rawElev) < 0.04 ? 0 : Number(rawElev.toFixed(3));
+                return { x: wx, y: groundY + elevationY, z: wz, elevationY };
+              }
+            } else if (worldNormal.y > 0.55) {
+              // Platform top fallback
+              const x = snap > 0 ? Math.round(h.point.x / snap) * snap : h.point.x;
+              const z = snap > 0 ? Math.round(h.point.z / snap) * snap : h.point.z;
+              const groundY = sampleLevelHeight(curLevel, x, z);
+              const rawElev = Math.max(0, h.point.y - groundY);
+              const elevationY = Number(rawElev.toFixed(3));
+              return { x, y: groundY + elevationY, z, elevationY };
             }
           }
         }
       }
 
-      if (!rawHit) {
-        const groundHits = raycaster.intersectObjects(refs.groundMeshes, false);
-        rawHit = groundHits[0]?.point?.clone() ?? null;
-      }
+      const groundHits = raycaster.intersectObjects(refs.groundMeshes, false);
+      const rawHit = groundHits[0]?.point?.clone() ?? null;
       if (!rawHit) return null;
+
+      // Magnetic edge snap on ground near ground-level building blocks/doors so walls connect seamlessly
+      if (shouldStack) {
+        const magnetDist = Math.max(0.55, snap * 0.65);
+        let bestDist = magnetDist;
+        let bestPlacement: { x: number; y: number; z: number; elevationY: number } | null = null;
+
+        for (const ent of curLevel.entities) {
+          if (ent.id === excludeEntityId) continue;
+          if (!ent.buildingBlock && ent.kind !== 'door') continue;
+          if (Math.abs(ent.elevationY ?? 0) > 0.75) continue;
+          const m = getTargetMeta(ent);
+          const dx = rawHit.x - m.tx;
+          const dz = rawHit.z - m.tz;
+          const lx = dx * m.cos - dz * m.sin;
+          const lz = dx * m.sin + dz * m.cos;
+
+          const adjX = m.tw * 0.5 + m.effHalfX;
+          const adjZ = m.td * 0.5 + m.effHalfZ;
+
+          if (Math.abs(lz) <= m.td * 0.5 + m.effHalfZ + 0.35) {
+            for (const dirX of [-1, 1]) {
+              const targetX = dirX * adjX;
+              const dist = Math.abs(lx - targetX);
+              if (dist < bestDist) {
+                bestDist = dist;
+                const snappedLz = alignAlongAxis(lz, m.td * 0.5, m.effHalfZ);
+                const wx = m.tx + targetX * m.cos + snappedLz * m.sin;
+                const wz = m.tz - targetX * m.sin + snappedLz * m.cos;
+                const groundY = sampleLevelHeight(curLevel, wx, wz);
+                const rawElev = m.baseY - groundY;
+                const elevationY = Math.abs(rawElev) < 0.04 ? 0 : Number(rawElev.toFixed(3));
+                bestPlacement = { x: wx, y: groundY + elevationY, z: wz, elevationY };
+              }
+            }
+          }
+          if (Math.abs(lx) <= m.tw * 0.5 + m.effHalfX + 0.35) {
+            for (const dirZ of [-1, 1]) {
+              const targetZ = dirZ * adjZ;
+              const dist = Math.abs(lz - targetZ);
+              if (dist < bestDist) {
+                bestDist = dist;
+                const snappedLx = alignAlongAxis(lx, m.tw * 0.5, m.effHalfX);
+                const wx = m.tx + snappedLx * m.cos + targetZ * m.sin;
+                const wz = m.tz - snappedLx * m.sin + targetZ * m.cos;
+                const groundY = sampleLevelHeight(curLevel, wx, wz);
+                const rawElev = m.baseY - groundY;
+                const elevationY = Math.abs(rawElev) < 0.04 ? 0 : Number(rawElev.toFixed(3));
+                bestPlacement = { x: wx, y: groundY + elevationY, z: wz, elevationY };
+              }
+            }
+          }
+        }
+        if (bestPlacement) {
+          return bestPlacement;
+        }
+      }
 
       const x = snap > 0 ? Math.round(rawHit.x / snap) * snap : rawHit.x;
       const z = snap > 0 ? Math.round(rawHit.z / snap) * snap : rawHit.z;
       const groundY = sampleLevelHeight(curLevel, x, z);
-      let elevationY = 0;
-      if (stackedTopY !== null) {
-        const rawElev = Math.max(0, stackedTopY - groundY);
-        // Quantize to clean masonry increments if very close to 2m or 0.24m
-        if (Math.abs(rawElev - Math.round(rawElev / 2) * 2) < 0.14) {
-          elevationY = Math.round(rawElev / 2) * 2;
-        } else {
-          elevationY = Number(rawElev.toFixed(2));
-        }
-      }
-      return { x, y: groundY + elevationY, z, elevationY };
+      return { x, y: groundY, z, elevationY: 0 };
     };
 
     const raycastEntity = (clientX: number, clientY: number): string | null => {
@@ -833,6 +1033,14 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
       } else if (refs && curTool === 'add' && (propsRef.current.isPlacingBuildingBlock || (propsRef.current.gridSnap ?? 0) > 0)) {
         const hit = raycastPlacementSurface(e.clientX, e.clientY, null);
         if (hit) {
+          const [gw, gh, gd] = propsRef.current.placementGhostSize ?? [2, 2, 2];
+          const safeW = Math.max(0.12, gw);
+          const safeH = Math.max(0.1, gh);
+          const safeD = Math.max(0.12, gd);
+          refs.snapGhostPlane.scale.set(safeW * 0.5, safeD * 0.5, 1);
+          refs.snapGhostWire.scale.set(safeW * 0.5, safeH * 0.5, safeD * 0.5);
+          refs.snapGhostWire.position.y = safeH * 0.5;
+          refs.snapGhostGroup.rotation.y = ((propsRef.current.placementGhostRotation ?? 0) * Math.PI) / 180;
           refs.snapGhostGroup.visible = true;
           refs.snapGhostGroup.position.set(hit.x, hit.y, hit.z);
         } else {
@@ -866,11 +1074,21 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
       if (!movedFar && wasMode === 'none') {
         const { tool: curTool, level: curLevel } = propsRef.current;
         if (curTool === 'add') {
+          if (e.altKey) {
+            const hitId = raycastEntity(e.clientX, e.clientY);
+            propsRef.current.onSelectEntity(hitId);
+            return;
+          }
           const hit = raycastPlacementSurface(e.clientX, e.clientY, null);
           if (hit) {
+            const curveGuide = propsRef.current.buildingCurveGuide;
+            if (curveGuide?.enabled && curveGuide.pickMode && propsRef.current.onPickBuildingCurvePoint) {
+              propsRef.current.onPickBuildingCurvePoint([hit.x, hit.z]);
+              return;
+            }
             propsRef.current.onAddAtPoint(
               levelWorldToBoard(curLevel, hit.x, hit.z),
-              hit.elevationY > 0.01 ? hit.elevationY : undefined
+              Math.abs(hit.elevationY) > 0.01 ? hit.elevationY : undefined
             );
           }
           return;
@@ -888,13 +1106,19 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
         return;
       }
       if (e.key.toLowerCase() === 'r') {
-        const { selectedEntityID: selId, level: curLevel } = propsRef.current;
-        if (!selId) return;
-        const ent = curLevel.entities.find((item) => item.id === selId);
-        if (!ent) return;
+        const { selectedEntityID: selId, level: curLevel, tool: curTool } = propsRef.current;
         const delta = e.shiftKey ? -90 : 90;
-        const nextRot = ((Math.round((ent.rotation ?? 0) / 90) * 90 + delta) + 360) % 360;
-        propsRef.current.onRotateEntity(selId, nextRot);
+        if (selId) {
+          const ent = curLevel.entities.find((item) => item.id === selId);
+          if (ent) {
+            const nextRot = ((Math.round((ent.rotation ?? 0) / 90) * 90 + delta) + 360) % 360;
+            propsRef.current.onRotateEntity(selId, nextRot);
+            return;
+          }
+        }
+        if (curTool === 'add') {
+          propsRef.current.onRotateActiveTool?.(delta);
+        }
       }
     };
 
@@ -2200,17 +2424,67 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
     return rc.ray.intersectPlane(fallbackPlane, hitPt) ? hitPt : null;
   };
 
+  // Sync Building Curve Guide spline, anchor markers & ghost blocks in 3D world
+  useEffect(() => {
+    const refs = sceneRefs.current;
+    if (!refs) return;
+    disposeObject3D(refs.curveGuideGroup);
+    refs.curveGuideGroup.clear();
+    if (!buildingCurveGuide?.enabled || buildingCurveGuide.curve.points.length < 2) return;
+
+    const curve = buildCurveInstance(buildingCurveGuide.curve);
+    const elev = buildingCurveGuide.elevationY ?? 0;
+    const splinePts = curve.getPoints(48).map(
+      (pt) => new THREE.Vector3(pt.x, sampleLevelHeight(level, pt.x, pt.z) + elev + 0.14, pt.z)
+    );
+    const lineGeo = new THREE.BufferGeometry().setFromPoints(splinePts);
+    refs.curveGuideGroup.add(
+      new THREE.Line(lineGeo, new THREE.LineBasicMaterial({ color: '#0EA5E9' }))
+    );
+
+    const anchorGeo = new THREE.SphereGeometry(0.28, 12, 10);
+    const anchorMat = new THREE.MeshBasicMaterial({ color: '#F59E0B' });
+    buildingCurveGuide.curve.points.forEach((pt) => {
+      const m = new THREE.Mesh(anchorGeo, anchorMat);
+      m.position.set(pt[0], sampleLevelHeight(level, pt[0], pt[2]) + elev + 0.25, pt[2]);
+      refs.curveGuideGroup.add(m);
+    });
+
+    const [bw, bh, bd] = buildingCurveGuide.blockSize;
+    const samples = sampleCurveTransforms(
+      buildingCurveGuide.curve,
+      Math.max(2, buildingCurveGuide.blockCount),
+      true
+    );
+    const ghostBoxGeo = new THREE.EdgesGeometry(new THREE.BoxGeometry(bw, bh, bd));
+    const ghostMat = new THREE.LineBasicMaterial({
+      color: '#38BDF8',
+      transparent: true,
+      opacity: 0.78,
+    });
+    for (const s of samples) {
+      const gy = sampleLevelHeight(level, s.position.x, s.position.z) + elev + bh * 0.5;
+      const wire = new THREE.LineSegments(ghostBoxGeo, ghostMat);
+      wire.position.set(s.position.x, gy, s.position.z);
+      wire.rotation.y = THREE.MathUtils.degToRad(s.yawDeg);
+      refs.curveGuideGroup.add(wire);
+    }
+  }, [buildingCurveGuide, level.terrain?.revision, level.environmentType]);
+
   const handleDragOver = (e: React.DragEvent<HTMLDivElement>) => {
     const hasFxMime =
       e.dataTransfer.types.includes(FX_DRAG_MIME) || Boolean(propsRef.current.draggingFxTemplate);
-    if (!hasFxMime) return;
+    const hasAssetMime = e.dataTransfer.types.includes(MAKER_ASSET_DRAG_MIME);
+    if (!hasFxMime && !hasAssetMime) return;
     e.preventDefault();
     e.dataTransfer.dropEffect = 'copy';
     if (!isDragOver) setIsDragOver(true);
 
     const refs = sceneRefs.current;
     if (refs) {
-      const accent = propsRef.current.draggingFxTemplate?.accentHex ?? '#7C5CFF';
+      const accent = hasAssetMime
+        ? '#20B46A'
+        : propsRef.current.draggingFxTemplate?.accentHex ?? '#7C5CFF';
       refs.dropRingMat.color.set(accent);
       refs.dropPillarMat.color.set(accent);
       const hit = raycastClientToGround(e.clientX, e.clientY);
@@ -2232,14 +2506,26 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
   };
 
   const handleDrop = (e: React.DragEvent<HTMLDivElement>) => {
+    const customAssetId = e.dataTransfer.getData(MAKER_ASSET_DRAG_MIME);
     const templateId =
       e.dataTransfer.getData(FX_DRAG_MIME) ||
       propsRef.current.draggingFxTemplate?.id ||
-      e.dataTransfer.getData('text/plain');
+      (!customAssetId ? e.dataTransfer.getData('text/plain') : '');
     setIsDragOver(false);
     if (sceneRefs.current) {
       sceneRefs.current.dropPreviewGroup.visible = false;
     }
+
+    if (customAssetId && propsRef.current.onDropCustomAsset) {
+      e.preventDefault();
+      const hit = raycastClientToGround(e.clientX, e.clientY);
+      const boardPos = hit
+        ? levelWorldToBoard(propsRef.current.level, hit.x, hit.z)
+        : { x: 0.5, y: 0.5 };
+      propsRef.current.onDropCustomAsset(customAssetId, boardPos);
+      return;
+    }
+
     if (!templateId || !propsRef.current.onDropFxTemplate) return;
     e.preventDefault();
     const hit = raycastClientToGround(e.clientX, e.clientY);

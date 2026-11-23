@@ -1,0 +1,2541 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import {
+  ActionRegistry,
+  createBlankLevel,
+  createEntity,
+  createStarterOpenWorldPickups,
+  defaultHUDProfile,
+  DefaultCraftingRecipes,
+  DefaultInventoryItems,
+  makeWidget,
+  Palette,
+  projectFromTemplate,
+  resolveGameInventoryConfig,
+  resolveItemMetadata,
+  starterProjects,
+  StarterActions,
+  WidgetKindMeta,
+} from '../data/registries';
+import type { FxLibraryTemplate } from '../data/fxEffectLibrary';
+import { parseUploadedGlbFile } from '../three/gltfAssetManager';
+import {
+  collectReferencedTextureIds,
+  evictCustomTexture,
+  primeCustomTextureCanvas,
+} from '../three/customTextureManager';
+import { measurePersistence, measureStateUpdate } from '../utils/resourceMonitor';
+import type {
+  AssetCategory,
+  BehaviorCard,
+  BoardPoint,
+  BuildingBlockConfig,
+  BuildingMaterialId,
+  BuildingShapeId,
+  BuiltinMechanismTemplate,
+  CraftingRecipe,
+  CustomAssetMeta,
+  CustomTextureAssetMeta,
+  CustomTextureResolution,
+  DoorConfig,
+  EntityKind,
+  EntitySection,
+  ExportedAssetBundle,
+  ExportedTextureBundle,
+  ExportedVoiceBundle,
+  GameInventoryConfig,
+  GameLevel,
+  GameProject,
+  GameTemplate,
+  HUDWidget,
+  InventoryItemDef,
+  ItemMetadata,
+  LevelEntity,
+  MakerIssue,
+  ObjectMechanism,
+  PlayerTelemetry,
+  RuleRecipe,
+  SavePresetEntry,
+  SavePresetScope,
+  SceneryTextureSlot,
+  StageTab,
+  StudioTheme,
+  StylizedCanopyConfig,
+  SurfaceTextureSettings,
+  TerrainBrush,
+  TerrainBrushFalloff,
+  TerrainBrushOptions,
+  ViewportResolutionScale,
+  ViewportShadowQuality,
+  ViewportTool,
+  VisualStyleId,
+  WidgetKind,
+} from '../types/maker';
+import { BUILDING_SHAPES, DEFAULT_DOOR_CONFIG } from '../three/buildingBlocks';
+
+type LiveTelemetryListener = (telemetry: PlayerTelemetry | null) => void;
+let currentLivePlayerTelemetry: PlayerTelemetry | null = null;
+const liveTelemetryListeners = new Set<LiveTelemetryListener>();
+
+export function getLivePlayerTelemetry(): PlayerTelemetry | null {
+  return currentLivePlayerTelemetry;
+}
+
+export function publishLivePlayerTelemetry(telemetry: PlayerTelemetry | null): void {
+  currentLivePlayerTelemetry = telemetry;
+  liveTelemetryListeners.forEach((listener) => listener(telemetry));
+}
+
+export function subscribeLivePlayerTelemetry(listener: LiveTelemetryListener): () => void {
+  liveTelemetryListeners.add(listener);
+  return () => {
+    liveTelemetryListeners.delete(listener);
+  };
+}
+import { createDefaultCanopyConfig } from '../data/canopyEnginePresets';
+import {
+  arrayBufferToBase64,
+  base64ToArrayBuffer,
+  deleteAssetRecord,
+  getAssetBlob,
+  listAssetMetas,
+  saveAssetRecord,
+  updateAssetMetaRecord,
+} from '../utils/assetVault';
+import {
+  deleteTextureRecord,
+  downsizeStoredTexture,
+  getTextureBlobRecord,
+  listTextureMetas,
+  processUploadedTextureFile,
+  saveTextureRecord,
+} from '../utils/textureVault';
+import {
+  collectReferencedVoiceIds,
+  collectVoiceIdsFromConfig,
+  getVoiceBlobRecord,
+  getVoiceMeta,
+  saveVoiceRecord,
+} from '../utils/voiceVault';
+import {
+  deletePresetRecord,
+  downloadSavePresetsFile,
+  listSavedPresets,
+  parseSavePresetsFile,
+  replaceAllPresetRecords,
+  savePresetRecord,
+} from '../utils/presetVault';
+import {
+  buildProjectZipArchive,
+  compressMakerBundle,
+  isZipArchiveFile,
+  readMakerFileAsText,
+  readMakerZipAsBundleText,
+  triggerBlobDownload,
+  type CompressedMakerResult,
+  type ZipAssetEntry,
+  type ZipProjectExportResult,
+  type ZipTextureEntry,
+  type ZipVoiceEntry,
+} from '../utils/makerArchive';
+import {
+  applyLushGroundFloraToTerrain,
+  applyMountainCaveToTerrain,
+  applyTerrainBrush,
+  createInitialTerrain,
+  ensureUpgradedTerrain,
+  getEnvironmentType,
+  IslandTerrain,
+  sampleTerrainHeight,
+  smoothOrganicMossLayers,
+  uid,
+} from '../utils/terrain';
+
+const STORAGE_KEY = 'maker.projects.v1';
+const THEME_KEY = 'maker.theme.v1';
+const VIEWPORT_QUALITY_KEY = 'maker.viewportQuality.v1';
+const WARM_SKY_MIGRATION_KEY = 'maker.warmForestSky.v1';
+const ORGANIC_MOSS_MIGRATION_KEY = 'maker.organicMoss.v1';
+const MOUNTAIN_CAVE_MIGRATION_KEY = 'maker.mountainCave.v1';
+const INVENTORY_STARTER_MIGRATION_KEY = 'maker.inventoryStarter.v1';
+const LUSH_FLORA_MIGRATION_KEY = 'maker.lushFlora.v1';
+
+interface HistorySnapshot {
+  label: string;
+  projects: GameProject[];
+}
+
+export interface IdeaSuggestion {
+  id: string;
+  title: string;
+  detail: string;
+  symbol: string;
+  tint: string;
+  actionTitle: string;
+  perform: () => void;
+}
+
+function migrateProject(proj: GameProject): GameProject {
+  const levels = (proj.levels ?? []).map((lvl) => {
+    const env = getEnvironmentType(lvl);
+    const rawStyle = lvl.visualStyle as string | undefined;
+    const visualStyle: VisualStyleId =
+      rawStyle === 'celToon' || rawStyle === 'softFantasy' || rawStyle === 'painterlyPBR'
+        ? rawStyle
+        : 'painterlyPBR';
+    return {
+      ...lvl,
+      environmentType: env,
+      visualStyle,
+      cameraMode: lvl.cameraMode ?? (env === 'sideScroller' ? 'sideScroll' : 'front'),
+      terrain: ensureUpgradedTerrain(lvl.terrain),
+    };
+  });
+
+  const baseWidgets = proj.hud?.widgets ?? [];
+  const relocatedWidgets = baseWidgets.map((w) =>
+    w.kind === 'objectiveList' && w.anchor === 'top' && w.offsetX === 0 && w.offsetY === 0
+      ? {
+          ...w,
+          anchor: 'topLeading' as const,
+          offsetX: 0,
+          offsetY: 106,
+          width: Math.max(w.width, 236),
+          height: Math.max(w.height, 76),
+        }
+      : w
+  );
+
+  const hasControls = relocatedWidgets.some((w) => w.kind === 'joystick' || w.kind === 'actionButton');
+  const hud = hasControls
+    ? {
+        ...proj.hud,
+        widgets: relocatedWidgets,
+      }
+    : {
+        ...proj.hud,
+        widgets: [
+          ...relocatedWidgets,
+          makeWidget('joystick', 'bottomLeading', 'move', '#1E2434', 'Move', 8, -8, {
+            width: 112,
+            height: 112,
+            knobColorHex: '#FFFFFF',
+            opacity: 0.85,
+          }),
+          makeWidget('actionButton', 'bottomTrailing', 'action', '#20B46A', 'Jump', -8, -8, {
+            width: 68,
+            height: 68,
+            actionId: 'jump',
+            shape: 'circle',
+          }),
+          makeWidget('actionButton', 'bottomTrailing', 'action', '#F2545B', 'Hit', -86, -4, {
+            width: 56,
+            height: 56,
+            actionId: 'attack',
+            shape: 'circle',
+          }),
+          makeWidget('actionButton', 'bottomTrailing', 'action', '#F59E0B', 'Use', -18, -84, {
+            width: 52,
+            height: 52,
+            actionId: 'interact',
+            shape: 'rounded',
+          }),
+        ],
+      };
+
+  return {
+    ...proj,
+    levels,
+    hud,
+  };
+}
+
+function loadInitialProjects(): GameProject[] {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw) as GameProject[];
+      if (Array.isArray(parsed) && parsed.length > 0) {
+        const shouldWarmForest = localStorage.getItem(WARM_SKY_MIGRATION_KEY) !== '1';
+        const shouldOrganicMoss = localStorage.getItem(ORGANIC_MOSS_MIGRATION_KEY) !== '1';
+        const shouldMountainCave = localStorage.getItem(MOUNTAIN_CAVE_MIGRATION_KEY) !== '1';
+        const shouldInventoryStarter = localStorage.getItem(INVENTORY_STARTER_MIGRATION_KEY) !== '1';
+        const shouldLushFlora = localStorage.getItem(LUSH_FLORA_MIGRATION_KEY) !== '1';
+        const migrated = parsed.map((p) => {
+          const base = migrateProject(p);
+          if (
+            !shouldWarmForest &&
+            !shouldOrganicMoss &&
+            !shouldMountainCave &&
+            !shouldInventoryStarter &&
+            !shouldLushFlora
+          ) {
+            return base;
+          }
+          return {
+            ...base,
+            levels: base.levels.map((lvl, lvlIdx) => {
+              const env = getEnvironmentType(lvl);
+              let nextLvl = lvl;
+              if (
+                shouldWarmForest &&
+                env === 'openWorld' &&
+                nextLvl.sky === 'sunny' &&
+                nextLvl.timeOfDay === undefined
+              ) {
+                nextLvl = {
+                  ...nextLvl,
+                  sky: 'golden' as const,
+                  sunAngle: 32,
+                  fog: Math.max(nextLvl.fog ?? 0.15, 0.24),
+                  weather: nextLvl.weather === 'none' ? ('fireflies' as const) : nextLvl.weather,
+                };
+              }
+              if (shouldOrganicMoss && env === 'openWorld' && nextLvl.terrain) {
+                nextLvl = {
+                  ...nextLvl,
+                  terrain: smoothOrganicMossLayers(nextLvl.terrain),
+                };
+              }
+              if (shouldMountainCave && env === 'openWorld' && nextLvl.terrain) {
+                nextLvl = {
+                  ...nextLvl,
+                  terrain: applyMountainCaveToTerrain(nextLvl.terrain),
+                };
+              }
+              if (shouldLushFlora && env === 'openWorld' && nextLvl.terrain) {
+                nextLvl = {
+                  ...nextLvl,
+                  terrain: applyLushGroundFloraToTerrain(nextLvl.terrain),
+                };
+              }
+              if (
+                shouldInventoryStarter &&
+                env === 'openWorld' &&
+                lvlIdx === 0 &&
+                !nextLvl.entities.some((e) => e.pickupItemId === 'wood_axe')
+              ) {
+                const updatedEntities = nextLvl.entities.map((e) =>
+                  e.kind === 'treasure' && !e.pickupItemId
+                    ? { ...e, pickupable: true, pickupItemId: 'leaf_cloak', pickupQty: 1 }
+                    : e.kind === 'prop' && !e.pickupItemId
+                    ? { ...e, pickupable: true, pickupItemId: 'river_stone', pickupQty: 2 }
+                    : e
+                );
+                nextLvl = {
+                  ...nextLvl,
+                  entities: [...updatedEntities, ...createStarterOpenWorldPickups()],
+                };
+              }
+              return nextLvl;
+            }),
+          };
+        });
+        if (shouldWarmForest) {
+          localStorage.setItem(WARM_SKY_MIGRATION_KEY, '1');
+        }
+        if (shouldOrganicMoss) {
+          localStorage.setItem(ORGANIC_MOSS_MIGRATION_KEY, '1');
+        }
+        if (shouldMountainCave) {
+          localStorage.setItem(MOUNTAIN_CAVE_MIGRATION_KEY, '1');
+        }
+        if (shouldInventoryStarter) {
+          localStorage.setItem(INVENTORY_STARTER_MIGRATION_KEY, '1');
+        }
+        if (shouldLushFlora) {
+          localStorage.setItem(LUSH_FLORA_MIGRATION_KEY, '1');
+        }
+        return migrated;
+      }
+    }
+  } catch {
+    // ignore storage errors
+  }
+  return starterProjects();
+}
+
+function loadInitialTheme(): StudioTheme {
+  try {
+    const stored = localStorage.getItem(THEME_KEY);
+    if (stored === 'light' || stored === 'dark') return stored;
+  } catch {
+    // ignore
+  }
+  return 'dark';
+}
+
+function loadInitialViewportQuality(): {
+  resolutionScale: ViewportResolutionScale;
+  shadowQuality: ViewportShadowQuality;
+} {
+  try {
+    const raw = localStorage.getItem(VIEWPORT_QUALITY_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw) as {
+        resolutionScale?: number;
+        shadowQuality?: string;
+      };
+      const validScales: ViewportResolutionScale[] = [0.5, 0.75, 1, 1.25, 1.5];
+      const resolutionScale = validScales.includes(parsed.resolutionScale as ViewportResolutionScale)
+        ? (parsed.resolutionScale as ViewportResolutionScale)
+        : 1;
+      const validShadows: ViewportShadowQuality[] = ['off', 'low', 'medium', 'high'];
+      const shadowQuality = validShadows.includes(parsed.shadowQuality as ViewportShadowQuality)
+        ? (parsed.shadowQuality as ViewportShadowQuality)
+        : 'medium';
+      return { resolutionScale, shadowQuality };
+    }
+  } catch {
+    // ignore
+  }
+  return { resolutionScale: 1, shadowQuality: 'medium' };
+}
+
+export function useMakerStore() {
+  const [projects, setProjects] = useState<GameProject[]>(loadInitialProjects);
+  const [theme, setTheme] = useState<StudioTheme>(loadInitialTheme);
+  const [viewportResolutionScale, setViewportResolutionScale] = useState<ViewportResolutionScale>(
+    () => loadInitialViewportQuality().resolutionScale
+  );
+  const [viewportShadowQuality, setViewportShadowQuality] = useState<ViewportShadowQuality>(
+    () => loadInitialViewportQuality().shadowQuality
+  );
+  const [customAssets, setCustomAssets] = useState<CustomAssetMeta[]>([]);
+  const [customTextures, setCustomTextures] = useState<CustomTextureAssetMeta[]>([]);
+  const [savedPresets, setSavedPresets] = useState<SavePresetEntry[]>([]);
+  const [showingAssetVault, setShowingAssetVault] = useState(false);
+  const [showingPresets, setShowingPresets] = useState(false);
+  const [showingLogicFlow, setShowingLogicFlow] = useState(false);
+  const [showingDirector, setShowingDirector] = useState(false);
+  const [showingTerrainEditor, setShowingTerrainEditorRaw] = useState(false);
+  const [rehearseSkitId, setRehearseSkitId] = useState<string | null>(null);
+
+  const [worldTool, setWorldTool] = useState<ViewportTool>('move');
+  const [worldGridSnap, setWorldGridSnap] = useState<0 | 1 | 2>(1);
+  const [terrainBrush, setTerrainBrush] = useState<TerrainBrush>('raiseGround');
+  const [terrainBrushRadius, setTerrainBrushRadius] = useState<number>(5.5);
+  const [terrainBrushStrength, setTerrainBrushStrength] = useState<number>(0.75);
+  const [terrainBrushFalloff, setTerrainBrushFalloff] = useState<TerrainBrushFalloff>('smooth');
+  const [terrainFlattenHeight, setTerrainFlattenHeight] = useState<number | null>(null);
+  const [terrainScatterAssetId, setTerrainScatterAssetId] = useState<string>('');
+
+  const [currentProjectID, setCurrentProjectID] = useState<string | null>(null);
+  const [selectedLevelID, setSelectedLevelID] = useState<string | null>(null);
+  const [selectedEntityID, setSelectedEntityID] = useState<string | null>(null);
+  const [selectedWidgetID, setSelectedWidgetID] = useState<string | null>(null);
+  const [selectedSection, setSelectedSection] = useState<EntitySection>('cast');
+  const [selectedTab, setSelectedTab] = useState<StageTab>('world');
+  const [selectedInventoryItemId, setSelectedInventoryItemId] = useState<string | null>(null);
+  const [runtimeDurability, setRuntimeDurability] = useState<
+    Record<string, { durability: number; maxDurability: number }>
+  >({});
+  const [motionAssetId, setMotionAssetId] = useState<string | null>(null);
+  const [interactionAssetId, setInteractionAssetId] = useState<string | null>(null);
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [playModalOpen, setPlayModalOpen] = useState(false);
+  const [playFromPoint, setPlayFromPoint] = useState<BoardPoint | null>(null);
+  const [playerTelemetry, setPlayerTelemetryRaw] = useState<PlayerTelemetry | null>(null);
+  const setPlayerTelemetry = useCallback(
+    (
+      next:
+        | PlayerTelemetry
+        | null
+        | ((prev: PlayerTelemetry | null) => PlayerTelemetry | null)
+    ) => {
+      setPlayerTelemetryRaw((prev) => {
+        const resolved = typeof next === 'function' ? next(prev) : next;
+        publishLivePlayerTelemetry(resolved);
+        return resolved;
+      });
+    },
+    []
+  );
+  const [showingNewGame, setShowingNewGame] = useState(false);
+  const [showingIdeas, setShowingIdeas] = useState(false);
+
+  const setShowingTerrainEditor = useCallback((open: boolean) => {
+    setShowingTerrainEditorRaw(open);
+    if (open) {
+      setSelectedTab('world');
+      setWorldTool('terrain');
+    }
+  }, []);
+
+  const [past, setPast] = useState<HistorySnapshot[]>([]);
+  const [future, setFuture] = useState<HistorySnapshot[]>([]);
+
+  const isFirstPersistRef = useRef(true);
+  const latestProjectsRef = useRef(projects);
+  latestProjectsRef.current = projects;
+  const persistDirtyRef = useRef(false);
+  const isPlayingRef = useRef(isPlaying);
+  isPlayingRef.current = isPlaying;
+  const lastContextSwitchMsRef = useRef(0);
+  const serializedProjectCacheRef = useRef(new WeakMap<GameProject, string>());
+  const serializedLevelCacheRef = useRef(new WeakMap<GameLevel, string>());
+
+  useEffect(() => {
+    lastContextSwitchMsRef.current = performance.now();
+  }, [currentProjectID, selectedLevelID]);
+
+  const flushProjectsToStorage = useCallback((force = false) => {
+    if (!force && !persistDirtyRef.current) return;
+    if (!force && isPlayingRef.current) return;
+    persistDirtyRef.current = false;
+    try {
+      measurePersistence('projects:localStorage', () => {
+        const cache = serializedProjectCacheRef.current;
+        const levelCache = serializedLevelCacheRef.current;
+        const list = latestProjectsRef.current;
+        const parts = new Array<string>(list.length);
+        for (let i = 0; i < list.length; i++) {
+          const proj = list[i];
+          let json = cache.get(proj);
+          if (json === undefined) {
+            const { levels, ...rest } = proj;
+            const baseJson = JSON.stringify(rest);
+            const levelParts = new Array<string>(levels.length);
+            for (let li = 0; li < levels.length; li++) {
+              const lvl = levels[li];
+              let lj = levelCache.get(lvl);
+              if (lj === undefined) {
+                lj = JSON.stringify(lvl);
+                levelCache.set(lvl, lj);
+              }
+              levelParts[li] = lj;
+            }
+            const prefix = baseJson.slice(0, -1);
+            const sep = prefix.length > 1 ? ',' : '';
+            json = `${prefix}${sep}"levels":[${levelParts.join(',')}]}`;
+            cache.set(proj, json);
+          }
+          parts[i] = json;
+        }
+        const serialized = `[${parts.join(',')}]`;
+        localStorage.setItem(STORAGE_KEY, serialized);
+        return { result: undefined, payloadBytes: serialized.length };
+      });
+    } catch {
+      // ignore quota errors
+    }
+  }, []);
+
+  useEffect(() => {
+    if (isFirstPersistRef.current) {
+      isFirstPersistRef.current = false;
+      return;
+    }
+    persistDirtyRef.current = true;
+    if (isPlaying) return;
+    let cancelled = false;
+    let idleId: number | null = null;
+    const winWithIdle = window as Window & {
+      requestIdleCallback?: (
+        cb: (deadline: { didTimeout: boolean; timeRemaining: () => number }) => void,
+        opts?: { timeout: number }
+      ) => number;
+      cancelIdleCallback?: (id: number) => void;
+    };
+    const sinceSwitch = performance.now() - lastContextSwitchMsRef.current;
+    const delayMs = sinceSwitch < 2500 ? Math.max(1500, 2800 - sinceSwitch) : 1350;
+    const scheduleIdleFlush = (retriesLeft: number) => {
+      if (cancelled) return;
+      if (typeof winWithIdle.requestIdleCallback === 'function') {
+        idleId = winWithIdle.requestIdleCallback(
+          (deadline) => {
+            if (cancelled) return;
+            if (!deadline.didTimeout && deadline.timeRemaining() < 12 && retriesLeft > 0) {
+              scheduleIdleFlush(retriesLeft - 1);
+              return;
+            }
+            flushProjectsToStorage(false);
+          },
+          { timeout: 3000 }
+        );
+      } else {
+        flushProjectsToStorage(false);
+      }
+    };
+    const timer = window.setTimeout(() => {
+      scheduleIdleFlush(3);
+    }, delayMs);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+      if (idleId !== null && typeof winWithIdle.cancelIdleCallback === 'function') {
+        winWithIdle.cancelIdleCallback(idleId);
+      }
+    };
+  }, [projects, isPlaying, flushProjectsToStorage]);
+
+  useEffect(() => {
+    const onHide = () => flushProjectsToStorage(true);
+    window.addEventListener('pagehide', onHide);
+    window.addEventListener('beforeunload', onHide);
+    return () => {
+      window.removeEventListener('pagehide', onHide);
+      window.removeEventListener('beforeunload', onHide);
+      flushProjectsToStorage(true);
+    };
+  }, [flushProjectsToStorage]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(THEME_KEY, theme);
+    } catch {
+      // ignore
+    }
+    if (typeof document !== 'undefined') {
+      document.documentElement.classList.toggle('dark', theme === 'dark');
+    }
+  }, [theme]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(
+        VIEWPORT_QUALITY_KEY,
+        JSON.stringify({
+          resolutionScale: viewportResolutionScale,
+          shadowQuality: viewportShadowQuality,
+        })
+      );
+    } catch {
+      // ignore
+    }
+  }, [viewportResolutionScale, viewportShadowQuality]);
+
+  useEffect(() => {
+    let active = true;
+    listAssetMetas().then((rows) => {
+      if (active) setCustomAssets(rows);
+    });
+    listTextureMetas().then((rows) => {
+      if (active) setCustomTextures(rows);
+    });
+    listSavedPresets().then((rows) => {
+      if (active) setSavedPresets(rows);
+    });
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  const toggleTheme = useCallback(() => {
+    setTheme((prev) => (prev === 'dark' ? 'light' : 'dark'));
+  }, []);
+
+  const uploadCustomGlb = useCallback(
+    async (file: File, category: AssetCategory): Promise<CustomAssetMeta> => {
+      const { meta, buffer } = await parseUploadedGlbFile(file, category);
+      await saveAssetRecord(meta, buffer);
+      setCustomAssets((prev) => [meta, ...prev]);
+      return meta;
+    },
+    []
+  );
+
+  const updateCustomAssetMeta = useCallback(async (meta: CustomAssetMeta) => {
+    await updateAssetMetaRecord(meta);
+    setCustomAssets((prev) => prev.map((a) => (a.id === meta.id ? meta : a)));
+  }, []);
+
+  const removeCustomAsset = useCallback(async (id: string) => {
+    await deleteAssetRecord(id);
+    setCustomAssets((prev) => prev.filter((a) => a.id !== id));
+  }, []);
+
+  const uploadCustomTexture = useCallback(
+    async (
+      file: File,
+      maxResolution: CustomTextureResolution = 512
+    ): Promise<CustomTextureAssetMeta> => {
+      const { meta, buffer, mimeType, canvas } = await processUploadedTextureFile(
+        file,
+        maxResolution
+      );
+      await saveTextureRecord(meta, buffer, mimeType);
+      primeCustomTextureCanvas(meta.id, canvas);
+      setCustomTextures((prev) => [meta, ...prev]);
+      return meta;
+    },
+    []
+  );
+
+  const resizeCustomTexture = useCallback(
+    async (
+      id: string,
+      targetResolution: CustomTextureResolution
+    ): Promise<CustomTextureAssetMeta | null> => {
+      const existing = customTextures.find((t) => t.id === id);
+      if (!existing) return null;
+      const res = await downsizeStoredTexture(existing, targetResolution);
+      if (!res) return null;
+      primeCustomTextureCanvas(res.meta.id, res.canvas);
+      setCustomTextures((prev) => prev.map((t) => (t.id === id ? res.meta : t)));
+      return res.meta;
+    },
+    [customTextures]
+  );
+
+  const removeCustomTexture = useCallback(async (id: string) => {
+    await deleteTextureRecord(id);
+    evictCustomTexture(id);
+    setCustomTextures((prev) => prev.filter((t) => t.id !== id));
+  }, []);
+
+  const currentProject = useMemo(
+    () => projects.find((p) => p.id === currentProjectID) ?? null,
+    [projects, currentProjectID]
+  );
+
+  const currentLevel = useMemo(() => {
+    if (!currentProject) return null;
+    return currentProject.levels.find((l) => l.id === selectedLevelID) ?? currentProject.levels[0] ?? null;
+  }, [currentProject, selectedLevelID]);
+
+  const levelIndex = useMemo(() => {
+    if (!currentProject || !currentLevel) return 0;
+    const idx = currentProject.levels.findIndex((l) => l.id === currentLevel.id);
+    return Math.max(0, idx);
+  }, [currentProject, currentLevel]);
+
+  const currentEntity = useMemo(() => {
+    if (!currentLevel || !selectedEntityID) return null;
+    return currentLevel.entities.find((e) => e.id === selectedEntityID) ?? null;
+  }, [currentLevel, selectedEntityID]);
+
+  const currentWidget = useMemo(() => {
+    if (!currentProject || !selectedWidgetID) return null;
+    return currentProject.hud.widgets.find((w) => w.id === selectedWidgetID) ?? null;
+  }, [currentProject, selectedWidgetID]);
+
+  const commit = useCallback(
+    (label: string, mutator: (prev: GameProject[]) => GameProject[], recordUndo = true) => {
+      setProjects((prev) => {
+        if (recordUndo) {
+          setPast((h) => [...h.slice(-29), { label, projects: prev }]);
+          setFuture([]);
+        }
+        return measureStateUpdate(`commit:${label}`, () => mutator(prev));
+      });
+    },
+    []
+  );
+
+  const undo = useCallback(() => {
+    measureStateUpdate('undo', () => {
+      setPast((prevPast) => {
+        if (prevPast.length === 0) return prevPast;
+        const last = prevPast[prevPast.length - 1];
+        setProjects((curr) => {
+          setFuture((f) => [{ label: last.label, projects: curr }, ...f.slice(0, 29)]);
+          return last.projects;
+        });
+        return prevPast.slice(0, -1);
+      });
+    });
+  }, []);
+
+  const redo = useCallback(() => {
+    measureStateUpdate('redo', () => {
+      setFuture((prevFuture) => {
+        if (prevFuture.length === 0) return prevFuture;
+        const next = prevFuture[0];
+        setProjects((curr) => {
+          setPast((p) => [...p.slice(-29), { label: next.label, projects: curr }]);
+          return next.projects;
+        });
+        return prevFuture.slice(1);
+      });
+    });
+  }, []);
+
+  const openProject = useCallback(
+    (id: string) => {
+      const target = projects.find((p) => p.id === id);
+      if (!target) return;
+      setCurrentProjectID(id);
+      const firstLevel = target.levels[0] ?? null;
+      setSelectedLevelID(firstLevel?.id ?? null);
+      setSelectedEntityID(firstLevel?.entities[0]?.id ?? null);
+      setSelectedWidgetID(target.hud.widgets[0]?.id ?? null);
+      setPlayerTelemetry(null);
+      setSelectedTab('world');
+      setPast([]);
+      setFuture([]);
+    },
+    [projects]
+  );
+
+  const closeProject = useCallback(() => {
+    setCurrentProjectID(null);
+    setIsPlaying(false);
+    setPlayFromPoint(null);
+    setPlayerTelemetry(null);
+    setPast([]);
+    setFuture([]);
+  }, []);
+
+  const createProject = useCallback((name: string, template: GameTemplate) => {
+    const next = projectFromTemplate(name, template);
+    setProjects((prev) => [next, ...prev]);
+    setCurrentProjectID(next.id);
+    const firstLevel = next.levels[0] ?? null;
+    setSelectedLevelID(firstLevel?.id ?? null);
+    setSelectedEntityID(firstLevel?.entities[0]?.id ?? null);
+    setSelectedWidgetID(next.hud.widgets[0]?.id ?? null);
+    setPlayFromPoint(null);
+    setPlayerTelemetry(null);
+    setSelectedTab('world');
+    setShowingNewGame(false);
+    setPast([]);
+    setFuture([]);
+  }, []);
+
+  const duplicateProject = useCallback((id: string) => {
+    setProjects((prev) =>
+      measureStateUpdate('duplicateProject', () => {
+        const src = prev.find((p) => p.id === id);
+        if (!src) return prev;
+        const copy: GameProject = {
+          ...JSON.parse(JSON.stringify(src)),
+          id: uid(),
+          name: `${src.name} copy`,
+          updatedAt: new Date().toISOString(),
+          published: false,
+        };
+        return [copy, ...prev];
+      })
+    );
+  }, []);
+
+  const deleteProject = useCallback(
+    (id: string) => {
+      setProjects((prev) => prev.filter((p) => p.id !== id));
+      if (currentProjectID === id) {
+        setCurrentProjectID(null);
+      }
+    },
+    [currentProjectID]
+  );
+
+  const updateProject = useCallback(
+    (undoLabel: string, updater: (project: GameProject) => GameProject, recordUndo = true) => {
+      if (!currentProjectID) return;
+      commit(
+        undoLabel,
+        (prev) =>
+          prev.map((p) =>
+            p.id === currentProjectID
+              ? { ...updater(p), updatedAt: new Date().toISOString() }
+              : p
+          ),
+        recordUndo
+      );
+    },
+    [commit, currentProjectID]
+  );
+
+  const updateLevel = useCallback(
+    (undoLabel: string, updater: (level: GameLevel) => GameLevel, recordUndo = true) => {
+      if (!currentProjectID || !currentLevel) return;
+      const targetLevelID = currentLevel.id;
+      updateProject(
+        undoLabel,
+        (proj) => ({
+          ...proj,
+          levels: proj.levels.map((l) => (l.id === targetLevelID ? updater(l) : l)),
+        }),
+        recordUndo
+      );
+    },
+    [currentLevel, currentProjectID, updateProject]
+  );
+
+  const addLevel = useCallback(() => {
+    if (!currentProject) return;
+    const newLevel = createBlankLevel(`Level ${currentProject.levels.length + 1}`, 'island');
+    updateProject('add a level', (proj) => ({
+      ...proj,
+      levels: [...proj.levels, newLevel],
+    }));
+    setSelectedLevelID(newLevel.id);
+    setSelectedEntityID(null);
+  }, [currentProject, updateProject]);
+
+  const deleteCurrentLevel = useCallback(() => {
+    if (!currentProject || !currentLevel || currentProject.levels.length <= 1) return;
+    const remaining = currentProject.levels.filter((l) => l.id !== currentLevel.id);
+    updateProject('delete a level', (proj) => ({
+      ...proj,
+      levels: remaining,
+    }));
+    setSelectedLevelID(remaining[0]?.id ?? null);
+    setSelectedEntityID(remaining[0]?.entities[0]?.id ?? null);
+  }, [currentLevel, currentProject, updateProject]);
+
+  const applyBrush = useCallback(
+    (
+      brush: TerrainBrush,
+      x: number,
+      z: number,
+      radius: number,
+      recordUndo = false,
+      customAssetId?: string,
+      options?: TerrainBrushOptions
+    ) => {
+      updateLevel(
+        'sculpt terrain',
+        (lvl) => {
+          const base = lvl.terrain ?? createInitialTerrain();
+          return {
+            ...lvl,
+            terrain: applyTerrainBrush(base, brush, x, z, radius, customAssetId, options),
+          };
+        },
+        recordUndo
+      );
+    },
+    [updateLevel]
+  );
+
+  const resetTerrain = useCallback(() => {
+    updateLevel('reset ground', (lvl) => ({
+      ...lvl,
+      terrain: createInitialTerrain(),
+    }));
+  }, [updateLevel]);
+
+  const addEntity = useCallback(
+    (
+      kind: EntityKind,
+      name?: string,
+      position?: { x: number; y: number },
+      customAssetId?: string
+    ) => {
+      const pos = position ?? {
+        x: 0.25 + Math.random() * 0.5,
+        y: 0.25 + Math.random() * 0.5,
+      };
+      const entity = createEntity(
+        kind,
+        name ?? kind.charAt(0).toUpperCase() + kind.slice(1),
+        pos.x,
+        pos.y,
+        {
+          customAssetId,
+          platformEnd: kind === 'platform' ? { x: Math.min(0.9, pos.x + 0.14), y: pos.y } : undefined,
+        }
+      );
+      updateLevel(`add ${entity.name}`, (lvl) => ({
+        ...lvl,
+        entities: [...lvl.entities, entity],
+      }));
+      setSelectedEntityID(entity.id);
+      return entity;
+    },
+    [updateLevel]
+  );
+
+  const addBuildingBlockEntity = useCallback(
+    (
+      shapeOrDoor: BuildingShapeId | 'door',
+      material: BuildingMaterialId,
+      pos: { x: number; y: number },
+      opts: {
+        elevationY?: number;
+        rotation?: number;
+        name?: string;
+        doorConfig?: DoorConfig;
+        buildingBlockPatch?: Partial<BuildingBlockConfig>;
+      } = {}
+    ) => {
+      if (shapeOrDoor === 'door') {
+        const doorCfg: DoorConfig = {
+          ...DEFAULT_DOOR_CONFIG,
+          frameMaterial: material,
+          ...opts.doorConfig,
+        };
+        const entity = createEntity('door', opts.name ?? 'Dungeon Door', pos.x, pos.y, {
+          rotation: opts.rotation ?? 0,
+          elevationY: opts.elevationY,
+          doorConfig: doorCfg,
+        });
+        updateLevel(`place ${entity.name}`, (lvl) => ({
+          ...lvl,
+          entities: [...lvl.entities, entity],
+        }));
+        setSelectedEntityID(entity.id);
+        return entity;
+      }
+
+      const shapeMeta = BUILDING_SHAPES.find((s) => s.id === shapeOrDoor) ?? BUILDING_SHAPES[0];
+      const kind: EntityKind = shapeOrDoor === 'wallTorch' ? 'light' : 'prop';
+      const entity = createEntity(kind, opts.name ?? shapeMeta.defaultName, pos.x, pos.y, {
+        rotation: opts.rotation ?? 0,
+        elevationY: opts.elevationY,
+        buildingBlock: {
+          shape: shapeOrDoor,
+          material,
+          ...(shapeOrDoor === 'archway' ? { archStyle: 'arched' } : {}),
+          ...(shapeOrDoor === 'windowWall' ? { windowStyle: 'barred' } : {}),
+          ...opts.buildingBlockPatch,
+        },
+      });
+      updateLevel(`place ${entity.name}`, (lvl) => ({
+        ...lvl,
+        entities: [...lvl.entities, entity],
+      }));
+      setSelectedEntityID(entity.id);
+      return entity;
+    },
+    [updateLevel]
+  );
+
+  const addFxTemplateAtPoint = useCallback(
+    (template: FxLibraryTemplate, position?: { x: number; y: number }) => {
+      const basePos = position ?? { x: 0.5, y: 0.5 };
+      const created: LevelEntity[] = template.layers.map((layer) => {
+        const dx = layer.offset?.[0] ?? 0;
+        const dy = layer.offset?.[1] ?? 0;
+        const px = Math.max(0.06, Math.min(0.94, basePos.x + dx));
+        const py = Math.max(0.06, Math.min(0.94, basePos.y + dy));
+        const layerName = layer.nameSuffix
+          ? `${template.name} · ${layer.nameSuffix}`
+          : template.name;
+        return createEntity('fxEmitter', layerName, px, py, {
+          scale: layer.scale ?? 1,
+          fxEmitter: {
+            ...layer.config,
+            targetOffset: [...layer.config.targetOffset] as [number, number, number],
+          },
+        });
+      });
+
+      if (created.length === 0) return null;
+
+      updateLevel(`place FX: ${template.name}`, (lvl) => ({
+        ...lvl,
+        entities: [...lvl.entities, ...created],
+      }));
+      setSelectedEntityID(created[0].id);
+      return created[0];
+    },
+    [updateLevel]
+  );
+
+  const addCanopyTreeEntity = useCallback(
+    (config: StylizedCanopyConfig, position?: { x: number; y: number }, label = 'Stylized Tree') => {
+      const pos = position ?? {
+        x: 0.42 + Math.random() * 0.16,
+        y: 0.42 + Math.random() * 0.16,
+      };
+      const entity = createEntity('scenery', label, pos.x, pos.y, {
+        rotation: Math.round(Math.random() * 360),
+        scale: Number((0.92 + Math.random() * 0.24).toFixed(2)),
+        canopyTree: {
+          ...config,
+          enabled: true,
+          seed: Math.floor(Math.random() * 90000) + 1000,
+        },
+      });
+      updateLevel(`place ${label}`, (lvl) => ({
+        ...lvl,
+        entities: [...lvl.entities, entity],
+      }));
+      setSelectedEntityID(entity.id);
+      return entity;
+    },
+    [updateLevel]
+  );
+
+  const scatterCanopyGrove = useCallback(
+    (config: StylizedCanopyConfig, count = 10) => {
+      updateLevel(`scatter ${count} stylized trees`, (lvl) => {
+        const baseTerrain = lvl.terrain ?? createInitialTerrain();
+        const nextScatter = [...baseTerrain.scatter];
+        const halfExtent = IslandTerrain.radius * 0.72;
+        let placed = 0;
+        let attempts = 0;
+        const scatterKind =
+          config.treeType === 'conifer'
+            ? 'pine'
+            : config.treeType === 'birch'
+            ? 'birch'
+            : 'oak';
+        while (placed < count && attempts < count * 18) {
+          attempts++;
+          const rx = (Math.random() * 2 - 1) * halfExtent;
+          const rz = (Math.random() * 2 - 1) * halfExtent;
+          const h = sampleTerrainHeight(baseTerrain, rx, rz);
+          if (h < IslandTerrain.waterLevel + 0.55) continue;
+          // Avoid overlapping existing trees too tightly
+          const tooClose = nextScatter.some(
+            (s) =>
+              (s.kind === 'oak' || s.kind === 'pine' || s.kind === 'birch' || s.kind === 'tree') &&
+              Math.hypot(s.x - rx, s.z - rz) < 4.2
+          );
+          if (tooClose) continue;
+          nextScatter.push({
+            id: uid(),
+            kind: scatterKind,
+            x: rx,
+            z: rz,
+            size: 0.82 + Math.random() * 0.42,
+            rotation: Math.random() * Math.PI * 2,
+          });
+          placed++;
+        }
+        return {
+          ...lvl,
+          canopyEngine: {
+            ...config,
+            enabled: true,
+            targetTrees:
+              config.targetTrees === 'placedOnly' ? 'matching' : config.targetTrees,
+          },
+          terrain: {
+            ...baseTerrain,
+            scatter: nextScatter,
+            revision: baseTerrain.revision + 1,
+          },
+        };
+      });
+    },
+    [updateLevel]
+  );
+
+  const addMechanicalEntityToLevel = useCallback(
+    (opts: {
+      name: string;
+      kind: EntityKind;
+      customAssetId?: string;
+      mechTemplate?: BuiltinMechanismTemplate;
+      mechanisms: ObjectMechanism[];
+    }) => {
+      const heroEntity = currentLevel?.entities.find((e) => e.kind === 'hero');
+      const heroStart = heroEntity?.position ?? { x: 0.5, y: 0.5 };
+      const existingMechCount = (currentLevel?.entities ?? []).filter(
+        (e) => e.mechTemplate || (e.mechanisms && e.mechanisms.length > 0)
+      ).length;
+      const angle = existingMechCount * 1.15;
+      const dist = 0.08 + (existingMechCount % 3) * 0.035;
+      const px = Math.max(0.14, Math.min(0.86, heroStart.x + Math.cos(angle) * dist));
+      const py = Math.max(0.14, Math.min(0.86, heroStart.y + Math.sin(angle) * dist));
+      const entity = createEntity(opts.kind, opts.name, px, py, {
+        customAssetId: opts.customAssetId,
+        mechTemplate: opts.mechTemplate,
+        mechanisms: opts.mechanisms,
+      });
+      updateLevel(`place ${entity.name}`, (lvl) => ({
+        ...lvl,
+        entities: [...lvl.entities, entity],
+      }));
+      setSelectedEntityID(entity.id);
+      return entity;
+    },
+    [currentLevel, updateLevel]
+  );
+
+  const updateEntity = useCallback(
+    (id: string, undoLabel: string, updater: (e: LevelEntity) => LevelEntity, recordUndo = true) => {
+      updateLevel(
+        undoLabel,
+        (lvl) => ({
+          ...lvl,
+          entities: lvl.entities.map((e) => (e.id === id ? updater(e) : e)),
+        }),
+        recordUndo
+      );
+    },
+    [updateLevel]
+  );
+
+  const moveEntity = useCallback(
+    (id: string, pos: { x: number; y: number }, recordUndo = false, elevationY?: number) => {
+      updateEntity(
+        id,
+        'move item',
+        (e) => ({
+          ...e,
+          position: pos,
+          ...(elevationY !== undefined ? { elevationY } : {}),
+        }),
+        recordUndo
+      );
+    },
+    [updateEntity]
+  );
+
+  const deleteEntity = useCallback(
+    (id: string) => {
+      updateLevel('delete item', (lvl) => ({
+        ...lvl,
+        entities: lvl.entities.filter((e) => e.id !== id),
+      }));
+      if (selectedEntityID === id) {
+        setSelectedEntityID(null);
+      }
+    },
+    [selectedEntityID, updateLevel]
+  );
+
+  const addEmptyCard = useCallback(
+    (entityID: string) => {
+      const card: BehaviorCard = {
+        id: uid(),
+        when: { id: uid(), key: 'playerTouches', detail: '' },
+        conditions: [],
+        actions: [{ id: uid(), key: 'say', detail: 'Hello!' }],
+        isOnce: false,
+        isEnabled: true,
+      };
+      updateEntity(entityID, 'add a rule', (e) => ({
+        ...e,
+        cards: [...e.cards, card],
+      }));
+    },
+    [updateEntity]
+  );
+
+  const applyRecipe = useCallback(
+    (recipe: RuleRecipe) => {
+      if (!selectedEntityID) return;
+      const card: BehaviorCard = {
+        id: uid(),
+        when: { id: uid(), key: recipe.whenKey, detail: '' },
+        conditions: recipe.conditionKeys.map((k) => ({ id: uid(), key: k, detail: '' })),
+        actions: recipe.actionKeys.map((k) => ({
+          id: uid(),
+          key: k,
+          detail: k === 'say' ? 'Watch out!' : k === 'giveTreasure' ? '3 coins' : '',
+        })),
+        isOnce: false,
+        isEnabled: true,
+      };
+      updateEntity(selectedEntityID, `use ${recipe.title}`, (e) => ({
+        ...e,
+        cards: [...e.cards, card],
+      }));
+    },
+    [selectedEntityID, updateEntity]
+  );
+
+  const toggleAction = useCallback(
+    (actionId: string) => {
+      updateProject('toggle move', (proj) => {
+        const has = proj.enabledActions.includes(actionId);
+        return {
+          ...proj,
+          enabledActions: has
+            ? proj.enabledActions.filter((id) => id !== actionId)
+            : [...proj.enabledActions, actionId],
+        };
+      });
+    },
+    [updateProject]
+  );
+
+  const enableAllActions = useCallback(() => {
+    updateProject('enable all moves', (proj) => ({
+      ...proj,
+      enabledActions: ActionRegistry.map((a) => a.id),
+    }));
+  }, [updateProject]);
+
+  const resetActions = useCallback(() => {
+    updateProject('reset moves', (proj) => ({
+      ...proj,
+      enabledActions: [...StarterActions],
+    }));
+  }, [updateProject]);
+
+  const addWidget = useCallback(
+    (kind: WidgetKind) => {
+      const meta = WidgetKindMeta[kind];
+      const anchor =
+        kind === 'bossBar'
+          ? 'top'
+          : kind === 'dialogue'
+          ? 'bottom'
+          : kind === 'joystick'
+          ? 'bottomLeading'
+          : kind === 'actionButton'
+          ? 'bottomTrailing'
+          : 'topLeading';
+      const widget = makeWidget(
+        kind,
+        anchor,
+        kind === 'counter' ? 'coins' : kind === 'joystick' ? 'move' : kind === 'actionButton' ? 'action' : 'health',
+        kind === 'joystick' ? '#1E2434' : kind === 'actionButton' ? '#20B46A' : Palette.accent,
+        kind === 'actionButton' ? 'Jump' : kind === 'joystick' ? 'Move' : meta.title,
+        0,
+        0
+      );
+      updateProject(`add ${meta.title}`, (proj) => ({
+        ...proj,
+        hud: {
+          ...proj.hud,
+          widgets: [...proj.hud.widgets, widget],
+        },
+      }));
+      setSelectedWidgetID(widget.id);
+    },
+    [updateProject]
+  );
+
+  const resetHUDToDefault = useCallback(() => {
+    const fresh = defaultHUDProfile();
+    updateProject('reset HUD layout', (proj) => ({
+      ...proj,
+      hud: fresh,
+    }));
+    setSelectedWidgetID(fresh.widgets[0]?.id ?? null);
+  }, [updateProject]);
+
+  const updateWidget = useCallback(
+    (id: string, undoLabel: string, updater: (w: HUDWidget) => HUDWidget, recordUndo = true) => {
+      updateProject(
+        undoLabel,
+        (proj) => ({
+          ...proj,
+          hud: {
+            ...proj.hud,
+            widgets: proj.hud.widgets.map((w) => (w.id === id ? updater(w) : w)),
+          },
+        }),
+        recordUndo
+      );
+    },
+    [updateProject]
+  );
+
+  const deleteWidget = useCallback(
+    (id: string) => {
+      updateProject('remove HUD widget', (proj) => ({
+        ...proj,
+        hud: {
+          ...proj.hud,
+          widgets: proj.hud.widgets.filter((w) => w.id !== id),
+        },
+      }));
+      if (selectedWidgetID === id) {
+        setSelectedWidgetID(null);
+      }
+    },
+    [selectedWidgetID, updateProject]
+  );
+
+  const addInventoryItem = useCallback(
+    (item: InventoryItemDef) => {
+      updateProject(`add item ${item.name}`, (proj) => {
+        const base = proj.inventoryItems?.length ? proj.inventoryItems : [...DefaultInventoryItems];
+        return {
+          ...proj,
+          inventoryItems: [...base.filter((i) => i.id !== item.id), item],
+        };
+      });
+    },
+    [updateProject]
+  );
+
+  const updateInventoryItem = useCallback(
+    (item: InventoryItemDef) => {
+      updateProject(`update item ${item.name}`, (proj) => {
+        const base = proj.inventoryItems?.length ? proj.inventoryItems : [...DefaultInventoryItems];
+        const exists = base.some((i) => i.id === item.id);
+        return {
+          ...proj,
+          inventoryItems: exists
+            ? base.map((i) => (i.id === item.id ? item : i))
+            : [...base, item],
+        };
+      });
+    },
+    [updateProject]
+  );
+
+  const deleteInventoryItem = useCallback(
+    (itemId: string) => {
+      updateProject('delete inventory item', (proj) => {
+        const base = proj.inventoryItems?.length ? proj.inventoryItems : [...DefaultInventoryItems];
+        return {
+          ...proj,
+          inventoryItems: base.filter((i) => i.id !== itemId),
+        };
+      });
+      if (selectedInventoryItemId === itemId) {
+        setSelectedInventoryItemId(null);
+      }
+    },
+    [selectedInventoryItemId, updateProject]
+  );
+
+  const updateInventoryItemMetadata = useCallback(
+    (itemId: string, patch: Partial<ItemMetadata>) => {
+      updateProject('update item metadata', (proj) => {
+        const base = proj.inventoryItems?.length ? proj.inventoryItems : [...DefaultInventoryItems];
+        return {
+          ...proj,
+          inventoryItems: base.map((item) => {
+            if (item.id !== itemId) return item;
+            const nextMeta: ItemMetadata = {
+              ...(item.metadata ?? {}),
+              ...patch,
+              properties: {
+                ...(item.metadata?.properties ?? {}),
+                ...(patch.properties ?? {}),
+              },
+            };
+            return {
+              ...item,
+              metadata: nextMeta,
+              ...(patch.magic_effect !== undefined ? { magicEffect: patch.magic_effect } : {}),
+            };
+          }),
+        };
+      });
+    },
+    [updateProject]
+  );
+
+  const wearItemDurability = useCallback(
+    (itemId: string, amount = 2) => {
+      const items = currentProject?.inventoryItems?.length
+        ? currentProject.inventoryItems
+        : DefaultInventoryItems;
+      const target = items.find((i) => i.id === itemId);
+      const baseMeta = target ? resolveItemMetadata(target) : null;
+      const fallbackMax = baseMeta?.maxDurability ?? 100;
+      const fallbackCur = baseMeta?.durability ?? fallbackMax;
+      if (fallbackMax <= 1) return;
+
+      setRuntimeDurability((prev) => {
+        const existing = prev[itemId];
+        const maxDurability = existing?.maxDurability ?? fallbackMax;
+        const curDurability = existing?.durability ?? fallbackCur;
+        const nextDurability = Math.max(0, curDurability - amount);
+        return {
+          ...prev,
+          [itemId]: { durability: nextDurability, maxDurability },
+        };
+      });
+    },
+    [currentProject?.inventoryItems]
+  );
+
+  const repairItemDurability = useCallback(
+    (itemId: string) => {
+      const items = currentProject?.inventoryItems?.length
+        ? currentProject.inventoryItems
+        : DefaultInventoryItems;
+      const target = items.find((i) => i.id === itemId);
+      const baseMeta = target ? resolveItemMetadata(target) : null;
+      const maxDurability = baseMeta?.maxDurability ?? 100;
+
+      setRuntimeDurability((prev) => ({
+        ...prev,
+        [itemId]: { durability: maxDurability, maxDurability },
+      }));
+    },
+    [currentProject?.inventoryItems]
+  );
+
+  const resetRuntimeDurability = useCallback(() => {
+    setRuntimeDurability({});
+  }, []);
+
+  const addCraftingRecipe = useCallback(
+    (recipe: CraftingRecipe) => {
+      updateProject(`add recipe ${recipe.title}`, (proj) => {
+        const base = proj.craftingRecipes?.length ? proj.craftingRecipes : [...DefaultCraftingRecipes];
+        return {
+          ...proj,
+          craftingRecipes: [...base.filter((r) => r.id !== recipe.id), recipe],
+        };
+      });
+    },
+    [updateProject]
+  );
+
+  const deleteCraftingRecipe = useCallback(
+    (recipeId: string) => {
+      updateProject('delete crafting recipe', (proj) => {
+        const base = proj.craftingRecipes?.length ? proj.craftingRecipes : [...DefaultCraftingRecipes];
+        return {
+          ...proj,
+          craftingRecipes: base.filter((r) => r.id !== recipeId),
+        };
+      });
+    },
+    [updateProject]
+  );
+
+  const updateInventoryConfig = useCallback(
+    (label: string, updater: (cfg: GameInventoryConfig) => GameInventoryConfig) => {
+      updateProject(label, (proj) => ({
+        ...proj,
+        inventoryConfig: updater(resolveGameInventoryConfig(proj)),
+      }));
+    },
+    [updateProject]
+  );
+
+  const collectProjectResourceIds = useCallback((project: GameProject) => {
+    const usedIds = new Set<string>();
+    const usedTexIds = new Set<string>();
+    if (project.heroCustomAssetId) usedIds.add(project.heroCustomAssetId);
+    for (const lvl of project.levels) {
+      if (lvl.canopyEngine?.canopyAssetId) usedIds.add(lvl.canopyEngine.canopyAssetId);
+      if (lvl.canopyEngine?.trunkAssetId) usedIds.add(lvl.canopyEngine.trunkAssetId);
+      if (lvl.canopyEngine?.fruitAssetId) usedIds.add(lvl.canopyEngine.fruitAssetId);
+      if (lvl.canopyEngine?.speciesProfiles) {
+        for (const prof of Object.values(lvl.canopyEngine.speciesProfiles)) {
+          if (!prof) continue;
+          if (prof.canopyAssetId) usedIds.add(prof.canopyAssetId);
+          if (prof.trunkAssetId) usedIds.add(prof.trunkAssetId);
+          if (prof.fruitAssetId) usedIds.add(prof.fruitAssetId);
+        }
+      }
+      for (const ent of lvl.entities) {
+        if (ent.customAssetId) usedIds.add(ent.customAssetId);
+        if (ent.canopyTree?.canopyAssetId) usedIds.add(ent.canopyTree.canopyAssetId);
+        if (ent.canopyTree?.trunkAssetId) usedIds.add(ent.canopyTree.trunkAssetId);
+        if (ent.canopyTree?.fruitAssetId) usedIds.add(ent.canopyTree.fruitAssetId);
+        if (ent.fxEmitter?.customMeshAssetId) usedIds.add(ent.fxEmitter.customMeshAssetId);
+      }
+      for (const sc of lvl.terrain?.scatter ?? []) {
+        if (sc.customAssetId) usedIds.add(sc.customAssetId);
+      }
+      for (const vi of lvl.vistaItems ?? []) {
+        if (vi.customAssetId) usedIds.add(vi.customAssetId);
+      }
+      for (const tid of collectReferencedTextureIds(
+        lvl.sceneryTextures,
+        lvl.canopyEngine,
+        lvl.entities.map((e) => e.canopyTree)
+      )) {
+        usedTexIds.add(tid);
+      }
+    }
+    const usedVoiceIds = collectReferencedVoiceIds(project.levels, [
+      project.storybook?.prologueVoice,
+      project.storybook?.epilogueVoice,
+    ]);
+    return { usedIds, usedTexIds, usedVoiceIds };
+  }, []);
+
+  const exportProjectJSON = useCallback(
+    async (project: GameProject, includeAssets = true): Promise<string> => {
+      const assets: ExportedAssetBundle[] = [];
+      const textures: ExportedTextureBundle[] = [];
+      const voiceOvers: ExportedVoiceBundle[] = [];
+      if (includeAssets) {
+        const { usedIds, usedTexIds, usedVoiceIds } = collectProjectResourceIds(project);
+        for (const assetId of usedIds) {
+          const meta = customAssets.find((a) => a.id === assetId);
+          if (!meta) continue;
+          const blob = await getAssetBlob(assetId);
+          if (!blob) continue;
+          assets.push({
+            meta,
+            base64Glb: arrayBufferToBase64(blob),
+          });
+        }
+        for (const texId of usedTexIds) {
+          const meta = customTextures.find((t) => t.id === texId);
+          if (!meta) continue;
+          const rec = await getTextureBlobRecord(texId);
+          if (!rec) continue;
+          textures.push({
+            meta,
+            mimeType: rec.mimeType,
+            base64Image: arrayBufferToBase64(rec.buffer),
+          });
+        }
+        for (const vid of usedVoiceIds) {
+          const meta = await getVoiceMeta(vid);
+          const rec = await getVoiceBlobRecord(vid);
+          if (!meta || !rec) continue;
+          voiceOvers.push({
+            meta,
+            mimeType: rec.mimeType || meta.mimeType,
+            base64Audio: arrayBufferToBase64(rec.buffer),
+          });
+        }
+      }
+
+      const bundle = {
+        format:
+          assets.length > 0 || textures.length > 0 || voiceOvers.length > 0
+            ? 'maker.game.v2'
+            : 'maker.game.v1',
+        title: project.name,
+        subtitle: project.coverTagline || project.tagline,
+        summary: `${project.levels.length} levels, ${project.levels.reduce((s, l) => s + l.entities.length, 0)} entities`,
+        project,
+        assets: assets.length > 0 ? assets : undefined,
+        textures: textures.length > 0 ? textures : undefined,
+        voiceOvers: voiceOvers.length > 0 ? voiceOvers : undefined,
+      };
+      return JSON.stringify(bundle, null, 2);
+    },
+    [collectProjectResourceIds, customAssets, customTextures]
+  );
+
+  const importProjectJSON = useCallback(
+    async (rawText: string): Promise<{ ok: boolean; error?: string }> => {
+      try {
+        const parsed = JSON.parse(rawText);
+        const proj: GameProject = parsed.project ?? parsed;
+        if (!proj || !proj.name || !Array.isArray(proj.levels)) {
+          return { ok: false, error: 'That file does not look like a Maker game.' };
+        }
+
+        if (Array.isArray(parsed.assets)) {
+          for (const entry of parsed.assets as ExportedAssetBundle[]) {
+            if (entry?.meta?.id && entry.base64Glb) {
+              const buffer = base64ToArrayBuffer(entry.base64Glb);
+              await saveAssetRecord(entry.meta, buffer);
+            }
+          }
+          const refreshed = await listAssetMetas();
+          setCustomAssets(refreshed);
+        }
+
+        if (Array.isArray(parsed.textures)) {
+          for (const entry of parsed.textures as ExportedTextureBundle[]) {
+            if (entry?.meta?.id && entry.base64Image) {
+              const buffer = base64ToArrayBuffer(entry.base64Image);
+              await saveTextureRecord(entry.meta, buffer, entry.mimeType || 'image/png');
+            }
+          }
+          const refreshedTex = await listTextureMetas();
+          setCustomTextures(refreshedTex);
+        }
+
+        if (Array.isArray(parsed.voiceOvers)) {
+          for (const entry of parsed.voiceOvers as ExportedVoiceBundle[]) {
+            if (entry?.meta?.id && entry.base64Audio) {
+              const buffer = base64ToArrayBuffer(entry.base64Audio);
+              await saveVoiceRecord(
+                { ...entry.meta, mimeType: entry.mimeType || entry.meta.mimeType || 'audio/webm' },
+                buffer
+              );
+            }
+          }
+        }
+
+        const imported: GameProject = migrateProject({
+          ...proj,
+          id: uid(),
+          updatedAt: new Date().toISOString(),
+          sharedBy: parsed.sharedBy || proj.sharedBy || 'Imported',
+        });
+        setProjects((prev) => [imported, ...prev]);
+        setCurrentProjectID(imported.id);
+        setSelectedLevelID(imported.levels[0]?.id ?? null);
+        setSelectedEntityID(imported.levels[0]?.entities[0]?.id ?? null);
+        setSelectedTab('world');
+        return { ok: true };
+      } catch {
+        return { ok: false, error: 'Could not read that project file.' };
+      }
+    },
+    []
+  );
+
+  const exportCompressedMakerFile = useCallback(
+    async (
+      project: GameProject,
+      opts?: { includeAssets?: boolean; sharedBy?: string }
+    ): Promise<CompressedMakerResult> => {
+      const targetProject: GameProject = opts?.sharedBy?.trim()
+        ? { ...project, sharedBy: opts.sharedBy.trim() }
+        : project;
+      const rawJson = await exportProjectJSON(targetProject, opts?.includeAssets ?? true);
+      // Compact before gzip for maximum compression ratio
+      const compactJson = JSON.stringify(JSON.parse(rawJson));
+      const result = await compressMakerBundle(compactJson, targetProject.name);
+      triggerBlobDownload(result.blob, result.filename);
+      return result;
+    },
+    [exportProjectJSON]
+  );
+
+  const exportProjectZip = useCallback(
+    async (
+      project: GameProject,
+      opts?: { includeAssets?: boolean; sharedBy?: string }
+    ): Promise<ZipProjectExportResult> => {
+      const includeAssets = opts?.includeAssets ?? true;
+      const assets: ZipAssetEntry[] = [];
+      const textures: ZipTextureEntry[] = [];
+      const voiceOvers: ZipVoiceEntry[] = [];
+
+      if (includeAssets) {
+        const { usedIds, usedTexIds, usedVoiceIds } = collectProjectResourceIds(project);
+        for (const assetId of usedIds) {
+          const meta = customAssets.find((a) => a.id === assetId);
+          if (!meta) continue;
+          const buffer = await getAssetBlob(assetId);
+          if (!buffer) continue;
+          assets.push({ meta, buffer });
+        }
+        for (const texId of usedTexIds) {
+          const meta = customTextures.find((t) => t.id === texId);
+          if (!meta) continue;
+          const rec = await getTextureBlobRecord(texId);
+          if (!rec) continue;
+          textures.push({
+            meta,
+            mimeType: rec.mimeType,
+            buffer: rec.buffer,
+          });
+        }
+        for (const vid of usedVoiceIds) {
+          const meta = await getVoiceMeta(vid);
+          const rec = await getVoiceBlobRecord(vid);
+          if (!meta || !rec) continue;
+          voiceOvers.push({
+            meta,
+            mimeType: rec.mimeType || meta.mimeType,
+            buffer: rec.buffer,
+          });
+        }
+      }
+
+      const result = await buildProjectZipArchive({
+        project,
+        sharedBy: opts?.sharedBy,
+        assets,
+        textures,
+        voiceOvers,
+      });
+      triggerBlobDownload(result.blob, result.filename);
+      return result;
+    },
+    [collectProjectResourceIds, customAssets, customTextures]
+  );
+
+  const importProjectFile = useCallback(
+    async (file: File): Promise<{ ok: boolean; error?: string }> => {
+      try {
+        const text = (await isZipArchiveFile(file))
+          ? await readMakerZipAsBundleText(file)
+          : await readMakerFileAsText(file);
+        return await importProjectJSON(text);
+      } catch (err) {
+        return {
+          ok: false,
+          error: err instanceof Error ? err.message : 'Could not open that game file.',
+        };
+      }
+    },
+    [importProjectJSON]
+  );
+
+  const packReferencedAssetsAndTextures = useCallback(
+    async (
+      usedAssetIds: Set<string>,
+      usedTextureIds: Set<string>,
+      usedVoiceIds?: Set<string>
+    ): Promise<{
+      assets: ExportedAssetBundle[];
+      textures: ExportedTextureBundle[];
+      voiceOvers: ExportedVoiceBundle[];
+    }> => {
+      const assets: ExportedAssetBundle[] = [];
+      const textures: ExportedTextureBundle[] = [];
+      const voiceOvers: ExportedVoiceBundle[] = [];
+      for (const assetId of usedAssetIds) {
+        const meta = customAssets.find((a) => a.id === assetId);
+        if (!meta) continue;
+        const blob = await getAssetBlob(assetId);
+        if (!blob) continue;
+        assets.push({ meta, base64Glb: arrayBufferToBase64(blob) });
+      }
+      for (const texId of usedTextureIds) {
+        const meta = customTextures.find((t) => t.id === texId);
+        if (!meta) continue;
+        const rec = await getTextureBlobRecord(texId);
+        if (!rec) continue;
+        textures.push({
+          meta,
+          mimeType: rec.mimeType,
+          base64Image: arrayBufferToBase64(rec.buffer),
+        });
+      }
+      if (usedVoiceIds) {
+        for (const vid of usedVoiceIds) {
+          const meta = await getVoiceMeta(vid);
+          const rec = await getVoiceBlobRecord(vid);
+          if (!meta || !rec) continue;
+          voiceOvers.push({
+            meta,
+            mimeType: rec.mimeType || meta.mimeType,
+            base64Audio: arrayBufferToBase64(rec.buffer),
+          });
+        }
+      }
+      return { assets, textures, voiceOvers };
+    },
+    [customAssets, customTextures]
+  );
+
+  const restoreBundledAssetsAndTextures = useCallback(
+    async (
+      assets?: ExportedAssetBundle[],
+      textures?: ExportedTextureBundle[],
+      voiceOvers?: ExportedVoiceBundle[]
+    ) => {
+      if (Array.isArray(assets) && assets.length > 0) {
+        for (const entry of assets) {
+          if (entry?.meta?.id && entry.base64Glb) {
+            const buffer = base64ToArrayBuffer(entry.base64Glb);
+            await saveAssetRecord(entry.meta, buffer);
+          }
+        }
+        const refreshed = await listAssetMetas();
+        setCustomAssets(refreshed);
+      }
+      if (Array.isArray(textures) && textures.length > 0) {
+        for (const entry of textures) {
+          if (entry?.meta?.id && entry.base64Image) {
+            const buffer = base64ToArrayBuffer(entry.base64Image);
+            await saveTextureRecord(entry.meta, buffer, entry.mimeType || 'image/png');
+          }
+        }
+        const refreshedTex = await listTextureMetas();
+        setCustomTextures(refreshedTex);
+      }
+      if (Array.isArray(voiceOvers) && voiceOvers.length > 0) {
+        for (const entry of voiceOvers) {
+          if (entry?.meta?.id && entry.base64Audio) {
+            const buffer = base64ToArrayBuffer(entry.base64Audio);
+            await saveVoiceRecord(
+              { ...entry.meta, mimeType: entry.mimeType || entry.meta.mimeType || 'audio/webm' },
+              buffer
+            );
+          }
+        }
+      }
+    },
+    []
+  );
+
+  const saveDesignPreset = useCallback(
+    async (opts: {
+      name: string;
+      notes?: string;
+      scope: SavePresetScope;
+      includeAssets?: boolean;
+      overwriteId?: string;
+    }): Promise<SavePresetEntry | null> => {
+      if (!currentProject) return null;
+      const lvl = currentLevel ?? currentProject.levels[0];
+      if (!lvl && opts.scope !== 'fullGame') return null;
+
+      const includeAssets = opts.includeAssets ?? true;
+      const usedIds = new Set<string>();
+      const usedTexIds = new Set<string>();
+      const usedVoiceIds = new Set<string>();
+
+      const collectCanopyAssets = (cfg?: StylizedCanopyConfig) => {
+        if (!cfg) return;
+        if (cfg.canopyAssetId) usedIds.add(cfg.canopyAssetId);
+        if (cfg.trunkAssetId) usedIds.add(cfg.trunkAssetId);
+        if (cfg.fruitAssetId) usedIds.add(cfg.fruitAssetId);
+        if (cfg.speciesProfiles) {
+          for (const prof of Object.values(cfg.speciesProfiles)) {
+            if (!prof) continue;
+            if (prof.canopyAssetId) usedIds.add(prof.canopyAssetId);
+            if (prof.trunkAssetId) usedIds.add(prof.trunkAssetId);
+            if (prof.fruitAssetId) usedIds.add(prof.fruitAssetId);
+          }
+        }
+      };
+
+      const collectLevelAssets = (level: GameLevel) => {
+        collectCanopyAssets(level.canopyEngine);
+        collectVoiceIdsFromConfig(level.heroIntroVoice, usedVoiceIds);
+        for (const ent of level.entities) {
+          if (ent.customAssetId) usedIds.add(ent.customAssetId);
+          collectCanopyAssets(ent.canopyTree);
+          collectVoiceIdsFromConfig(ent.voiceConfig, usedVoiceIds);
+          if (ent.fxEmitter?.customMeshAssetId) usedIds.add(ent.fxEmitter.customMeshAssetId);
+        }
+        for (const sc of level.terrain?.scatter ?? []) {
+          if (sc.customAssetId) usedIds.add(sc.customAssetId);
+        }
+        for (const vi of level.vistaItems ?? []) {
+          if (vi.customAssetId) usedIds.add(vi.customAssetId);
+        }
+        for (const tid of collectReferencedTextureIds(
+          level.sceneryTextures,
+          level.canopyEngine,
+          level.entities.map((e) => e.canopyTree)
+        )) {
+          usedTexIds.add(tid);
+        }
+      };
+
+      const now = new Date().toISOString();
+      const existing = opts.overwriteId
+        ? savedPresets.find((p) => p.id === opts.overwriteId)
+        : undefined;
+
+      let summary = '';
+      let fullGame: GameProject | undefined;
+      let worldLevel: SavePresetEntry['worldLevel'];
+      let treeStudio: StylizedCanopyConfig | undefined;
+      let atmosphere: SavePresetEntry['atmosphere'];
+
+      if (opts.scope === 'fullGame') {
+        fullGame = JSON.parse(JSON.stringify(currentProject)) as GameProject;
+        if (includeAssets) {
+          if (fullGame.heroCustomAssetId) usedIds.add(fullGame.heroCustomAssetId);
+          fullGame.levels.forEach(collectLevelAssets);
+        }
+        const totalEnts = fullGame.levels.reduce((s, l) => s + l.entities.length, 0);
+        summary = `${fullGame.levels.length} level${fullGame.levels.length === 1 ? '' : 's'} · ${totalEnts} entities`;
+      } else if (opts.scope === 'worldLevel' && lvl) {
+        const clonedLevel = JSON.parse(JSON.stringify(lvl)) as GameLevel;
+        worldLevel = {
+          level: clonedLevel,
+          postProcessing: currentProject.postProcessing
+            ? JSON.parse(JSON.stringify(currentProject.postProcessing))
+            : undefined,
+        };
+        if (includeAssets) {
+          collectLevelAssets(clonedLevel);
+        }
+        summary = `${clonedLevel.name} · ${clonedLevel.biome} · ${clonedLevel.entities.length} entities`;
+      } else if (opts.scope === 'treeStudio' && lvl) {
+        const cfg = JSON.parse(
+          JSON.stringify(lvl.canopyEngine ?? createDefaultCanopyConfig())
+        ) as StylizedCanopyConfig;
+        treeStudio = cfg;
+        if (includeAssets) {
+          collectCanopyAssets(cfg);
+          for (const tid of collectReferencedTextureIds(undefined, cfg)) {
+            usedTexIds.add(tid);
+          }
+        }
+        const speciesName =
+          cfg.treeType === 'custom'
+            ? cfg.customTypeName?.trim() || 'Custom'
+            : cfg.treeType ?? 'oak';
+        summary = `${speciesName} · ${cfg.canopyLeavesEnabled ? `${cfg.canopyLeafShape ?? 'basic'} leaves` : 'base canopy'}`;
+      } else if (opts.scope === 'atmosphere' && lvl) {
+        atmosphere = {
+          sky: lvl.sky,
+          timeOfDay: lvl.timeOfDay,
+          autoCycleTime: lvl.autoCycleTime,
+          cloudDensity: lvl.cloudDensity,
+          sunIntensityScale: lvl.sunIntensityScale,
+          ambientIntensityScale: lvl.ambientIntensityScale,
+          atmosphereWarmth: lvl.atmosphereWarmth,
+          starIntensity: lvl.starIntensity,
+          sunAngle: lvl.sunAngle,
+          fog: lvl.fog,
+          weather: lvl.weather,
+          wind: lvl.wind,
+          visualStyle: lvl.visualStyle,
+          vistaPreset: lvl.vistaPreset,
+          postProcessing: currentProject.postProcessing
+            ? JSON.parse(JSON.stringify(currentProject.postProcessing))
+            : undefined,
+        };
+        const grade = currentProject.postProcessing?.colorGradingPreset ?? 'natural';
+        summary = `${lvl.sky} sky · ${lvl.weather} · ${grade === 'natural' ? 'natural grade' : grade}`;
+      }
+
+      const packed = includeAssets
+        ? await packReferencedAssetsAndTextures(usedIds, usedTexIds, usedVoiceIds)
+        : { assets: [], textures: [], voiceOvers: [] };
+
+      const entry: SavePresetEntry = {
+        id: existing?.id ?? uid(),
+        name: opts.name.trim() || currentProject.name || 'Saved Preset',
+        notes: opts.notes?.trim() || undefined,
+        scope: opts.scope,
+        createdAt: existing?.createdAt ?? now,
+        updatedAt: now,
+        summary,
+        fullGame,
+        worldLevel,
+        treeStudio,
+        atmosphere,
+        assets: packed.assets.length > 0 ? packed.assets : undefined,
+        textures: packed.textures.length > 0 ? packed.textures : undefined,
+        voiceOvers: packed.voiceOvers.length > 0 ? packed.voiceOvers : undefined,
+      };
+
+      await savePresetRecord(entry);
+      setSavedPresets((prev) => [entry, ...prev.filter((p) => p.id !== entry.id)]);
+      return entry;
+    },
+    [currentLevel, currentProject, packReferencedAssetsAndTextures, savedPresets]
+  );
+
+  const loadDesignPreset = useCallback(
+    async (
+      preset: SavePresetEntry,
+      opts?: { loadMode?: 'replaceCurrent' | 'asNewGame' }
+    ): Promise<{ ok: boolean; message: string }> => {
+      try {
+        await restoreBundledAssetsAndTextures(
+          preset.assets,
+          preset.textures,
+          preset.voiceOvers
+        );
+
+        if (preset.scope === 'fullGame' && preset.fullGame) {
+          const cloned = migrateProject(
+            JSON.parse(JSON.stringify(preset.fullGame)) as GameProject
+          );
+          const loadAsNew =
+            opts?.loadMode === 'asNewGame' || !currentProjectID || !currentProject;
+          if (loadAsNew) {
+            const opened: GameProject = {
+              ...cloned,
+              id: uid(),
+              updatedAt: new Date().toISOString(),
+            };
+            setProjects((prev) => [opened, ...prev]);
+            setCurrentProjectID(opened.id);
+            setSelectedLevelID(opened.levels[0]?.id ?? null);
+            setSelectedEntityID(opened.levels[0]?.entities[0]?.id ?? null);
+            setSelectedWidgetID(opened.hud?.widgets?.[0]?.id ?? null);
+            setSelectedTab('world');
+            setPast([]);
+            setFuture([]);
+            return { ok: true, message: `Opened "${preset.name}" as a new game.` };
+          }
+          const preservedId = currentProjectID;
+          updateProject(
+            `load preset: ${preset.name}`,
+            () => ({
+              ...cloned,
+              id: preservedId,
+              updatedAt: new Date().toISOString(),
+            }),
+            true
+          );
+          setSelectedLevelID(cloned.levels[0]?.id ?? null);
+          setSelectedEntityID(cloned.levels[0]?.entities[0]?.id ?? null);
+          setSelectedWidgetID(cloned.hud?.widgets?.[0]?.id ?? null);
+          return { ok: true, message: `Loaded full game design "${preset.name}".` };
+        }
+
+        if (!currentProject || !currentLevel) {
+          return {
+            ok: false,
+            message: 'Open a game first to apply this level, tree, or atmosphere preset.',
+          };
+        }
+
+        if (preset.scope === 'worldLevel' && preset.worldLevel?.level) {
+          const clonedLevel = JSON.parse(
+            JSON.stringify(preset.worldLevel.level)
+          ) as GameLevel;
+          const nextPP = preset.worldLevel.postProcessing
+            ? JSON.parse(JSON.stringify(preset.worldLevel.postProcessing))
+            : undefined;
+          const targetLevelId = currentLevel.id;
+          updateProject(
+            `load level preset: ${preset.name}`,
+            (proj) => ({
+              ...proj,
+              postProcessing: nextPP ?? proj.postProcessing,
+              levels: proj.levels.map((l) =>
+                l.id === targetLevelId
+                  ? {
+                      ...clonedLevel,
+                      id: targetLevelId,
+                      terrain: clonedLevel.terrain
+                        ? {
+                            ...ensureUpgradedTerrain(clonedLevel.terrain),
+                            revision: (l.terrain?.revision ?? 0) + 1,
+                          }
+                        : l.terrain,
+                    }
+                  : l
+              ),
+            }),
+            true
+          );
+          setSelectedEntityID(clonedLevel.entities[0]?.id ?? null);
+          return { ok: true, message: `Loaded level design "${preset.name}".` };
+        }
+
+        if (preset.scope === 'treeStudio' && preset.treeStudio) {
+          const clonedTree = JSON.parse(
+            JSON.stringify(preset.treeStudio)
+          ) as StylizedCanopyConfig;
+          updateLevel(
+            `load tree preset: ${preset.name}`,
+            (lvl) => ({
+              ...lvl,
+              canopyEngine: {
+                ...clonedTree,
+                enabled: true,
+              },
+              terrain: lvl.terrain
+                ? { ...lvl.terrain, revision: lvl.terrain.revision + 1 }
+                : lvl.terrain,
+            }),
+            true
+          );
+          return { ok: true, message: `Applied Tree Studio preset "${preset.name}".` };
+        }
+
+        if (preset.scope === 'atmosphere' && preset.atmosphere) {
+          const atmo = preset.atmosphere;
+          const targetLevelId = currentLevel.id;
+          updateProject(
+            `load atmosphere preset: ${preset.name}`,
+            (proj) => ({
+              ...proj,
+              postProcessing: atmo.postProcessing
+                ? JSON.parse(JSON.stringify(atmo.postProcessing))
+                : proj.postProcessing,
+              levels: proj.levels.map((l) =>
+                l.id === targetLevelId
+                  ? {
+                      ...l,
+                      sky: atmo.sky,
+                      timeOfDay: atmo.timeOfDay,
+                      autoCycleTime: atmo.autoCycleTime,
+                      cloudDensity: atmo.cloudDensity,
+                      sunIntensityScale: atmo.sunIntensityScale,
+                      ambientIntensityScale: atmo.ambientIntensityScale,
+                      atmosphereWarmth: atmo.atmosphereWarmth,
+                      starIntensity: atmo.starIntensity,
+                      sunAngle: atmo.sunAngle,
+                      fog: atmo.fog,
+                      weather: atmo.weather,
+                      wind: atmo.wind,
+                      visualStyle: atmo.visualStyle ?? l.visualStyle,
+                      vistaPreset: atmo.vistaPreset ?? l.vistaPreset,
+                    }
+                  : l
+              ),
+            }),
+            true
+          );
+          return { ok: true, message: `Applied atmosphere & post-FX "${preset.name}".` };
+        }
+
+        return { ok: false, message: 'Preset payload was empty.' };
+      } catch {
+        return { ok: false, message: 'Could not load that preset.' };
+      }
+    },
+    [
+      currentLevel,
+      currentProject,
+      currentProjectID,
+      restoreBundledAssetsAndTextures,
+      updateLevel,
+      updateProject,
+    ]
+  );
+
+  const deleteDesignPreset = useCallback(async (id: string) => {
+    await deletePresetRecord(id);
+    setSavedPresets((prev) => prev.filter((p) => p.id !== id));
+  }, []);
+
+  const renameDesignPreset = useCallback(
+    async (id: string, name: string, notes?: string) => {
+      const target = savedPresets.find((p) => p.id === id);
+      if (!target) return;
+      const updated: SavePresetEntry = {
+        ...target,
+        name: name.trim() || target.name,
+        notes: notes?.trim() || undefined,
+        updatedAt: new Date().toISOString(),
+      };
+      await savePresetRecord(updated);
+      setSavedPresets((prev) => [updated, ...prev.filter((p) => p.id !== id)]);
+    },
+    [savedPresets]
+  );
+
+  const exportSavePresetsFile = useCallback(
+    (presetIds?: string[], filename = 'savepresets.json') => {
+      const list =
+        presetIds && presetIds.length > 0
+          ? savedPresets.filter((p) => presetIds.includes(p.id))
+          : savedPresets;
+      downloadSavePresetsFile(list, filename);
+      return list.length;
+    },
+    [savedPresets]
+  );
+
+  const importSavePresetsFile = useCallback(
+    async (
+      rawText: string,
+      mode: 'merge' | 'replace' = 'merge'
+    ): Promise<{ ok: boolean; count?: number; presets?: SavePresetEntry[]; error?: string }> => {
+      const res = parseSavePresetsFile(rawText);
+      if (!res.ok) return { ok: false, error: res.error };
+
+      if (mode === 'replace') {
+        await replaceAllPresetRecords(res.presets);
+        setSavedPresets(res.presets);
+        return { ok: true, count: res.presets.length, presets: res.presets };
+      }
+
+      const byId = new Map<string, SavePresetEntry>();
+      for (const existing of savedPresets) {
+        byId.set(existing.id, existing);
+      }
+      for (const incoming of res.presets) {
+        byId.set(incoming.id, incoming);
+        await savePresetRecord(incoming);
+      }
+      const merged = Array.from(byId.values()).sort((a, b) =>
+        (b.updatedAt || b.createdAt).localeCompare(a.updatedAt || a.createdAt)
+      );
+      setSavedPresets(merged);
+      return { ok: true, count: res.presets.length, presets: res.presets };
+    },
+    [savedPresets]
+  );
+
+  const issues: MakerIssue[] = useMemo(() => {
+    if (!currentProject) return [];
+    const list: MakerIssue[] = [];
+    if (!currentProject.enabledActions.includes('walk') || !currentProject.enabledActions.includes('jump')) {
+      list.push({
+        id: 'moves',
+        title: 'Hero needs Walk & Jump',
+        detail: 'Turn on Walk and Jump in Actions so the player can get around.',
+        symbol: 'figure.run',
+        tab: 'actions',
+        isBlocking: true,
+      });
+    }
+    const noPortal = currentProject.levels.find((l) => !l.hasPortal);
+    if (noPortal) {
+      list.push({
+        id: 'portal',
+        title: `${noPortal.name} has no portal`,
+        detail: 'Turn on the end portal in World so players can finish the level.',
+        symbol: 'sparkles',
+        tab: 'world',
+        isBlocking: true,
+      });
+    }
+    if (currentLevel && currentLevel.entities.length === 0) {
+      list.push({
+        id: 'empty',
+        title: `${currentLevel.name} is empty`,
+        detail: 'Add a friend, treasure chest, or baddie in Cast or World.',
+        symbol: 'person.2.fill',
+        tab: 'cast',
+        isBlocking: false,
+      });
+    }
+    const quiet = currentLevel?.entities.find(
+      (e) => (e.kind === 'baddie' || e.kind === 'npc' || e.kind === 'treasure') && e.cards.length === 0
+    );
+    if (quiet) {
+      list.push({
+        id: 'rule',
+        title: `${quiet.name} has no rules yet`,
+        detail: 'Give it a When → If → Then rule in the Logic tab.',
+        symbol: 'arrow.triangle.branch',
+        tab: 'logic',
+        isBlocking: false,
+      });
+    }
+    if (!currentProject.coverTagline.trim()) {
+      list.push({
+        id: 'tagline',
+        title: 'Add a cover tagline',
+        detail: 'Give your game a one-line hook on the Publish tab.',
+        symbol: 'paperplane.fill',
+        tab: 'publish',
+        isBlocking: false,
+      });
+    }
+    return list;
+  }, [currentLevel, currentProject]);
+
+  const suggestions: IdeaSuggestion[] = useMemo(() => {
+    if (!currentProject || !currentLevel) return [];
+    const list: IdeaSuggestion[] = [];
+
+    const hasBaddie = currentLevel.entities.some((e) => e.kind === 'baddie');
+    if (!hasBaddie) {
+      list.push({
+        id: 'add-baddie',
+        title: 'Add a grumpy guard',
+        detail: 'Every adventure feels more exciting with someone to dodge or battle.',
+        symbol: 'bolt.fill',
+        tint: Palette.coral,
+        actionTitle: 'Drop a baddie',
+        perform: () => {
+          addEntity('baddie', 'Grumpy Slime', { x: 0.54, y: 0.44 });
+          setSelectedTab('cast');
+        },
+      });
+    }
+
+    const hasTreasure = currentLevel.entities.some((e) => e.kind === 'treasure');
+    if (!hasTreasure) {
+      list.push({
+        id: 'add-treasure',
+        title: 'Hide a treasure chest',
+        detail: 'Reward curious explorers who wander off the main path.',
+        symbol: 'gift.fill',
+        tint: Palette.gold,
+        actionTitle: 'Add a chest',
+        perform: () => {
+          addEntity('treasure', 'Secret Chest', { x: 0.72, y: 0.65 });
+          setSelectedTab('world');
+        },
+      });
+    }
+
+    const quietEntity = currentLevel.entities.find(
+      (e) => (e.kind === 'baddie' || e.kind === 'npc' || e.kind === 'treasure') && e.cards.length === 0
+    );
+    if (quietEntity) {
+      list.push({
+        id: 'add-rule',
+        title: `Give ${quietEntity.name} a rule`,
+        detail: 'Right now it just stands there. One tap makes it react to the hero.',
+        symbol: 'arrow.triangle.branch',
+        tint: Palette.plum,
+        actionTitle: 'Open Logic',
+        perform: () => {
+          setSelectedEntityID(quietEntity.id);
+          setSelectedTab('logic');
+        },
+      });
+    }
+
+    if (currentLevel.audio.mood === 'none') {
+      list.push({
+        id: 'add-music',
+        title: 'Pick a music mood',
+        detail: 'Music sets the tone as soon as the player steps onto the island.',
+        symbol: 'speaker.wave.2.fill',
+        tint: Palette.sky,
+        actionTitle: 'Set Adventure music',
+        perform: () => {
+          updateLevel('set adventure music', (lvl) => ({
+            ...lvl,
+            audio: { ...lvl.audio, mood: 'adventure' },
+          }));
+        },
+      });
+    }
+
+    if (currentProject.levels.length < 2) {
+      list.push({
+        id: 'add-level',
+        title: 'Build Level 2',
+        detail: 'Connect a second island so the portal takes the player somewhere new.',
+        symbol: 'map.fill',
+        tint: Palette.mint,
+        actionTitle: 'Add Level 2',
+        perform: () => addLevel(),
+      });
+    }
+
+    return list;
+  }, [addEntity, addLevel, currentLevel, currentProject, updateLevel]);
+
+  const updateLevelSceneryTexture = useCallback(
+    (slot: SceneryTextureSlot, settings: SurfaceTextureSettings | undefined, recordUndo = false) => {
+      updateLevel(
+        `update ${slot} texture`,
+        (lvl) => {
+          const next = { ...(lvl.sceneryTextures ?? {}) };
+          if (!settings) {
+            delete next[slot];
+          } else {
+            next[slot] = settings;
+          }
+          return { ...lvl, sceneryTextures: next };
+        },
+        recordUndo
+      );
+    },
+    [updateLevel]
+  );
+
+  return {
+    projects,
+    theme,
+    setTheme,
+    toggleTheme,
+    customAssets,
+    customTextures,
+    savedPresets,
+    viewportResolutionScale,
+    setViewportResolutionScale,
+    viewportShadowQuality,
+    setViewportShadowQuality,
+    showingAssetVault,
+    setShowingAssetVault,
+    showingPresets,
+    setShowingPresets,
+    showingLogicFlow,
+    setShowingLogicFlow,
+    showingDirector,
+    setShowingDirector,
+    rehearseSkitId,
+    setRehearseSkitId,
+    showingTerrainEditor,
+    setShowingTerrainEditor,
+    worldTool,
+    setWorldTool,
+    worldGridSnap,
+    setWorldGridSnap,
+    terrainBrush,
+    setTerrainBrush,
+    terrainBrushRadius,
+    setTerrainBrushRadius,
+    terrainBrushStrength,
+    setTerrainBrushStrength,
+    terrainBrushFalloff,
+    setTerrainBrushFalloff,
+    terrainFlattenHeight,
+    setTerrainFlattenHeight,
+    terrainScatterAssetId,
+    setTerrainScatterAssetId,
+    saveDesignPreset,
+    loadDesignPreset,
+    deleteDesignPreset,
+    renameDesignPreset,
+    exportSavePresetsFile,
+    importSavePresetsFile,
+    uploadCustomGlb,
+    updateCustomAssetMeta,
+    removeCustomAsset,
+    uploadCustomTexture,
+    resizeCustomTexture,
+    removeCustomTexture,
+    updateLevelSceneryTexture,
+    currentProject,
+    currentLevel,
+    levelIndex,
+    currentEntity,
+    currentWidget,
+    selectedLevelID,
+    setSelectedLevelID,
+    selectedEntityID,
+    setSelectedEntityID,
+    selectedWidgetID,
+    setSelectedWidgetID,
+    selectedSection,
+    setSelectedSection,
+    selectedTab,
+    setSelectedTab,
+    motionAssetId,
+    setMotionAssetId,
+    openMotionStudio: (assetId?: string) => {
+      if (assetId) setMotionAssetId(assetId);
+      setShowingAssetVault(false);
+      setSelectedTab('motion');
+    },
+    interactionAssetId,
+    setInteractionAssetId,
+    openInteractionDesigner: (assetId?: string) => {
+      if (assetId) setInteractionAssetId(assetId);
+      setShowingAssetVault(false);
+      setSelectedTab('interact');
+    },
+    isPlaying,
+    setIsPlaying,
+    playModalOpen,
+    setPlayModalOpen,
+    playFromPoint,
+    setPlayFromPoint,
+    playerTelemetry,
+    setPlayerTelemetry,
+    showingNewGame,
+    setShowingNewGame,
+    showingIdeas,
+    setShowingIdeas,
+    canUndo: past.length > 0,
+    canRedo: future.length > 0,
+    undoLabel: past[past.length - 1]?.label ?? '',
+    undo,
+    redo,
+    openProject,
+    closeProject,
+    createProject,
+    duplicateProject,
+    deleteProject,
+    updateProject,
+    updateLevel,
+    addLevel,
+    deleteCurrentLevel,
+    applyBrush,
+    resetTerrain,
+    addEntity,
+    addBuildingBlockEntity,
+    addFxTemplateAtPoint,
+    addCanopyTreeEntity,
+    scatterCanopyGrove,
+    addMechanicalEntityToLevel,
+    updateEntity,
+    moveEntity,
+    deleteEntity,
+    addEmptyCard,
+    applyRecipe,
+    toggleAction,
+    enableAllActions,
+    resetActions,
+    addWidget,
+    resetHUDToDefault,
+    updateWidget,
+    deleteWidget,
+    addInventoryItem,
+    updateInventoryItem,
+    updateInventoryItemMetadata,
+    deleteInventoryItem,
+    selectedInventoryItemId,
+    setSelectedInventoryItemId,
+    runtimeDurability,
+    wearItemDurability,
+    repairItemDurability,
+    resetRuntimeDurability,
+    selectedInventoryMetadata: (() => {
+      const items = currentProject?.inventoryItems?.length
+        ? currentProject.inventoryItems
+        : DefaultInventoryItems;
+      const target = items.find((i) => i.id === selectedInventoryItemId) ?? null;
+      if (!target) return null;
+      const dur = runtimeDurability[target.id];
+      return resolveItemMetadata(
+        target,
+        dur
+          ? { itemId: target.id, qty: 1, durability: dur.durability, maxDurability: dur.maxDurability }
+          : null
+      );
+    })(),
+    addCraftingRecipe,
+    deleteCraftingRecipe,
+    updateInventoryConfig,
+    exportProjectJSON,
+    importProjectJSON,
+    exportCompressedMakerFile,
+    exportProjectZip,
+    importProjectFile,
+    saveProjectStateNow: flushProjectsToStorage,
+    issues,
+    suggestions,
+  };
+}
+
+export type MakerStore = ReturnType<typeof useMakerStore>;

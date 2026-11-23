@@ -1,0 +1,2359 @@
+import React, { useEffect, useRef, useState } from 'react';
+import * as THREE from 'three';
+import type { WebGPURenderer } from 'three/webgpu';
+import { uniform } from 'three/tsl';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { ClusteredLighting } from 'three/addons/lighting/ClusteredLighting.js';
+import type {
+  BoardPoint,
+  CustomAssetMeta,
+  LevelEntity,
+  GameLevel,
+  GameProject,
+  StoryCameraShot,
+  TerrainBrush,
+  TerrainBrushFalloff,
+  ViewportResolutionScale,
+  ViewportShadowQuality,
+  ViewportTool,
+} from '../../types/maker';
+import { registerDirectorViewportBridge } from '../../utils/directorBridge';
+import {
+  getEnvironmentType,
+  levelBoardToWorld,
+  levelWorldToBoard,
+  PlatformMotion,
+  sampleLevelHeight,
+} from '../../utils/terrain';
+import {
+  applyVisualStyleToObject,
+  getCachedAssetSync,
+  instantiateCustomModel,
+  loadCustomAssetToCache,
+} from '../../three/gltfAssetManager';
+import {
+  applyAtmosphere,
+  applyLiveRendererQuality,
+  buildIslandMesh,
+  buildWeatherParticles,
+  createMakerRenderer,
+  detectSoftwareGl,
+  disposeObject3D,
+  ensureSkyDome,
+  setupSceneEnvironment,
+  updateIslandTerrainGeometryInPlace,
+  updateSkyClouds,
+  type IslandSceneHandles,
+} from '../../three/islandScene';
+import { isWebGPUFallbackAdapter } from '../../three/webglUtils';
+import { createDefaultFxEmitterConfig } from '../../data/fxEmitterPresets';
+import {
+  buildSingleCanopyTreeGroup,
+  computeWeatherWindFactor,
+} from '../../three/canopyClusterBuilder';
+import {
+  collectReferencedTextureIds,
+  getRawCustomTextureSync,
+  loadCustomTextureToCache,
+  subscribeCustomTextureInvalidation,
+} from '../../three/customTextureManager';
+import { FxEmitterRuntime } from '../../three/fxEmitterRuntime';
+import { PostProcessingPipeline } from '../../three/postProcessingPipeline';
+import { buildEntityMesh, buildHeroModel, buildPortalMarker } from '../../three/proceduralModels';
+import { buildCarModel } from '../../three/vehicleModels';
+import { applyVertexPaintStrokesToObject } from '../../three/vertexPainter';
+import { createOptInMeshletPipeline, prepareObjectForMeshletCulling } from '../../three/meshletPipeline';
+import {
+  applyEntityMaterialVariant,
+  stripLiveVariantFieldsForStructKey,
+  updateEntityMaterialVariantInPlace,
+} from '../../three/nodeMaterialUtils';
+import { runDeferredChunks } from '../../utils/deferredLoader';
+import { readJsHeapUsageMB } from '../../utils/resourceMonitor';
+
+import { FX_DRAG_MIME } from './FxLibraryPanel';
+
+export interface TerrainBrushStrokeMeta {
+  isStart: boolean;
+  sampledHeight: number;
+}
+
+const HEIGHT_MODIFYING_BRUSHES = new Set<TerrainBrush>([
+  'raiseGround',
+  'lowerGround',
+  'smoothGround',
+  'flattenGround',
+  'plateauCliff',
+  'carveRiver',
+  'carveCave',
+  'weatherErode',
+]);
+
+function getBrushAccentHex(brush: TerrainBrush): string {
+  switch (brush) {
+    case 'raiseGround':
+      return '#20B46A';
+    case 'lowerGround':
+      return '#F2545B';
+    case 'flattenGround':
+      return '#38BDF8';
+    case 'smoothGround':
+      return '#A855F7';
+    case 'plateauCliff':
+      return '#F59E0B';
+    case 'carveRiver':
+      return '#0EA5E9';
+    case 'carveCave':
+      return '#94A3B8';
+    case 'weatherMoss':
+      return '#4B8B3B';
+    case 'weatherCracks':
+      return '#78716C';
+    case 'weatherErode':
+      return '#D97706';
+    case 'weatherScorch':
+      return '#44403C';
+    case 'weatherMud':
+      return '#8B5E3C';
+    case 'weatherFrost':
+      return '#BAE6FD';
+    case 'weatherClear':
+      return '#E2E8F0';
+    default:
+      return '#F59E0B';
+  }
+}
+
+function getFalloffInnerRatio(falloff: TerrainBrushFalloff): number {
+  switch (falloff) {
+    case 'plateau':
+      return 0.68;
+    case 'dome':
+      return 0.54;
+    case 'peak':
+      return 0.24;
+    case 'smooth':
+    default:
+      return 0.42;
+  }
+}
+
+const savedCameraPoseMap = new Map<
+  string,
+  { pos: [number, number, number]; target: [number, number, number] }
+>();
+
+interface WorldViewport3DProps {
+  project: GameProject;
+  level: GameLevel;
+  customAssets: CustomAssetMeta[];
+  selectedEntityID: string | null;
+  playerPin?: BoardPoint | null;
+  tool: ViewportTool;
+  brush: TerrainBrush;
+  brushRadius: number;
+  brushFalloff?: TerrainBrushFalloff;
+  gridSnap?: 0 | 1 | 2;
+  isPlacingBuildingBlock?: boolean;
+  resolutionScale?: ViewportResolutionScale;
+  shadowQuality?: ViewportShadowQuality;
+  addKindName?: string;
+  fxBurstSignal?: { entityId: string; nonce: number } | null;
+  fxPaused?: boolean;
+  renderPaused?: boolean;
+  draggingFxTemplate?: { id: string; name: string; accentHex: string } | null;
+  onSelectEntity: (id: string | null) => void;
+  onMoveEntity: (id: string, pos: { x: number; y: number }, elevationY?: number) => void;
+  onRotateEntity: (id: string, deg: number) => void;
+  onScaleEntity: (id: string, scale: number) => void;
+  onBrushStroke: (x: number, z: number, meta?: TerrainBrushStrokeMeta) => void;
+  onAddAtPoint: (pos: { x: number; y: number }, elevationY?: number) => void;
+  onDropFxTemplate?: (templateId: string, pos: { x: number; y: number }) => void;
+}
+
+export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
+  project,
+  level,
+  customAssets,
+  selectedEntityID,
+  playerPin = null,
+  tool,
+  brush,
+  brushRadius,
+  brushFalloff = 'smooth',
+  gridSnap = 0,
+  isPlacingBuildingBlock = false,
+  resolutionScale = 1,
+  shadowQuality = 'medium',
+  fxBurstSignal = null,
+  fxPaused = false,
+  renderPaused = false,
+  draggingFxTemplate = null,
+  onSelectEntity,
+  onMoveEntity,
+  onRotateEntity,
+  onScaleEntity,
+  onBrushStroke,
+  onAddAtPoint,
+  onDropFxTemplate,
+}) => {
+  const mountRef = useRef<HTMLDivElement | null>(null);
+  const [texInvalidationTick, setTexInvalidationTick] = useState(0);
+  const [sculptFinalizeNonce, setSculptFinalizeNonce] = useState(0);
+  const [isDragOver, setIsDragOver] = useState(false);
+  const [showPerfHud, setShowPerfHud] = useState(false);
+  const [perfStats, setPerfStats] = useState<{
+    fps: number;
+    frameMs: number;
+    calls: number;
+    triangles: number;
+    backend: string;
+    heapMB?: number;
+    heapLimitMB?: number;
+  }>({ fps: 0, frameMs: 0, calls: 0, triangles: 0, backend: 'WebGPU' });
+  const showPerfHudRef = useRef(showPerfHud);
+  showPerfHudRef.current = showPerfHud;
+  const compactFpsDotRef = useRef<HTMLSpanElement | null>(null);
+  const compactFpsTextRef = useRef<HTMLSpanElement | null>(null);
+  const compactMsTextRef = useRef<HTMLSpanElement | null>(null);
+  const latestPerfSnapshotRef = useRef(perfStats);
+
+  const lastSculptAreaRef = useRef<{ x: number; z: number; radius: number } | null>(null);
+  const isSculptDraggingRef = useRef(false);
+  const lastIslandStructKeyRef = useRef<string>('');
+  const lastEntityStructKeyRef = useRef<string>('');
+  const islandBuildAbortRef = useRef<AbortController | null>(null);
+  const entityBuildAbortRef = useRef<AbortController | null>(null);
+
+  useEffect(() => {
+    return subscribeCustomTextureInvalidation(() => setTexInvalidationTick((t) => t + 1));
+  }, []);
+
+  const resumeLoopRef = useRef<(() => void) | null>(null);
+
+  const propsRef = useRef({
+    project,
+    level,
+    customAssets,
+    selectedEntityID,
+    tool,
+    brush,
+    brushRadius,
+    brushFalloff,
+    gridSnap,
+    isPlacingBuildingBlock,
+    resolutionScale,
+    shadowQuality,
+    fxPaused,
+    renderPaused,
+    draggingFxTemplate,
+    onSelectEntity,
+    onMoveEntity,
+    onRotateEntity,
+    onScaleEntity,
+    onBrushStroke,
+    onAddAtPoint,
+    onDropFxTemplate,
+  });
+  propsRef.current = {
+    project,
+    level,
+    customAssets,
+    selectedEntityID,
+    tool,
+    brush,
+    brushRadius,
+    brushFalloff,
+    gridSnap,
+    isPlacingBuildingBlock,
+    resolutionScale,
+    shadowQuality,
+    fxPaused,
+    renderPaused,
+    draggingFxTemplate,
+    onSelectEntity,
+    onMoveEntity,
+    onRotateEntity,
+    onScaleEntity,
+    onBrushStroke,
+    onAddAtPoint,
+    onDropFxTemplate,
+  };
+
+  const sceneRefs = useRef<{
+    scene: THREE.Scene;
+    camera: THREE.PerspectiveCamera;
+    controls: OrbitControls;
+    renderer: WebGPURenderer;
+    postPipeline: PostProcessingPipeline | null;
+    sun: THREE.DirectionalLight;
+    hemi: THREE.HemisphereLight;
+    islandContainer: THREE.Group;
+    entitiesContainer: THREE.Group;
+    fxContainer: THREE.Group;
+    fxEmitters: Map<string, FxEmitterRuntime>;
+    islandHandles: IslandSceneHandles | null;
+    weatherPoints: THREE.Points | null;
+    selectionRing: THREE.Mesh;
+    brushGroup: THREE.Group;
+    brushOuterMat: THREE.MeshBasicMaterial;
+    brushInnerRing: THREE.Mesh;
+    brushInnerMat: THREE.MeshBasicMaterial;
+    brushCenterDot: THREE.Mesh;
+    dropPreviewGroup: THREE.Group;
+    dropRingMat: THREE.MeshBasicMaterial;
+    dropPillarMat: THREE.MeshBasicMaterial;
+    snapGhostGroup: THREE.Group;
+    buildGridHelper: THREE.GridHelper;
+    entityGroups: Map<string, THREE.Group>;
+    floatSpinObjects: THREE.Object3D[];
+    torchFlameObjects: Array<{ mesh: THREE.Object3D; baseY: number; phase: number }>;
+    groundMeshes: THREE.Object3D[];
+    heroGroup: THREE.Group | null;
+    portalGroup: THREE.Group | null;
+    customUpdaters: ((dt: number) => void)[];
+    hasDynamicShadows: boolean;
+    rendererInitialized: boolean;
+    markShadowDirty: () => void;
+    precompileObject: (obj: THREE.Object3D) => Promise<void>;
+    canopyTimeUniform: { value: number };
+    canopyWindUniform: { value: number };
+    lastFramedEnvKey: string;
+    isSoftwareGl: boolean;
+  } | null>(null);
+
+  useEffect(() => {
+    const container = mountRef.current;
+    if (!container) return;
+
+    const isSoftwareGl = detectSoftwareGl();
+    let renderer = createMakerRenderer(isSoftwareGl);
+    renderer.setSize(container.clientWidth || 640, container.clientHeight || 420);
+    container.innerHTML = '';
+    container.appendChild(renderer.domElement);
+
+    const scene = new THREE.Scene();
+    ensureSkyDome(scene);
+
+    const camera = new THREE.PerspectiveCamera(
+      48,
+      (container.clientWidth || 640) / Math.max(1, container.clientHeight || 420),
+      0.2,
+      1250
+    );
+    camera.position.set(68, 52, 88);
+
+    let controls = new OrbitControls(camera, renderer.domElement);
+    controls.target.set(0, 1.2, 0);
+    controls.enableDamping = !isSoftwareGl;
+    controls.dampingFactor = 0.08;
+    controls.minDistance = 8;
+    controls.maxDistance = 360;
+    controls.maxPolarAngle = Math.PI * 0.47;
+    controls.update();
+
+    const saveCurrentCameraPose = () => {
+      const refs = sceneRefs.current;
+      if (!refs || !refs.lastFramedEnvKey) return;
+      const { project: curProj, level: curLvl } = propsRef.current;
+      const curEnv = getEnvironmentType(curLvl);
+      const poseKey = `${curProj.id}:${curLvl.id}:${curEnv}`;
+      savedCameraPoseMap.set(poseKey, {
+        pos: [camera.position.x, camera.position.y, camera.position.z],
+        target: [controls.target.x, controls.target.y, controls.target.z],
+      });
+    };
+    controls.addEventListener('change', saveCurrentCameraPose);
+
+    const hemi = new THREE.HemisphereLight('#B8E4FF', '#5F7844', 0.75);
+    scene.add(hemi);
+
+    const sun = new THREE.DirectionalLight('#FFF5E0', 1.8);
+    sun.castShadow = !isSoftwareGl;
+    sun.shadow.mapSize.set(1024, 1024);
+    sun.shadow.camera.left = -140;
+    sun.shadow.camera.right = 140;
+    sun.shadow.camera.top = 140;
+    sun.shadow.camera.bottom = -140;
+    sun.shadow.camera.near = 2;
+    sun.shadow.camera.far = 400;
+    sun.shadow.bias = -0.0005;
+    sun.shadow.normalBias = 0.02;
+    sun.shadow.autoUpdate = false;
+    sun.shadow.needsUpdate = !isSoftwareGl;
+    scene.add(sun);
+
+    let envTex: THREE.Texture | null = null;
+    let postPipeline: PostProcessingPipeline | null = null;
+
+    const islandContainer = new THREE.Group();
+    const entitiesContainer = new THREE.Group();
+    const fxContainer = new THREE.Group();
+    scene.add(islandContainer, entitiesContainer, fxContainer);
+
+    const selectionRing = new THREE.Mesh(
+      new THREE.RingGeometry(0.95, 1.18, 28),
+      new THREE.MeshBasicMaterial({
+        color: '#7C5CFF',
+        side: THREE.DoubleSide,
+        transparent: true,
+        opacity: 0.92,
+      })
+    );
+    selectionRing.rotation.x = -Math.PI / 2;
+    selectionRing.visible = false;
+    scene.add(selectionRing);
+
+    // Dual-ring terrain sculpt reticle (outer radius + inner falloff profile + center dot)
+    const brushGroup = new THREE.Group();
+    const brushOuterMat = new THREE.MeshBasicMaterial({
+      color: '#20B46A',
+      side: THREE.DoubleSide,
+      transparent: true,
+      opacity: 0.92,
+      depthTest: false,
+      depthWrite: false,
+    });
+    const brushOuterRing = new THREE.Mesh(new THREE.RingGeometry(0.94, 1.0, 48), brushOuterMat);
+    brushOuterRing.rotation.x = -Math.PI / 2;
+    brushOuterRing.renderOrder = 25;
+
+    const brushInnerMat = new THREE.MeshBasicMaterial({
+      color: '#20B46A',
+      side: THREE.DoubleSide,
+      transparent: true,
+      opacity: 0.42,
+      depthTest: false,
+      depthWrite: false,
+    });
+    const brushInnerRing = new THREE.Mesh(new THREE.RingGeometry(0.92, 1.0, 40), brushInnerMat);
+    brushInnerRing.rotation.x = -Math.PI / 2;
+    brushInnerRing.renderOrder = 25;
+
+    const brushCenterDot = new THREE.Mesh(
+      new THREE.CircleGeometry(0.055, 16),
+      brushOuterMat
+    );
+    brushCenterDot.rotation.x = -Math.PI / 2;
+    brushCenterDot.renderOrder = 26;
+
+    brushGroup.add(brushOuterRing, brushInnerRing, brushCenterDot);
+    brushGroup.visible = false;
+    scene.add(brushGroup);
+
+    // Glowing 3D target beacon for drag-and-drop FX Library placement
+    const dropPreviewGroup = new THREE.Group();
+    const dropRingMat = new THREE.MeshBasicMaterial({
+      color: '#7C5CFF',
+      side: THREE.DoubleSide,
+      transparent: true,
+      opacity: 0.92,
+      depthWrite: false,
+    });
+    const dropOuterRing = new THREE.Mesh(new THREE.RingGeometry(1.15, 1.48, 36), dropRingMat);
+    dropOuterRing.rotation.x = -Math.PI / 2;
+    dropOuterRing.position.y = 0.14;
+    const dropInnerDisc = new THREE.Mesh(
+      new THREE.CircleGeometry(0.42, 24),
+      dropRingMat
+    );
+    dropInnerDisc.rotation.x = -Math.PI / 2;
+    dropInnerDisc.position.y = 0.16;
+    const dropPillarMat = new THREE.MeshBasicMaterial({
+      color: '#7C5CFF',
+      transparent: true,
+      opacity: 0.34,
+      depthWrite: false,
+    });
+    const dropPillar = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.14, 0.45, 3.8, 16, 1, true),
+      dropPillarMat
+    );
+    dropPillar.position.y = 2.0;
+    dropPreviewGroup.add(dropOuterRing, dropInnerDisc, dropPillar);
+    dropPreviewGroup.visible = false;
+    scene.add(dropPreviewGroup);
+
+    // Modular 2m build snap grid & cursor block ghost
+    const buildGridHelper = new THREE.GridHelper(88, 44, '#7C5CFF', '#4B556B');
+    const gridMats = Array.isArray(buildGridHelper.material)
+      ? buildGridHelper.material
+      : [buildGridHelper.material];
+    for (const gm of gridMats) {
+      gm.transparent = true;
+      gm.opacity = 0.24;
+      gm.depthWrite = false;
+    }
+    buildGridHelper.position.y = 0.04;
+    buildGridHelper.visible = false;
+    scene.add(buildGridHelper);
+
+    const snapGhostGroup = new THREE.Group();
+    const ghostFloorMat = new THREE.MeshBasicMaterial({
+      color: '#38BDF8',
+      transparent: true,
+      opacity: 0.22,
+      side: THREE.DoubleSide,
+      depthWrite: false,
+    });
+    const ghostPlane = new THREE.Mesh(new THREE.PlaneGeometry(1.96, 1.96), ghostFloorMat);
+    ghostPlane.rotation.x = -Math.PI / 2;
+    ghostPlane.position.y = 0.03;
+    const ghostWire = new THREE.LineSegments(
+      new THREE.EdgesGeometry(new THREE.BoxGeometry(2.0, 2.0, 2.0)),
+      new THREE.LineBasicMaterial({ color: '#38BDF8', transparent: true, opacity: 0.72 })
+    );
+    ghostWire.position.y = 1.0;
+    snapGhostGroup.add(ghostPlane, ghostWire);
+    snapGhostGroup.visible = false;
+    scene.add(snapGhostGroup);
+
+    sceneRefs.current = {
+      scene,
+      camera,
+      controls,
+      renderer,
+      postPipeline: null,
+      sun,
+      hemi,
+      islandContainer,
+      entitiesContainer,
+      fxContainer,
+      fxEmitters: new Map(),
+      islandHandles: null,
+      weatherPoints: null,
+      selectionRing,
+      brushGroup,
+      brushOuterMat,
+      brushInnerRing,
+      brushInnerMat,
+      brushCenterDot,
+      dropPreviewGroup,
+      dropRingMat,
+      dropPillarMat,
+      snapGhostGroup,
+      buildGridHelper,
+      entityGroups: new Map(),
+      floatSpinObjects: [],
+      torchFlameObjects: [],
+      groundMeshes: [],
+      heroGroup: null,
+      portalGroup: null,
+      customUpdaters: [],
+      hasDynamicShadows: false,
+      rendererInitialized: false,
+      markShadowDirty: () => {
+        if (!isSoftwareGl && sun.castShadow) {
+          sun.shadow.needsUpdate = true;
+        }
+      },
+      precompileObject: async (obj: THREE.Object3D) => {
+        const curRefs = sceneRefs.current;
+        if (!curRefs || !curRefs.rendererInitialized || disposed) return;
+        compileChain = compileChain.then(async () => {
+          const activeRefs = sceneRefs.current;
+          if (disposed || !activeRefs?.rendererInitialized) return;
+          try {
+            if (activeRefs.postPipeline) {
+              await activeRefs.postPipeline.precompileAsync(
+                propsRef.current.project.postProcessing,
+                obj
+              );
+            } else {
+              await activeRefs.renderer.compileAsync(obj, camera, scene);
+            }
+          } catch {
+            // ignore compile skips if object was disposed mid-flight
+          } finally {
+            const next = pendingResizeRef.current;
+            if (!disposed && !activeRefs.postPipeline?.isPrecompiling() && next) {
+              pendingResizeRef.current = null;
+              applyContainerResize(next.w, next.h);
+            }
+          }
+        });
+        await compileChain;
+      },
+      canopyTimeUniform: uniform(0),
+      canopyWindUniform: uniform(
+        computeWeatherWindFactor(propsRef.current.level.weather, propsRef.current.level.wind)
+      ),
+      lastFramedEnvKey: '',
+      isSoftwareGl,
+    };
+
+    const raycaster = new THREE.Raycaster();
+    const pointerNdc = new THREE.Vector2();
+
+    let activeMode: 'none' | 'dragEntity' | 'rotateEntity' | 'scaleEntity' | 'brush' = 'none';
+    let activeEntityId: string | null = null;
+    let dragStartX = 0;
+    let startVal = 0;
+    let pointerDownPos = { x: 0, y: 0 };
+    let movedFar = false;
+    let strokeSampledHeight = 0;
+    let strokeModifiedHeight = false;
+    let lastStrokeTimeMs = 0;
+
+    const updatePointer = (clientX: number, clientY: number) => {
+      const rect = renderer.domElement.getBoundingClientRect();
+      pointerNdc.x = ((clientX - rect.left) / Math.max(1, rect.width)) * 2 - 1;
+      pointerNdc.y = -((clientY - rect.top) / Math.max(1, rect.height)) * 2 + 1;
+    };
+
+    const raycastGround = (clientX: number, clientY: number): THREE.Vector3 | null => {
+      const refs = sceneRefs.current;
+      if (!refs || refs.groundMeshes.length === 0) return null;
+      updatePointer(clientX, clientY);
+      raycaster.setFromCamera(pointerNdc, camera);
+      const hits = raycaster.intersectObjects(refs.groundMeshes, false);
+      return hits[0]?.point ?? null;
+    };
+
+    const raycastPlacementSurface = (
+      clientX: number,
+      clientY: number,
+      excludeEntityId?: string | null
+    ): { x: number; y: number; z: number; elevationY: number } | null => {
+      const refs = sceneRefs.current;
+      if (!refs || refs.groundMeshes.length === 0) return null;
+      const curLevel = propsRef.current.level;
+      const snap = propsRef.current.gridSnap ?? 0;
+      const shouldStack = Boolean(propsRef.current.isPlacingBuildingBlock || excludeEntityId);
+
+      updatePointer(clientX, clientY);
+      raycaster.setFromCamera(pointerNdc, camera);
+
+      let rawHit: THREE.Vector3 | null = null;
+      let stackedTopY: number | null = null;
+
+      if (shouldStack) {
+        const stackTargets: THREE.Object3D[] = [];
+        for (const ent of curLevel.entities) {
+          if (ent.id === excludeEntityId) continue;
+          if (!ent.buildingBlock && ent.kind !== 'platform') continue;
+          const grp = refs.entityGroups.get(ent.id);
+          if (grp) stackTargets.push(grp);
+        }
+        if (stackTargets.length > 0) {
+          const objHits = raycaster.intersectObjects(stackTargets, true);
+          const worldNormal = new THREE.Vector3();
+          for (const h of objHits) {
+            if (!h.face) continue;
+            worldNormal.copy(h.face.normal).transformDirection(h.object.matrixWorld);
+            if (worldNormal.y > 0.55) {
+              rawHit = h.point.clone();
+              stackedTopY = h.point.y;
+              break;
+            }
+          }
+        }
+      }
+
+      if (!rawHit) {
+        const groundHits = raycaster.intersectObjects(refs.groundMeshes, false);
+        rawHit = groundHits[0]?.point?.clone() ?? null;
+      }
+      if (!rawHit) return null;
+
+      const x = snap > 0 ? Math.round(rawHit.x / snap) * snap : rawHit.x;
+      const z = snap > 0 ? Math.round(rawHit.z / snap) * snap : rawHit.z;
+      const groundY = sampleLevelHeight(curLevel, x, z);
+      let elevationY = 0;
+      if (stackedTopY !== null) {
+        const rawElev = Math.max(0, stackedTopY - groundY);
+        // Quantize to clean masonry increments if very close to 2m or 0.24m
+        if (Math.abs(rawElev - Math.round(rawElev / 2) * 2) < 0.14) {
+          elevationY = Math.round(rawElev / 2) * 2;
+        } else {
+          elevationY = Number(rawElev.toFixed(2));
+        }
+      }
+      return { x, y: groundY + elevationY, z, elevationY };
+    };
+
+    const raycastEntity = (clientX: number, clientY: number): string | null => {
+      const refs = sceneRefs.current;
+      if (!refs) return null;
+      updatePointer(clientX, clientY);
+      raycaster.setFromCamera(pointerNdc, camera);
+      const targets: THREE.Object3D[] = [
+        ...refs.entitiesContainer.children,
+        ...refs.fxContainer.children,
+      ];
+      const hits = raycaster.intersectObjects(targets, true);
+      for (const hit of hits) {
+        let obj: THREE.Object3D | null = hit.object;
+        while (obj) {
+          if (obj.userData?.entityId) return String(obj.userData.entityId);
+          obj = obj.parent;
+        }
+      }
+      return null;
+    };
+
+    const onPointerDown = (e: PointerEvent) => {
+      pointerDownPos = { x: e.clientX, y: e.clientY };
+      movedFar = false;
+      const {
+        tool: curTool,
+        brush: curBrush,
+        brushRadius: r,
+        selectedEntityID: selId,
+        level: curLevel,
+      } = propsRef.current;
+
+      // Left-click sculpts terrain; right/middle-click still orbits smoothly
+      if (curTool === 'terrain' && e.button === 0) {
+        const hit = raycastGround(e.clientX, e.clientY);
+        if (hit) {
+          activeMode = 'brush';
+          isSculptDraggingRef.current = true;
+          controls.enabled = false;
+          strokeSampledHeight = sampleLevelHeight(curLevel, hit.x, hit.z);
+          const nearCaveForWeather =
+            curBrush.startsWith('weather') &&
+            (curLevel.terrain?.caves ?? []).some(
+              (c) => Math.hypot(hit.x - c.x, hit.z - c.z) < r + 15
+            );
+          strokeModifiedHeight = HEIGHT_MODIFYING_BRUSHES.has(curBrush) || nearCaveForWeather;
+          lastSculptAreaRef.current = { x: hit.x, z: hit.z, radius: r };
+          lastStrokeTimeMs = performance.now();
+          propsRef.current.onBrushStroke(hit.x, hit.z, {
+            isStart: true,
+            sampledHeight: strokeSampledHeight,
+          });
+        }
+        return;
+      }
+
+      if (curTool === 'terrain') return;
+
+      const hitEntityId = raycastEntity(e.clientX, e.clientY);
+
+      if (curTool === 'move' && hitEntityId && hitEntityId === selId) {
+        activeMode = 'dragEntity';
+        activeEntityId = hitEntityId;
+        controls.enabled = false;
+        return;
+      }
+
+      if ((curTool === 'rotate' || curTool === 'scale') && selId) {
+        const ent = curLevel.entities.find((item) => item.id === selId);
+        if (ent && (hitEntityId === selId || e.button === 0)) {
+          if (hitEntityId === selId) {
+            activeMode = curTool === 'rotate' ? 'rotateEntity' : 'scaleEntity';
+            activeEntityId = selId;
+            dragStartX = e.clientX;
+            startVal = curTool === 'rotate' ? ent.rotation : ent.scale;
+            controls.enabled = false;
+          }
+        }
+      }
+    };
+
+    const onPointerMove = (e: PointerEvent) => {
+      if (Math.hypot(e.clientX - pointerDownPos.x, e.clientY - pointerDownPos.y) > 5) {
+        movedFar = true;
+      }
+      const {
+        tool: curTool,
+        brush: curBrush,
+        brushRadius: r,
+        brushFalloff: falloff,
+      } = propsRef.current;
+      const refs = sceneRefs.current;
+
+      if (curTool === 'terrain' && refs) {
+        const hit = raycastGround(e.clientX, e.clientY);
+        if (hit) {
+          const accent = getBrushAccentHex(curBrush);
+          refs.brushOuterMat.color.set(accent);
+          refs.brushInnerMat.color.set(accent);
+          refs.brushInnerRing.scale.setScalar(getFalloffInnerRatio(falloff));
+          refs.brushGroup.visible = true;
+          refs.brushGroup.position.set(hit.x, hit.y + 0.16, hit.z);
+          refs.brushGroup.scale.setScalar(r);
+          if (activeMode === 'brush') {
+            const now = performance.now();
+            if (now - lastStrokeTimeMs >= 22) {
+              lastStrokeTimeMs = now;
+              lastSculptAreaRef.current = { x: hit.x, z: hit.z, radius: r };
+              if (
+                HEIGHT_MODIFYING_BRUSHES.has(curBrush) ||
+                (curBrush.startsWith('weather') &&
+                  (propsRef.current.level.terrain?.caves ?? []).some(
+                    (c) => Math.hypot(hit.x - c.x, hit.z - c.z) < r + 15
+                  ))
+              ) {
+                strokeModifiedHeight = true;
+              }
+              propsRef.current.onBrushStroke(hit.x, hit.z, {
+                isStart: false,
+                sampledHeight: strokeSampledHeight,
+              });
+            }
+          }
+        } else {
+          refs.brushGroup.visible = false;
+        }
+        return;
+      } else if (refs) {
+        refs.brushGroup.visible = false;
+      }
+
+      if (activeMode === 'dragEntity' && activeEntityId) {
+        const draggedEnt = propsRef.current.level.entities.find((item) => item.id === activeEntityId);
+        const useSnapStack = Boolean(draggedEnt?.buildingBlock || draggedEnt?.kind === 'door' || (propsRef.current.gridSnap ?? 0) > 0);
+        if (useSnapStack) {
+          const hit = raycastPlacementSurface(
+            e.clientX,
+            e.clientY,
+            draggedEnt?.buildingBlock ? activeEntityId : null
+          );
+          if (hit) {
+            const bp = levelWorldToBoard(propsRef.current.level, hit.x, hit.z);
+            const keepElev = draggedEnt?.buildingBlock ? hit.elevationY : draggedEnt?.elevationY;
+            propsRef.current.onMoveEntity(activeEntityId, bp, keepElev);
+          }
+        } else {
+          const hit = raycastGround(e.clientX, e.clientY);
+          if (hit) {
+            const bp = levelWorldToBoard(propsRef.current.level, hit.x, hit.z);
+            propsRef.current.onMoveEntity(activeEntityId, bp);
+          }
+        }
+      } else if (activeMode === 'rotateEntity' && activeEntityId) {
+        const dx = e.clientX - dragStartX;
+        propsRef.current.onRotateEntity(activeEntityId, (startVal + dx * 0.9) % 360);
+      } else if (activeMode === 'scaleEntity' && activeEntityId) {
+        const dx = e.clientX - dragStartX;
+        const nextScale = Math.max(0.4, Math.min(2.6, startVal + dx * 0.008));
+        propsRef.current.onScaleEntity(activeEntityId, Number(nextScale.toFixed(2)));
+      } else if (refs && curTool === 'add' && (propsRef.current.isPlacingBuildingBlock || (propsRef.current.gridSnap ?? 0) > 0)) {
+        const hit = raycastPlacementSurface(e.clientX, e.clientY, null);
+        if (hit) {
+          refs.snapGhostGroup.visible = true;
+          refs.snapGhostGroup.position.set(hit.x, hit.y, hit.z);
+        } else {
+          refs.snapGhostGroup.visible = false;
+        }
+      } else if (refs) {
+        refs.snapGhostGroup.visible = false;
+      }
+    };
+
+    const onPointerUp = (e: PointerEvent) => {
+      const wasMode = activeMode;
+      activeMode = 'none';
+      activeEntityId = null;
+      controls.enabled = true;
+      if (sceneRefs.current) {
+        sceneRefs.current.snapGhostGroup.visible = false;
+      }
+
+      if (wasMode === 'brush') {
+        isSculptDraggingRef.current = false;
+        if (strokeModifiedHeight) {
+          strokeModifiedHeight = false;
+          // Finalize scatter/trees/caves seating once after live sculpt drag completes
+          setSculptFinalizeNonce((n) => n + 1);
+        }
+        lastSculptAreaRef.current = null;
+        return;
+      }
+
+      if (!movedFar && wasMode === 'none') {
+        const { tool: curTool, level: curLevel } = propsRef.current;
+        if (curTool === 'add') {
+          const hit = raycastPlacementSurface(e.clientX, e.clientY, null);
+          if (hit) {
+            propsRef.current.onAddAtPoint(
+              levelWorldToBoard(curLevel, hit.x, hit.z),
+              hit.elevationY > 0.01 ? hit.elevationY : undefined
+            );
+          }
+          return;
+        }
+        if (curTool !== 'terrain') {
+          const hitId = raycastEntity(e.clientX, e.clientY);
+          propsRef.current.onSelectEntity(hitId);
+        }
+      }
+    };
+
+    const onKeyDown = (e: KeyboardEvent) => {
+      const target = e.target as HTMLElement | null;
+      if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.tagName === 'SELECT')) {
+        return;
+      }
+      if (e.key.toLowerCase() === 'r') {
+        const { selectedEntityID: selId, level: curLevel } = propsRef.current;
+        if (!selId) return;
+        const ent = curLevel.entities.find((item) => item.id === selId);
+        if (!ent) return;
+        const delta = e.shiftKey ? -90 : 90;
+        const nextRot = ((Math.round((ent.rotation ?? 0) / 90) * 90 + delta) + 360) % 360;
+        propsRef.current.onRotateEntity(selId, nextRot);
+      }
+    };
+
+    let dom = renderer.domElement;
+    dom.addEventListener('pointerdown', onPointerDown);
+    window.addEventListener('pointermove', onPointerMove);
+    window.addEventListener('pointerup', onPointerUp);
+    window.addEventListener('keydown', onKeyDown);
+
+    let lastResizeW = container.clientWidth || 640;
+    let lastResizeH = Math.max(1, container.clientHeight || 420);
+    const pendingResizeRef: { current: { w: number; h: number } | null } = { current: null };
+
+    const applyContainerResize = (w: number, h: number) => {
+      camera.aspect = w / h;
+      camera.updateProjectionMatrix();
+      renderer.setSize(w, h);
+      postPipeline?.setSize(w, h);
+    };
+
+    const onResize = () => {
+      if (!container || disposed) return;
+      const w = container.clientWidth || 640;
+      const h = Math.max(1, container.clientHeight || 420);
+      if (w === lastResizeW && h === lastResizeH) return;
+      lastResizeW = w;
+      lastResizeH = h;
+      if (postPipeline?.isPrecompiling()) {
+        pendingResizeRef.current = { w, h };
+        return;
+      }
+      applyContainerResize(w, h);
+    };
+    const ro = new ResizeObserver(onResize);
+    ro.observe(container);
+
+    let frameId = 0;
+    const timer = new THREE.Timer();
+    let disposed = false;
+    let compileChain: Promise<void> = Promise.resolve();
+    let perfFrames = 0;
+    let perfWindowStart = performance.now();
+    let lastCompactFps = -1;
+    let weatherSyncTimer = 0;
+    let lastAnimShadowTime = -1;
+
+    function afterDraw(cb: () => void) {
+      const gl =
+        typeof renderer.getContext === 'function'
+          ? (renderer.getContext() as Partial<WebGL2RenderingContext> | null)
+          : null;
+      if (!gl || typeof gl.fenceSync !== 'function') {
+        frameId = window.setTimeout(cb, 80);
+        return;
+      }
+      const sync = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE ?? 0x9117, 0);
+      gl.flush?.();
+      const poll = () => {
+        if (disposed) {
+          if (sync) gl.deleteSync?.(sync);
+          return;
+        }
+        const state = sync && gl.getSyncParameter?.(sync, gl.SYNC_STATUS ?? 0x9114);
+        if (state === (gl.UNSIGNALED ?? 0x9118)) {
+          frameId = window.setTimeout(poll, 5);
+        } else {
+          if (sync) gl.deleteSync?.(sync);
+          frameId = window.setTimeout(cb, 80);
+        }
+      };
+      frameId = window.setTimeout(poll, 5);
+    }
+
+    let loopScheduled = false;
+
+    function tick() {
+      loopScheduled = false;
+      if (disposed || propsRef.current.renderPaused) return;
+      try {
+        timer.update();
+        const dt = Math.min(0.1, timer.getDelta());
+        const t = timer.getElapsed();
+        const refs = sceneRefs.current;
+        const { level: curLevel, selectedEntityID: selId } = propsRef.current;
+
+      if (refs) {
+        updateSkyClouds(refs.scene, t, curLevel.wind);
+        if (refs.islandHandles) {
+          refs.islandHandles.timeUniform.value = t;
+          for (const th of refs.islandHandles.torchLights) {
+            th.light.intensity =
+              th.baseIntensity +
+              Math.sin(t * 7.2 + th.phase) * 1.1 +
+              Math.cos(t * 13.1 + th.phase * 1.7) * 0.5;
+          }
+          for (const fm of refs.islandHandles.flameMeshes) {
+            fm.mesh.position.y = fm.baseY + Math.sin(t * 8.5 + fm.phase) * 0.04;
+            const s = 1 + Math.sin(t * 10 + fm.phase) * 0.12;
+            fm.mesh.scale.set(s, 1 + Math.cos(t * 9 + fm.phase) * 0.16, s);
+          }
+        }
+
+        const liveWindFactor = computeWeatherWindFactor(curLevel.weather, curLevel.wind);
+        refs.canopyTimeUniform.value = t;
+        refs.canopyWindUniform.value = liveWindFactor;
+        if (refs.islandHandles) {
+          refs.islandHandles.windUniform.value = liveWindFactor;
+        }
+        for (const updateCustom of refs.customUpdaters) {
+          updateCustom(dt);
+        }
+
+        // Update live FX Emitters (auto-pauses when entering Play Mode)
+        const isFxPaused = propsRef.current.fxPaused;
+        refs.fxEmitters.forEach((fx) => {
+          fx.setPaused(isFxPaused);
+          fx.update(dt, refs.camera);
+        });
+
+        // Animate moving platforms cleanly without traversing entities every frame
+        if (refs.hasDynamicShadows || refs.customUpdaters.length > 0) {
+          refs.entityGroups.forEach((grp, id) => {
+            const ent = curLevel.entities.find((item) => item.id === id);
+            if (ent && ent.kind === 'platform' && ent.platformRunning) {
+              const [sx, sz] = levelBoardToWorld(curLevel, ent.position);
+              const sy = sampleLevelHeight(curLevel, sx, sz) + PlatformMotion.hover(ent.platformPreset);
+              const endBp = ent.platformEnd ?? ent.position;
+              const [ex, ez] = levelBoardToWorld(curLevel, endBp);
+              const ey = sampleLevelHeight(curLevel, ex, ez) + PlatformMotion.hover(ent.platformPreset);
+              const pose = PlatformMotion.pose(
+                t,
+                [sx, sy, sz],
+                [ex, ey, ez],
+                ent.platformSpeed,
+                ent.platformWait,
+                ent.platformMotion === 'spin'
+              );
+              grp.position.set(pose.position[0], pose.position[1], pose.position[2]);
+              if (ent.platformMotion === 'spin') {
+                grp.rotation.y = pose.yaw;
+              }
+            }
+          });
+          if (t - lastAnimShadowTime >= 0.08) {
+            lastAnimShadowTime = t;
+            refs.markShadowDirty();
+          }
+        }
+        for (let fi = 0; fi < refs.floatSpinObjects.length; fi++) {
+          refs.floatSpinObjects[fi].rotation.y += dt * 1.4;
+        }
+        for (let ti = 0; ti < refs.torchFlameObjects.length; ti++) {
+          const tf = refs.torchFlameObjects[ti];
+          tf.mesh.position.y = tf.baseY + Math.sin(t * 9.2 + tf.phase) * 0.025;
+          const sc = 1 + Math.sin(t * 11 + tf.phase) * 0.14;
+          tf.mesh.scale.set(sc, 1 + Math.cos(t * 10 + tf.phase) * 0.18, sc);
+        }
+
+        // Show subtle build grid when Grid Snap is active & adding/building/moving blocks
+        const snap = propsRef.current.gridSnap ?? 0;
+        const showGrid =
+          snap > 0 &&
+          (propsRef.current.tool === 'add' || Boolean(propsRef.current.isPlacingBuildingBlock));
+        refs.buildGridHelper.visible = showGrid;
+        if (showGrid) {
+          refs.buildGridHelper.position.y = sampleLevelHeight(curLevel, 0, 0) + 0.04;
+        }
+
+        // Selection ring placement
+        if (selId && refs.entityGroups.has(selId)) {
+          const target = refs.entityGroups.get(selId)!;
+          refs.selectionRing.visible = true;
+          refs.selectionRing.position.set(
+            target.position.x,
+            target.position.y + 0.08,
+            target.position.z
+          );
+          const pulse = 1 + Math.sin(t * 3.5) * 0.06;
+          refs.selectionRing.scale.setScalar(pulse);
+        } else {
+          refs.selectionRing.visible = false;
+        }
+
+        if (refs.dropPreviewGroup.visible) {
+          const dropPulse = 1 + Math.sin(t * 7.0) * 0.09;
+          refs.dropPreviewGroup.scale.set(dropPulse, 1, dropPulse);
+          refs.dropPreviewGroup.rotation.y += dt * 1.6;
+        }
+
+        // Weather particle animation (throttled ~30Hz GPU buffer upload)
+        if (refs.weatherPoints) {
+          weatherSyncTimer += dt;
+          if (weatherSyncTimer >= 0.032) {
+            const wDt = Math.min(0.1, weatherSyncTimer);
+            weatherSyncTimer = 0;
+            const posAttr = refs.weatherPoints.geometry.getAttribute('position') as THREE.BufferAttribute;
+            const kind = refs.weatherPoints.userData.weather;
+            for (let i = 0; i < posAttr.count; i++) {
+              let px = posAttr.getX(i);
+              let py = posAttr.getY(i);
+              let pz = posAttr.getZ(i);
+              if (kind === 'fireflies') {
+                px += Math.sin(t * 0.9 + i * 1.3) * wDt * 0.7;
+                py += Math.cos(t * 1.4 + i * 0.7) * wDt * 0.45;
+                pz += Math.cos(t * 0.8 + i * 1.1) * wDt * 0.7;
+                if (py < 0.4) py = 0.6;
+                if (py > 8.5) py = 7.2;
+              } else if (kind === 'leaves') {
+                py -= wDt * 2.1;
+                px += Math.sin(t * 1.5 + i) * wDt * 1.3;
+                pz += Math.cos(t * 1.2 + i * 0.5) * wDt * 0.7;
+                if (py < -1) {
+                  py = 26;
+                  px = (Math.random() - 0.5) * 260;
+                  pz = (Math.random() - 0.5) * 260;
+                }
+              } else {
+                const isRain = kind === 'rain';
+                py -= wDt * (isRain ? 18 : 3.2);
+                px += isRain ? 0 : Math.sin(t + i) * wDt * 0.6;
+                if (py < -2) {
+                  py = 26;
+                  px = (Math.random() - 0.5) * 260;
+                  pz = (Math.random() - 0.5) * 260;
+                }
+              }
+              posAttr.setXYZ(i, px, py, pz);
+            }
+            posAttr.needsUpdate = true;
+          }
+        }
+      }
+
+        controls.update();
+        if (refs?.islandHandles?.grassSystem) {
+          refs.islandHandles.grassSystem.update(
+            refs.camera,
+            refs.sun,
+            refs.hemi,
+            refs.scene,
+            t,
+            refs.islandHandles.windUniform.value
+          );
+        }
+        try {
+          if (postPipeline) {
+            postPipeline.render({
+              config: propsRef.current.project.postProcessing,
+              sunPosition: sun.position,
+              sunColor: sun.color,
+              sunIntensity: sun.intensity,
+              isDungeon: getEnvironmentType(curLevel) === 'dungeon',
+              dt,
+              elapsedTime: t,
+            });
+          } else {
+            renderer.render(scene, camera);
+          }
+        } catch (renderErr) {
+          console.error('WorldViewport post-pipeline error; falling back to direct render:', renderErr);
+          renderer.render(scene, camera);
+        }
+        perfFrames++;
+        const nowMs = performance.now();
+        const elapsedMs = nowMs - perfWindowStart;
+        const perfUpdateIntervalMs = showPerfHudRef.current ? 350 : 900;
+        if (elapsedMs >= perfUpdateIntervalMs) {
+          const fps = Math.round((perfFrames * 1000) / Math.max(1, elapsedMs));
+          if (showPerfHudRef.current || lastCompactFps < 0 || Math.abs(fps - lastCompactFps) >= 2) {
+            lastCompactFps = fps;
+            const frameMs = Number((elapsedMs / Math.max(1, perfFrames)).toFixed(1));
+            const renderInfo = renderer.info?.render as { calls?: number; triangles?: number } | undefined;
+            const backendObj = renderer.backend as { isWebGPUBackend?: boolean } | undefined;
+            const heap = showPerfHudRef.current ? readJsHeapUsageMB() : undefined;
+            const snapshot = {
+              fps,
+              frameMs,
+              calls: renderInfo?.calls ?? 0,
+              triangles: renderInfo?.triangles ?? 0,
+              backend: backendObj?.isWebGPUBackend ? 'WebGPU' : 'WebGL2',
+              heapMB: heap?.usedMB,
+              heapLimitMB: heap?.limitMB,
+            };
+            latestPerfSnapshotRef.current = snapshot;
+            if (showPerfHudRef.current) {
+              setPerfStats(snapshot);
+            } else {
+              if (compactFpsDotRef.current) {
+                compactFpsDotRef.current.className = `w-2 h-2 rounded-full ${
+                  fps >= 50 ? 'bg-emerald-400' : fps >= 30 ? 'bg-amber-300' : 'bg-rose-400'
+                }`;
+              }
+              if (compactFpsTextRef.current) {
+                compactFpsTextRef.current.textContent = fps > 0 ? `${fps} FPS` : '-- FPS';
+              }
+              if (compactMsTextRef.current) {
+                compactMsTextRef.current.textContent = `${frameMs.toFixed(0)}ms`;
+              }
+            }
+          }
+          perfFrames = 0;
+          perfWindowStart = nowMs;
+        }
+      } catch (tickErr) {
+        console.error('WorldViewport tick error:', tickErr);
+      } finally {
+        if (!disposed && !propsRef.current.renderPaused) {
+          loopScheduled = true;
+          if (isSoftwareGl) {
+            afterDraw(tick);
+          } else {
+            frameId = requestAnimationFrame(tick);
+          }
+        }
+      }
+    }
+
+    const scheduleTick = () => {
+      if (disposed || propsRef.current.renderPaused || loopScheduled) return;
+      loopScheduled = true;
+      frameId = requestAnimationFrame(tick);
+    };
+
+    const switchToWebGLFallback = async (): Promise<boolean> => {
+      if (disposed) return false;
+      cancelAnimationFrame(frameId);
+      clearTimeout(frameId);
+      loopScheduled = false;
+      dom.removeEventListener('pointerdown', onPointerDown);
+      controls.removeEventListener('change', saveCurrentCameraPose);
+      controls.dispose();
+      postPipeline?.dispose();
+      postPipeline = null;
+      envTex?.dispose();
+      envTex = null;
+      try {
+        renderer.dispose();
+      } catch {
+        // ignore dispose errors on failed adapter
+      }
+      renderer = createMakerRenderer(isSoftwareGl, true);
+      renderer.setSize(container.clientWidth || 640, container.clientHeight || 420);
+      container.innerHTML = '';
+      container.appendChild(renderer.domElement);
+      dom = renderer.domElement;
+      dom.addEventListener('pointerdown', onPointerDown);
+      controls = new OrbitControls(camera, dom);
+      controls.target.set(0, 1.2, 0);
+      controls.enableDamping = !isSoftwareGl;
+      controls.dampingFactor = 0.08;
+      controls.minDistance = 8;
+      controls.maxDistance = 360;
+      controls.maxPolarAngle = Math.PI * 0.47;
+      controls.update();
+      controls.addEventListener('change', saveCurrentCameraPose);
+      if (sceneRefs.current) {
+        sceneRefs.current.renderer = renderer;
+        sceneRefs.current.controls = controls;
+      }
+      try {
+        await renderer.init();
+        if (disposed) return false;
+        envTex = setupSceneEnvironment(scene, renderer);
+        postPipeline = new PostProcessingPipeline(
+          renderer,
+          scene,
+          camera,
+          container.clientWidth || 640,
+          container.clientHeight || 420,
+          isSoftwareGl
+        );
+        if (sceneRefs.current) {
+          sceneRefs.current.postPipeline = postPipeline;
+        }
+        applyLiveRendererQuality(
+          renderer,
+          sun,
+          postPipeline,
+          container.clientWidth || 640,
+          container.clientHeight || 420,
+          isSoftwareGl,
+          propsRef.current.resolutionScale,
+          propsRef.current.shadowQuality
+        );
+        if (sceneRefs.current) {
+          sceneRefs.current.rendererInitialized = true;
+          sceneRefs.current.markShadowDirty();
+        }
+        return true;
+      } catch (fallbackErr) {
+        console.error('WebGL fallback renderer init failed:', fallbackErr);
+        return false;
+      }
+    };
+
+    void (async () => {
+      let initOk = false;
+      try {
+        await renderer.init();
+        if (!isSoftwareGl && isWebGPUFallbackAdapter(renderer)) {
+          console.warn('WorldViewport WebGPU returned a software fallback adapter; switching to hardware WebGL2.');
+          initOk = await switchToWebGLFallback();
+        } else {
+          initOk = true;
+        }
+      } catch (err) {
+        console.warn('WebGPU renderer init failed; falling back to WebGL backend:', err);
+        initOk = await switchToWebGLFallback();
+      }
+      if (disposed || !initOk) return;
+      // Yield one frame after device init so PMREM & PostProcessing don't stack onto mount long tasks
+      await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+      if (disposed) return;
+      const backend = renderer.backend as {
+        isWebGPUBackend?: boolean;
+        device?: GPUDevice;
+      } | undefined;
+      if (backend?.isWebGPUBackend === true) {
+        if (!isSoftwareGl) {
+          const initLevel = propsRef.current.level;
+          const initPointLights = initLevel.entities.filter((e) => e.kind === 'light').length;
+          if (getEnvironmentType(initLevel) === 'dungeon' || initPointLights >= 6) {
+            renderer.lighting = new ClusteredLighting(128, 64, 16, 16);
+          }
+          if (initLevel.entities.some((e) => e.meshletEnabled)) {
+            renderer.drawingPipeline = createOptInMeshletPipeline(renderer);
+          }
+        }
+        if (backend.device?.lost) {
+          void backend.device.lost.then((info) => {
+            if (disposed || info.reason === 'destroyed') return;
+            console.warn('WorldViewport WebGPU device lost; recovering with WebGL2 fallback:', info.message);
+            void switchToWebGLFallback().then((ok) => {
+              if (ok && !disposed) scheduleTick();
+            });
+          });
+        }
+      }
+      if (!envTex) {
+        envTex = setupSceneEnvironment(scene, renderer);
+      }
+      if (!postPipeline) {
+        postPipeline = new PostProcessingPipeline(
+          renderer,
+          scene,
+          camera,
+          container.clientWidth || 640,
+          container.clientHeight || 420,
+          isSoftwareGl
+        );
+        if (sceneRefs.current) {
+          sceneRefs.current.postPipeline = postPipeline;
+        }
+        applyLiveRendererQuality(
+          renderer,
+          sun,
+          postPipeline,
+          container.clientWidth || 640,
+          container.clientHeight || 420,
+          isSoftwareGl,
+          propsRef.current.resolutionScale,
+          propsRef.current.shadowQuality
+        );
+        if (sceneRefs.current) {
+          sceneRefs.current.rendererInitialized = true;
+          sceneRefs.current.markShadowDirty();
+        }
+        try {
+          await postPipeline.precompileAsync(propsRef.current.project.postProcessing);
+        } catch {
+          // ignore precompile errors on fallback adapters
+        }
+        if (disposed) return;
+        const nextResize = pendingResizeRef.current;
+        if (nextResize) {
+          pendingResizeRef.current = null;
+          applyContainerResize(nextResize.w, nextResize.h);
+        }
+      }
+      resumeLoopRef.current = scheduleTick;
+      if (!propsRef.current.renderPaused) {
+        tick();
+      }
+    })();
+
+    return () => {
+      disposed = true;
+      islandBuildAbortRef.current?.abort();
+      islandBuildAbortRef.current = null;
+      entityBuildAbortRef.current?.abort();
+      entityBuildAbortRef.current = null;
+      resumeLoopRef.current = null;
+      cancelAnimationFrame(frameId);
+      clearTimeout(frameId);
+      saveCurrentCameraPose();
+      ro.disconnect();
+      dom.removeEventListener('pointerdown', onPointerDown);
+      window.removeEventListener('pointermove', onPointerMove);
+      window.removeEventListener('pointerup', onPointerUp);
+      window.removeEventListener('keydown', onKeyDown);
+      controls.removeEventListener('change', saveCurrentCameraPose);
+      controls.dispose();
+      timer.dispose();
+      if (sceneRefs.current) {
+        sceneRefs.current.rendererInitialized = false;
+        sceneRefs.current.islandHandles?.grassSystem?.dispose();
+        sceneRefs.current.fxEmitters.forEach((fx) => fx.dispose());
+        sceneRefs.current.fxEmitters.clear();
+        sceneRefs.current = null;
+      }
+      postPipeline?.dispose();
+      envTex?.dispose();
+      disposeObject3D(scene);
+      scene.background = null;
+      scene.environment = null;
+      scene.fog = null;
+      scene.clear();
+      try {
+        renderer.dispose();
+      } catch {
+        // ignore if device already lost
+      }
+    };
+  }, []);
+
+  // Resume render loop immediately when modal overlays close
+  useEffect(() => {
+    if (!renderPaused) {
+      resumeLoopRef.current?.();
+    }
+  }, [renderPaused]);
+
+  // Register live 3D camera capture & preview bridge for Story Director
+  useEffect(() => {
+    registerDirectorViewportBridge({
+      captureCurrentShot: (nameHint?: string) => {
+        const refs = sceneRefs.current;
+        const curLevel = propsRef.current.level;
+        if (!refs || !curLevel) return null;
+        const t = refs.controls.target;
+        const c = refs.camera.position;
+        const bp = levelWorldToBoard(curLevel, t.x, t.z);
+        const groundY = sampleLevelHeight(curLevel, t.x, t.z);
+        const dx = c.x - t.x;
+        const dy = c.y - t.y;
+        const dz = c.z - t.z;
+        const horiz = Math.hypot(dx, dz);
+        const distance = THREE.MathUtils.clamp(Math.hypot(dx, dy, dz), 3, 28);
+        const yaw = Number(((Math.atan2(dx, dz) * 180) / Math.PI).toFixed(1));
+        const pitch = Number(
+          THREE.MathUtils.clamp((Math.atan2(dy, Math.max(0.01, horiz)) * 180) / Math.PI, 5, 70).toFixed(1)
+        );
+        const heightOffset = Number(THREE.MathUtils.clamp(t.y - groundY, 0, 6).toFixed(2));
+        return {
+          id: `shot_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`,
+          name: nameHint?.trim() || 'Captured Shot',
+          targetMode: 'point',
+          point: bp,
+          yaw,
+          pitch,
+          distance: Number(distance.toFixed(1)),
+          heightOffset,
+          fov: Math.round(refs.camera.fov || 48),
+        };
+      },
+      previewShot: (shot: StoryCameraShot, targetLevel: GameLevel) => {
+        const refs = sceneRefs.current;
+        if (!refs) return;
+        const ent =
+          shot.targetMode === 'entity' && shot.targetEntityId
+            ? targetLevel.entities.find((e) => e.id === shot.targetEntityId)
+            : undefined;
+        const pt = ent?.position ?? shot.point ?? { x: 0.5, y: 0.5 };
+        const [tx, tz] = levelBoardToWorld(targetLevel, pt);
+        const groundY = sampleLevelHeight(targetLevel, tx, tz);
+        const lookY = groundY + (shot.heightOffset ?? 1.2);
+        const yawRad = ((shot.yaw ?? 25) * Math.PI) / 180;
+        const pitchRad = (THREE.MathUtils.clamp(shot.pitch ?? 18, 5, 70) * Math.PI) / 180;
+        const dist = THREE.MathUtils.clamp(shot.distance ?? 7.5, 3, 28);
+        const cosP = Math.cos(pitchRad);
+
+        refs.controls.target.set(tx, lookY, tz);
+        refs.camera.position.set(
+          tx + Math.sin(yawRad) * cosP * dist,
+          lookY + Math.sin(pitchRad) * dist,
+          tz + Math.cos(yawRad) * cosP * dist
+        );
+        if (shot.fov && Math.abs(refs.camera.fov - shot.fov) > 0.25) {
+          refs.camera.fov = THREE.MathUtils.clamp(shot.fov, 32, 68);
+          refs.camera.updateProjectionMatrix();
+        }
+        refs.controls.update();
+      },
+    });
+    return () => {
+      registerDirectorViewportBridge(null);
+    };
+  }, []);
+
+  // Dynamically update pixel ratio scaling & shadow map quality without reloading scene
+  useEffect(() => {
+    const refs = sceneRefs.current;
+    const container = mountRef.current;
+    if (!refs || !container || !refs.rendererInitialized || refs.postPipeline?.isPrecompiling()) {
+      return;
+    }
+    applyLiveRendererQuality(
+      refs.renderer,
+      refs.sun,
+      refs.postPipeline,
+      container.clientWidth || 640,
+      container.clientHeight || 420,
+      refs.isSoftwareGl,
+      resolutionScale,
+      shadowQuality
+    );
+  }, [resolutionScale, shadowQuality]);
+
+  // Rebuild island & atmosphere when terrain, environment, biome, visualStyle, sky, timeOfDay, weather change
+  // Lightweight real-time atmosphere, skybox, clouds & lighting update (no terrain/tree rebuild!)
+  useEffect(() => {
+    const refs = sceneRefs.current;
+    if (!refs) return;
+    applyAtmosphere(refs.scene, refs.sun, refs.hemi, level, refs.renderer);
+    refs.markShadowDirty();
+  }, [
+    level.id,
+    level.environmentType,
+    level.visualStyle,
+    level.sky,
+    level.fog,
+    level.sunAngle,
+    level.timeOfDay,
+    level.cloudDensity,
+    level.sunIntensityScale,
+    level.ambientIntensityScale,
+    level.atmosphereWarmth,
+    level.starIntensity,
+  ]);
+
+  // Lightweight weather particle rebuild
+  useEffect(() => {
+    const refs = sceneRefs.current;
+    if (!refs) return;
+    if (refs.weatherPoints) {
+      refs.scene.remove(refs.weatherPoints);
+      disposeObject3D(refs.weatherPoints);
+      refs.weatherPoints = null;
+    }
+    const wp = buildWeatherParticles(level.weather);
+    if (wp) {
+      refs.weatherPoints = wp;
+      refs.scene.add(wp);
+    }
+  }, [level.weather, level.id]);
+
+  // Rebuild island mesh OR perform fast in-place GPU sculpt update during live brush strokes
+  useEffect(() => {
+    const refs = sceneRefs.current;
+    if (!refs) return;
+
+    const env = getEnvironmentType(level);
+    const frameKey = `${project.id}:${level.id}:${env}`;
+    if (refs.lastFramedEnvKey !== frameKey) {
+      refs.lastFramedEnvKey = frameKey;
+      const savedPose = savedCameraPoseMap.get(frameKey);
+      if (savedPose) {
+        refs.camera.position.set(savedPose.pos[0], savedPose.pos[1], savedPose.pos[2]);
+        refs.controls.target.set(savedPose.target[0], savedPose.target[1], savedPose.target[2]);
+      } else if (env === 'sideScroller') {
+        refs.camera.position.set(0, 8, 30);
+        refs.controls.target.set(0, 1.5, 0);
+      } else if (env === 'dungeon' || env === 'castle') {
+        refs.camera.position.set(0, 32, 46);
+        refs.controls.target.set(0, 1.2, 0);
+      } else {
+        refs.camera.position.set(68, 52, 88);
+        refs.controls.target.set(0, 1.2, 0);
+      }
+      refs.controls.update();
+    }
+
+    const scatterCount = level.terrain?.scatter?.length ?? 0;
+    const cavesCount = level.terrain?.caves?.length ?? 0;
+    const structKey = JSON.stringify([
+      level.id,
+      env,
+      level.biome,
+      level.visualStyle ?? 'painterlyPBR',
+      level.vistaPreset ?? '',
+      level.vistaDensity ?? 0.85,
+      level.vistaItems?.length ?? 0,
+      level.canopyEngine,
+      level.sceneryTextures,
+      level.grass,
+      level.customWallBoxes ?? null,
+      level.roguelikeTorchAnchors ?? null,
+      level.dungeonStyle ?? level.roguelikeConfig?.dungeonStyle ?? null,
+      scatterCount,
+      cavesCount,
+      customAssets.length,
+      texInvalidationTick,
+      sculptFinalizeNonce,
+    ]);
+
+    // Fast 60fps in-place GPU vertex/splat/normal update while actively sculpting or painting
+    if (
+      env === 'openWorld' &&
+      refs.islandHandles?.terrainMesh &&
+      lastIslandStructKeyRef.current === structKey &&
+      lastSculptAreaRef.current !== null &&
+      level.terrain
+    ) {
+      const updated = updateIslandTerrainGeometryInPlace(
+        refs.islandHandles,
+        level.terrain,
+        lastSculptAreaRef.current
+      );
+      if (updated) {
+        refs.markShadowDirty();
+        return;
+      }
+    }
+
+    lastIslandStructKeyRef.current = structKey;
+
+    islandBuildAbortRef.current?.abort();
+    const abortController = new AbortController();
+    islandBuildAbortRef.current = abortController;
+
+    refs.islandHandles?.grassSystem?.dispose();
+    disposeObject3D(refs.islandContainer);
+    refs.islandContainer.clear();
+    const handles = buildIslandMesh(level, customAssets, refs.isSoftwareGl, {
+      deferFoliage: true,
+      deferFoliageSignal: abortController.signal,
+      onDeferredBatchReady: async (obj) => {
+        if (abortController.signal.aborted) return;
+        await refs.precompileObject(obj);
+        if (!abortController.signal.aborted) {
+          refs.markShadowDirty();
+        }
+      },
+    });
+    refs.islandHandles = handles;
+    refs.islandContainer.add(handles.group);
+    void refs.precompileObject(handles.group);
+    refs.markShadowDirty();
+
+    const groundMeshes: THREE.Object3D[] = [];
+    handles.group.traverse((o) => {
+      if (o.userData?.isGround) groundMeshes.push(o);
+    });
+    refs.groundMeshes = groundMeshes;
+  }, [
+    level.environmentType,
+    level.biome,
+    level.visualStyle,
+    level.vistaPreset,
+    level.vistaDensity,
+    level.vistaItems,
+    level.canopyEngine,
+    level.sceneryTextures,
+    level.grass,
+    level.customWallBoxes,
+    level.roguelikeTorchAnchors,
+    level.dungeonStyle,
+    level.roguelikeConfig?.dungeonStyle,
+    level.terrain?.revision,
+    level.id,
+    customAssets,
+    texInvalidationTick,
+    sculptFinalizeNonce,
+  ]);
+
+  // Rebuild entity meshes & hero start marker (fast Y-reposition only during live terrain sculpting)
+  useEffect(() => {
+    const refs = sceneRefs.current;
+    if (!refs) return;
+
+    const backendObj = refs.renderer.backend as { isWebGPUBackend?: boolean } | undefined;
+    if (
+      backendObj?.isWebGPUBackend === true &&
+      !refs.isSoftwareGl &&
+      !refs.renderer.drawingPipeline &&
+      level.entities.some((e) => e.meshletEnabled)
+    ) {
+      refs.renderer.drawingPipeline = createOptInMeshletPipeline(refs.renderer);
+    }
+
+    const env = getEnvironmentType(level);
+    const startBp =
+      playerPin ??
+      level.startPoint ??
+      (env === 'sideScroller' ? { x: 0.1, y: 0.5 } : { x: 0.14, y: 0.8 });
+    const portalBp = level.portalPoint ?? (env === 'sideScroller' ? { x: 0.92, y: 0.5 } : { x: 0.88, y: 0.24 });
+
+    const entityStructKey = JSON.stringify([
+      level.id,
+      env,
+      level.gameplayMode ?? 'adventure',
+      level.drivingConfig ?? null,
+      startBp,
+      Boolean(playerPin),
+      portalBp,
+      level.hasStart,
+      level.hasPortal,
+      level.visualStyle ?? 'painterlyPBR',
+      level.sceneryTextures,
+      stripLiveVariantFieldsForStructKey(level.entities),
+      project.heroBody,
+      project.heroColors,
+      project.heroCustomAssetId,
+      project.heroModelScale,
+      project.heroModelOffsetY,
+      customAssets.length,
+      texInvalidationTick,
+    ]);
+
+    // Fast Y-only re-grounding & zero-stutter NodeMaterialInstance uniform updates
+    if (lastEntityStructKeyRef.current === entityStructKey && refs.entityGroups.size === level.entities.length) {
+      if (level.hasStart && refs.heroGroup) {
+        const [hx, hz] = levelBoardToWorld(level, startBp);
+        refs.heroGroup.position.set(hx, sampleLevelHeight(level, hx, hz), hz);
+      }
+      if (level.hasPortal && refs.portalGroup) {
+        const [px, pz] = levelBoardToWorld(level, portalBp);
+        refs.portalGroup.position.set(px, sampleLevelHeight(level, px, pz), pz);
+      }
+      for (const ent of level.entities) {
+        const grp = refs.entityGroups.get(ent.id);
+        if (!grp) continue;
+        const [wx, wz] = levelBoardToWorld(level, ent.position);
+        const wy = sampleLevelHeight(level, wx, wz);
+        const extraY = ent.kind === 'platform' ? PlatformMotion.hover(ent.platformPreset) : 0;
+        grp.position.set(wx, wy + extraY + (ent.elevationY ?? 0), wz);
+
+        if (ent.kind !== 'fxEmitter' && ent.kind !== 'light') {
+          const isMatte =
+            ent.kind === 'platform' ||
+            ent.kind === 'checkpoint' ||
+            ent.kind === 'door' ||
+            ent.kind === 'puzzle' ||
+            ent.kind === 'spawner';
+          updateEntityMaterialVariantInPlace(grp, ent.materialVariant, isMatte);
+          if (Boolean(grp.userData.meshletEnabled) !== Boolean(ent.meshletEnabled)) {
+            prepareObjectForMeshletCulling(grp, Boolean(ent.meshletEnabled));
+          }
+        }
+      }
+      refs.hasDynamicShadows = level.entities.some(
+        (ent) => ent.kind === 'platform' && Boolean(ent.platformRunning)
+      );
+      refs.markShadowDirty();
+      return;
+    }
+
+    lastEntityStructKeyRef.current = entityStructKey;
+
+    entityBuildAbortRef.current?.abort();
+    const entityAbort = new AbortController();
+    entityBuildAbortRef.current = entityAbort;
+    const signal = entityAbort.signal;
+
+    disposeObject3D(refs.entitiesContainer);
+    refs.entitiesContainer.clear();
+    refs.entityGroups.clear();
+    refs.floatSpinObjects = [];
+    refs.torchFlameObjects = [];
+    refs.customUpdaters = [];
+    refs.hasDynamicShadows = level.entities.some(
+      (ent) => ent.kind === 'platform' && Boolean(ent.platformRunning)
+    );
+    refs.heroGroup = null;
+    refs.portalGroup = null;
+
+    const style = level.visualStyle ?? 'painterlyPBR';
+
+    // Hero start marker
+    if (level.hasStart) {
+      const [hx, hz] = levelBoardToWorld(level, startBp);
+      const hy = sampleLevelHeight(level, hx, hz);
+      const heroAnchor = new THREE.Group();
+      heroAnchor.position.set(hx, hy, hz);
+      heroAnchor.rotation.y = env === 'sideScroller' ? Math.PI * 0.5 : Math.PI * 0.75;
+      refs.entitiesContainer.add(heroAnchor);
+      refs.heroGroup = heroAnchor;
+
+      if (level.gameplayMode === 'driving') {
+        const carRig = buildCarModel(
+          level.drivingConfig?.carId ?? 'trailBuggy',
+          level.drivingConfig?.driverId ?? 'stunt'
+        );
+        applyVisualStyleToObject(carRig.group, style);
+        heroAnchor.add(carRig.group);
+      } else if (project.heroCustomAssetId) {
+        const heroAssetId = project.heroCustomAssetId;
+        const cached = getCachedAssetSync(heroAssetId);
+        if (cached) {
+          const meta = customAssets.find((a) => a.id === heroAssetId);
+          const inst = instantiateCustomModel(heroAssetId, meta, {
+            scaleAdjust: project.heroModelScale ?? 1,
+            offsetY: project.heroModelOffsetY ?? 0,
+            visualStyle: style,
+          });
+          if (inst) {
+            heroAnchor.add(inst.group);
+            refs.customUpdaters.push((stepDt) => inst.update(stepDt));
+          } else {
+            const heroRig = buildHeroModel(project.heroBody, project.heroColors);
+            applyVisualStyleToObject(heroRig.group, style);
+            heroAnchor.add(heroRig.group);
+          }
+        } else {
+          const heroRig = buildHeroModel(project.heroBody, project.heroColors);
+          applyVisualStyleToObject(heroRig.group, style);
+          heroAnchor.add(heroRig.group);
+          void loadCustomAssetToCache(heroAssetId, 'character').then((loaded) => {
+            if (signal.aborted || !loaded) return;
+            const meta = customAssets.find((a) => a.id === heroAssetId);
+            const inst = instantiateCustomModel(heroAssetId, meta, {
+              scaleAdjust: project.heroModelScale ?? 1,
+              offsetY: project.heroModelOffsetY ?? 0,
+              visualStyle: style,
+            });
+            if (!inst || signal.aborted) {
+              if (inst) disposeObject3D(inst.group);
+              return;
+            }
+            disposeObject3D(heroAnchor);
+            heroAnchor.clear();
+            heroAnchor.add(inst.group);
+            refs.customUpdaters.push((stepDt) => inst.update(stepDt));
+            void refs.precompileObject(heroAnchor);
+          });
+        }
+      } else {
+        const heroRig = buildHeroModel(project.heroBody, project.heroColors);
+        applyVisualStyleToObject(heroRig.group, style);
+        heroAnchor.add(heroRig.group);
+      }
+    }
+
+    // Portal marker
+    if (level.hasPortal) {
+      const portal = buildPortalMarker();
+      const [px, pz] = levelBoardToWorld(level, portalBp);
+      const py = sampleLevelHeight(level, px, pz);
+      portal.position.set(px, py, pz);
+      portal.rotation.y = -Math.PI * 0.25;
+      refs.entitiesContainer.add(portal);
+      refs.portalGroup = portal;
+    }
+
+    // Track live fxEmitter IDs to keep persistent FxEmitterRuntime pools smooth while editing sliders
+    const activeFxIds = new Set<string>();
+    const deferredCanopyEntities: Array<{ ent: LevelEntity; anchor: THREE.Group }> = [];
+    const deferredCustomEntities: Array<{ ent: LevelEntity; anchor: THREE.Group; isCached: boolean }> = [];
+    let wallTorchAddedLight = 0;
+
+    for (const ent of level.entities) {
+      if (ent.kind === 'fxEmitter') {
+        activeFxIds.add(ent.id);
+        const cfg = ent.fxEmitter ?? createDefaultFxEmitterConfig('fire');
+        let fx = refs.fxEmitters.get(ent.id);
+        if (!fx) {
+          fx = new FxEmitterRuntime(cfg, ent.id, true);
+          refs.fxEmitters.set(ent.id, fx);
+          refs.fxContainer.add(fx.group);
+        } else {
+          fx.updateConfig(cfg);
+        }
+        const [wx, wz] = levelBoardToWorld(level, ent.position);
+        const wy = sampleLevelHeight(level, wx, wz);
+        fx.group.position.set(wx, wy + (ent.elevationY ?? 0), wz);
+        fx.group.rotation.y = (ent.rotation * Math.PI) / 180;
+        fx.group.scale.setScalar(ent.scale);
+        refs.entityGroups.set(ent.id, fx.group);
+        continue;
+      }
+
+      const [wx, wz] = levelBoardToWorld(level, ent.position);
+      const wy = sampleLevelHeight(level, wx, wz);
+      const extraY = ent.kind === 'platform' ? PlatformMotion.hover(ent.platformPreset) : 0;
+
+      if (ent.canopyTree) {
+        const anchor = new THREE.Group();
+        anchor.userData.entityId = ent.id;
+        anchor.position.set(wx, wy + extraY + (ent.elevationY ?? 0), wz);
+        anchor.rotation.y = (ent.rotation * Math.PI) / 180;
+        anchor.scale.setScalar(ent.scale);
+        refs.entitiesContainer.add(anchor);
+        refs.entityGroups.set(ent.id, anchor);
+        deferredCanopyEntities.push({ ent, anchor });
+        continue;
+      }
+
+      if (ent.customAssetId) {
+        const anchor = new THREE.Group();
+        anchor.userData.entityId = ent.id;
+        anchor.position.set(wx, wy + extraY + (ent.elevationY ?? 0), wz);
+        const isCached = Boolean(getCachedAssetSync(ent.customAssetId));
+        if (!isCached) {
+          const fallbackMesh = buildEntityMesh(ent);
+          applyVisualStyleToObject(fallbackMesh, style);
+          fallbackMesh.userData.entityId = ent.id;
+          anchor.add(fallbackMesh);
+        }
+        refs.entitiesContainer.add(anchor);
+        refs.entityGroups.set(ent.id, anchor);
+        deferredCustomEntities.push({ ent, anchor, isCached });
+        continue;
+      }
+
+      const mesh = buildEntityMesh(ent);
+      applyVisualStyleToObject(mesh, style);
+
+      if (ent.vertexPaintStrokes && ent.vertexPaintStrokes.length > 0) {
+        applyVertexPaintStrokesToObject(mesh, ent.vertexPaintStrokes);
+      }
+
+      if (ent.kind !== 'light') {
+        const isMatte =
+          ent.kind === 'platform' ||
+          ent.kind === 'checkpoint' ||
+          ent.kind === 'door' ||
+          ent.kind === 'puzzle' ||
+          ent.kind === 'spawner';
+        applyEntityMaterialVariant(mesh, ent.materialVariant, isMatte);
+        if (ent.meshletEnabled) {
+          prepareObjectForMeshletCulling(mesh, true);
+        }
+      }
+
+      mesh.position.set(wx, wy + extraY + (ent.elevationY ?? 0), wz);
+      mesh.traverse((child) => {
+        if (child.userData?.floatSpin) {
+          refs.floatSpinObjects.push(child);
+        }
+        if (child.userData?.torchFlame) {
+          refs.torchFlameObjects.push({
+            mesh: child,
+            baseY: Number(child.userData.baseY ?? child.position.y),
+            phase: wx * 0.43 + wz * 0.61,
+          });
+        }
+      });
+      if (ent.buildingBlock?.shape === 'wallTorch' && wallTorchAddedLight < 8) {
+        wallTorchAddedLight++;
+        const pt = new THREE.PointLight('#FF9C40', 4.5, 11, 1.8);
+        pt.position.set(0, 1.82, 0.38);
+        mesh.add(pt);
+      }
+      refs.entitiesContainer.add(mesh);
+      refs.entityGroups.set(ent.id, mesh);
+    }
+    void refs.precompileObject(refs.entitiesContainer);
+    refs.markShadowDirty();
+
+    // Dispose removed FX Emitters
+    refs.fxEmitters.forEach((fx, id) => {
+      if (!activeFxIds.has(id)) {
+        refs.fxContainer.remove(fx.group);
+        fx.dispose();
+        refs.fxEmitters.delete(id);
+      }
+    });
+
+    if (deferredCanopyEntities.length > 0 || deferredCustomEntities.length > 0) {
+      void (async () => {
+        if (signal.aborted) return;
+
+        // Preload any custom canopy textures referenced by placed canopy trees asynchronously
+        if (deferredCanopyEntities.length > 0) {
+          const entTexIds = collectReferencedTextureIds(
+            level.sceneryTextures,
+            undefined,
+            deferredCanopyEntities.map((d) => d.ent.canopyTree)
+          );
+          const missingEntTex = entTexIds.filter((id) => !getRawCustomTextureSync(id));
+          if (missingEntTex.length > 0) {
+            await Promise.allSettled(missingEntTex.map((id) => loadCustomTextureToCache(id)));
+            if (signal.aborted) return;
+          }
+        }
+
+        const readyCanopy = deferredCanopyEntities.filter(({ ent }) => {
+          const ct = ent.canopyTree!;
+          return (
+            (!ct.canopyAssetId || getCachedAssetSync(ct.canopyAssetId)) &&
+            (!ct.trunkAssetId || getCachedAssetSync(ct.trunkAssetId)) &&
+            (!ct.fruitAssetId || getCachedAssetSync(ct.fruitAssetId))
+          );
+        });
+        const waitingCanopy = deferredCanopyEntities.filter((d) => !readyCanopy.includes(d));
+
+        const attachCanopyTree = (ent: LevelEntity, anchor: THREE.Group) => {
+          if (signal.aborted || !ent.canopyTree) return;
+          const treeMesh = buildSingleCanopyTreeGroup(
+            ent.canopyTree,
+            ent.id,
+            style,
+            refs.canopyTimeUniform,
+            undefined,
+            {
+              sceneryTextures: level.sceneryTextures,
+              weatherWindUniform: refs.canopyWindUniform,
+            }
+          );
+          if (signal.aborted) {
+            disposeObject3D(treeMesh);
+            return;
+          }
+          const latestEnt = propsRef.current.level.entities.find((e) => e.id === ent.id) ?? ent;
+          treeMesh.userData.entityId = ent.id;
+          applyEntityMaterialVariant(treeMesh, latestEnt.materialVariant, false);
+          if (latestEnt.meshletEnabled) {
+            prepareObjectForMeshletCulling(treeMesh, true);
+          }
+          disposeObject3D(anchor);
+          anchor.clear();
+          anchor.add(treeMesh);
+        };
+
+        if (readyCanopy.length > 0) {
+          const ok = await runDeferredChunks({
+            items: readyCanopy,
+            chunkSize: 1,
+            frameBudgetMs: 4,
+            maxItemsPerFrame: 2,
+            yieldBeforeFirst: true,
+            signal,
+            onChunk: (chunk) => {
+              for (const { ent, anchor } of chunk) {
+                attachCanopyTree(ent, anchor);
+              }
+            },
+          });
+          if (!ok || signal.aborted) return;
+          void refs.precompileObject(refs.entitiesContainer);
+        }
+
+        if (waitingCanopy.length > 0) {
+          const missingIds = new Map<string, CustomAssetMeta['category']>();
+          for (const { ent } of waitingCanopy) {
+            const ct = ent.canopyTree!;
+            for (const aid of [ct.canopyAssetId, ct.trunkAssetId, ct.fruitAssetId]) {
+              if (aid && !getCachedAssetSync(aid) && !missingIds.has(aid)) {
+                const meta = customAssets.find((a) => a.id === aid);
+                missingIds.set(aid, meta?.category ?? 'scenery');
+              }
+            }
+          }
+          await Promise.allSettled(
+            Array.from(missingIds.entries()).map(([id, cat]) => loadCustomAssetToCache(id, cat))
+          );
+          if (signal.aborted) return;
+          const ok = await runDeferredChunks({
+            items: waitingCanopy,
+            chunkSize: 1,
+            frameBudgetMs: 4,
+            maxItemsPerFrame: 2,
+            signal,
+            onChunk: (chunk) => {
+              for (const { ent, anchor } of chunk) {
+                attachCanopyTree(ent, anchor);
+              }
+            },
+          });
+          if (!ok || signal.aborted) return;
+          void refs.precompileObject(refs.entitiesContainer);
+        }
+
+        const attachCustomEntity = (ent: LevelEntity, anchor: THREE.Group) => {
+          if (signal.aborted || !ent.customAssetId) return;
+          const meta = customAssets.find((a) => a.id === ent.customAssetId);
+          const inst = instantiateCustomModel(ent.customAssetId, meta, {
+            scaleAdjust: ent.modelScaleAdjust ?? 1,
+            offsetY: ent.modelOffsetY ?? 0,
+            visualStyle: style,
+          });
+          if (!inst || signal.aborted) {
+            if (inst) disposeObject3D(inst.group);
+            return;
+          }
+          const latestEnt = propsRef.current.level.entities.find((e) => e.id === ent.id) ?? ent;
+          inst.group.scale.setScalar(latestEnt.scale);
+          inst.group.rotation.y = (latestEnt.rotation * Math.PI) / 180;
+          inst.group.userData.entityId = ent.id;
+          if (latestEnt.vertexPaintStrokes && latestEnt.vertexPaintStrokes.length > 0) {
+            applyVertexPaintStrokesToObject(inst.group, latestEnt.vertexPaintStrokes);
+          }
+          const isMatte =
+            latestEnt.kind === 'platform' ||
+            latestEnt.kind === 'checkpoint' ||
+            latestEnt.kind === 'door' ||
+            latestEnt.kind === 'puzzle' ||
+            latestEnt.kind === 'spawner';
+          applyEntityMaterialVariant(inst.group, latestEnt.materialVariant, isMatte);
+          if (latestEnt.meshletEnabled) {
+            prepareObjectForMeshletCulling(inst.group, true);
+          }
+          disposeObject3D(anchor);
+          anchor.clear();
+          anchor.add(inst.group);
+          refs.customUpdaters.push((stepDt) => inst.update(stepDt));
+        };
+
+        const cachedCustom = deferredCustomEntities.filter((d) => d.isCached);
+        const uncachedCustom = deferredCustomEntities.filter((d) => !d.isCached);
+
+        if (cachedCustom.length > 0) {
+          const ok = await runDeferredChunks({
+            items: cachedCustom,
+            chunkSize: 3,
+            frameBudgetMs: 6,
+            maxItemsPerFrame: 6,
+            yieldBeforeFirst: true,
+            signal,
+            onChunk: (chunk) => {
+              for (const { ent, anchor } of chunk) {
+                attachCustomEntity(ent, anchor);
+              }
+            },
+          });
+          if (!ok || signal.aborted) return;
+          void refs.precompileObject(refs.entitiesContainer);
+        }
+
+        if (uncachedCustom.length > 0) {
+          const missingEntAssets = new Map<string, CustomAssetMeta['category']>();
+          for (const { ent } of uncachedCustom) {
+            if (ent.customAssetId && !missingEntAssets.has(ent.customAssetId)) {
+              const meta = customAssets.find((a) => a.id === ent.customAssetId);
+              missingEntAssets.set(ent.customAssetId, meta?.category ?? 'prop');
+            }
+          }
+          await Promise.allSettled(
+            Array.from(missingEntAssets.entries()).map(([id, cat]) => loadCustomAssetToCache(id, cat))
+          );
+          if (signal.aborted) return;
+          const ok = await runDeferredChunks({
+            items: uncachedCustom,
+            chunkSize: 3,
+            frameBudgetMs: 6,
+            maxItemsPerFrame: 6,
+            signal,
+            onChunk: (chunk) => {
+              for (const { ent, anchor } of chunk) {
+                attachCustomEntity(ent, anchor);
+              }
+            },
+          });
+          if (ok && !signal.aborted) {
+            void refs.precompileObject(refs.entitiesContainer);
+          }
+        }
+      })();
+    }
+  }, [
+    level.environmentType,
+    level.entities,
+    level.hasStart,
+    level.hasPortal,
+    level.terrain?.revision,
+    level.visualStyle,
+    level.sceneryTextures,
+    level.id,
+    project.heroBody,
+    project.heroColors,
+    project.heroCustomAssetId,
+    project.heroModelScale,
+    project.heroModelOffsetY,
+    customAssets,
+    texInvalidationTick,
+  ]);
+
+  // Manual Preview / Burst trigger from Inspector
+  useEffect(() => {
+    if (!fxBurstSignal) return;
+    const fx = sceneRefs.current?.fxEmitters.get(fxBurstSignal.entityId);
+    if (fx) {
+      fx.triggerBurst();
+    }
+  }, [fxBurstSignal]);
+
+  const raycastClientToGround = (clientX: number, clientY: number): THREE.Vector3 | null => {
+    const refs = sceneRefs.current;
+    if (!refs || refs.groundMeshes.length === 0) return null;
+    const rect = refs.renderer.domElement.getBoundingClientRect();
+    const ndc = new THREE.Vector2(
+      ((clientX - rect.left) / Math.max(1, rect.width)) * 2 - 1,
+      -((clientY - rect.top) / Math.max(1, rect.height)) * 2 + 1
+    );
+    const rc = new THREE.Raycaster();
+    rc.setFromCamera(ndc, refs.camera);
+    const hits = rc.intersectObjects(refs.groundMeshes, false);
+    if (hits[0]?.point) return hits[0].point;
+
+    // Fallback intersection against Y=0 plane if dragging near terrain edges
+    const fallbackPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
+    const hitPt = new THREE.Vector3();
+    return rc.ray.intersectPlane(fallbackPlane, hitPt) ? hitPt : null;
+  };
+
+  const handleDragOver = (e: React.DragEvent<HTMLDivElement>) => {
+    const hasFxMime =
+      e.dataTransfer.types.includes(FX_DRAG_MIME) || Boolean(propsRef.current.draggingFxTemplate);
+    if (!hasFxMime) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'copy';
+    if (!isDragOver) setIsDragOver(true);
+
+    const refs = sceneRefs.current;
+    if (refs) {
+      const accent = propsRef.current.draggingFxTemplate?.accentHex ?? '#7C5CFF';
+      refs.dropRingMat.color.set(accent);
+      refs.dropPillarMat.color.set(accent);
+      const hit = raycastClientToGround(e.clientX, e.clientY);
+      if (hit) {
+        refs.dropPreviewGroup.visible = true;
+        refs.dropPreviewGroup.position.set(hit.x, hit.y, hit.z);
+      } else {
+        refs.dropPreviewGroup.visible = false;
+      }
+    }
+  };
+
+  const handleDragLeave = (e: React.DragEvent<HTMLDivElement>) => {
+    if (e.currentTarget.contains(e.relatedTarget as Node | null)) return;
+    setIsDragOver(false);
+    if (sceneRefs.current) {
+      sceneRefs.current.dropPreviewGroup.visible = false;
+    }
+  };
+
+  const handleDrop = (e: React.DragEvent<HTMLDivElement>) => {
+    const templateId =
+      e.dataTransfer.getData(FX_DRAG_MIME) ||
+      propsRef.current.draggingFxTemplate?.id ||
+      e.dataTransfer.getData('text/plain');
+    setIsDragOver(false);
+    if (sceneRefs.current) {
+      sceneRefs.current.dropPreviewGroup.visible = false;
+    }
+    if (!templateId || !propsRef.current.onDropFxTemplate) return;
+    e.preventDefault();
+    const hit = raycastClientToGround(e.clientX, e.clientY);
+    const boardPos = hit
+      ? levelWorldToBoard(propsRef.current.level, hit.x, hit.z)
+      : { x: 0.5, y: 0.5 };
+    propsRef.current.onDropFxTemplate(templateId, boardPos);
+  };
+
+  return (
+    <div
+      className="w-full h-full relative select-none touch-none"
+      onDragOver={handleDragOver}
+      onDragLeave={handleDragLeave}
+      onDrop={handleDrop}
+    >
+      <div
+        ref={mountRef}
+        className="w-full h-full"
+        style={{ cursor: tool === 'terrain' || tool === 'add' ? 'crosshair' : 'grab' }}
+      />
+      {/* Compact Framerate Viewer & Expandable Performance HUD */}
+      <div
+        className="absolute bottom-3 left-3 z-10 flex flex-col items-start gap-1.5"
+        onPointerDown={(e) => e.stopPropagation()}
+      >
+        {showPerfHud && (
+          <div className="px-3 py-2 rounded-xl bg-black/82 text-white text-[11px] font-mono border border-white/15 shadow-lg space-y-0.5 tabular-nums">
+            <div className="flex items-center justify-between gap-4 pb-1 mb-1 border-b border-white/10">
+              <span className="font-sans font-bold text-[10px] uppercase tracking-wider text-slate-300">
+                Framerate &amp; Stats
+              </span>
+              <span className="text-[10px] font-sans font-semibold text-emerald-400">
+                {perfStats.backend}
+              </span>
+            </div>
+            <div className="flex justify-between gap-5">
+              <span className="text-slate-400">FPS</span>
+              <span
+                className={`font-bold ${
+                  perfStats.fps >= 50
+                    ? 'text-emerald-400'
+                    : perfStats.fps >= 30
+                    ? 'text-amber-300'
+                    : 'text-rose-400'
+                }`}
+              >
+                {perfStats.fps}
+              </span>
+            </div>
+            <div className="flex justify-between gap-5">
+              <span className="text-slate-400">Frame</span>
+              <span>{perfStats.frameMs.toFixed(1)} ms</span>
+            </div>
+            <div className="flex justify-between gap-5">
+              <span className="text-slate-400">Draws</span>
+              <span>{perfStats.calls.toLocaleString()}</span>
+            </div>
+            <div className="flex justify-between gap-5">
+              <span className="text-slate-400">Triangles</span>
+              <span>{perfStats.triangles.toLocaleString()}</span>
+            </div>
+            {perfStats.heapMB !== undefined && (
+              <div className="flex justify-between gap-5">
+                <span className="text-slate-400">JS Heap</span>
+                <span>
+                  {perfStats.heapMB.toFixed(1)} MB
+                  {perfStats.heapLimitMB ? ` / ${Math.round(perfStats.heapLimitMB)}` : ''}
+                </span>
+              </div>
+            )}
+          </div>
+        )}
+        <button
+          type="button"
+          onClick={() =>
+            setShowPerfHud((v) => {
+              if (!v) setPerfStats({ ...latestPerfSnapshotRef.current });
+              return !v;
+            })
+          }
+          className="px-2.5 py-1 rounded-lg bg-black/75 hover:bg-black/90 text-white text-[11px] font-mono font-semibold border border-white/15 inline-flex items-center gap-1.5 tabular-nums"
+          title="Toggle detailed framerate, frame time, draw calls, triangle count, and heap usage"
+        >
+          <span
+            ref={compactFpsDotRef}
+            className={`w-2 h-2 rounded-full ${
+              perfStats.fps >= 50
+                ? 'bg-emerald-400'
+                : perfStats.fps >= 30
+                ? 'bg-amber-300'
+                : 'bg-rose-400'
+            }`}
+          />
+          <span ref={compactFpsTextRef}>{perfStats.fps > 0 ? `${perfStats.fps} FPS` : '-- FPS'}</span>
+          <span ref={compactMsTextRef} className="text-white/50 font-sans text-[10px]">
+            {showPerfHud ? '▲' : `${perfStats.frameMs.toFixed(0)}ms`}
+          </span>
+        </button>
+      </div>
+
+      {isDragOver && (
+        <div
+          className="pointer-events-none absolute inset-0 rounded-2xl border-2 transition-colors"
+          style={{
+            borderColor: draggingFxTemplate?.accentHex ?? '#7C5CFF',
+            boxShadow: `inset 0 0 36px ${(draggingFxTemplate?.accentHex ?? '#7C5CFF')}33`,
+          }}
+        >
+          <div className="absolute bottom-4 left-1/2 -translate-x-1/2 px-3.5 py-1.5 rounded-xl bg-black/80 text-white text-xs font-extrabold shadow-lg border border-white/15">
+            Drop to place {draggingFxTemplate?.name ?? 'FX Effect'} here
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};

@@ -1,4 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
+import { Hand } from 'lucide-react';
 import * as THREE from 'three';
 import type { WebGPURenderer } from 'three/webgpu';
 import { uniform } from 'three/tsl';
@@ -254,6 +255,10 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
   const [texInvalidationTick, setTexInvalidationTick] = useState(0);
   const [sculptFinalizeNonce, setSculptFinalizeNonce] = useState(0);
   const [isDragOver, setIsDragOver] = useState(false);
+  const [shiftHeld, setShiftHeld] = useState(false);
+  const [isPanning, setIsPanning] = useState(false);
+  const shiftHeldRef = useRef(false);
+  const isPanDragRef = useRef(false);
   const [showPerfHud, setShowPerfHud] = useState(false);
   const [perfStats, setPerfStats] = useState<{
     fps: number;
@@ -971,6 +976,30 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
     const onPointerDown = (e: PointerEvent) => {
       pointerDownPos = { x: e.clientX, y: e.clientY };
       movedFar = false;
+      shiftHeldRef.current = e.shiftKey;
+      setShiftHeld(e.shiftKey);
+
+      // Shift+drag always pans in 3D view regardless of active tool or angle lock
+      if (e.shiftKey) {
+        activeMode = 'none';
+        activeEntityId = null;
+        isPanDragRef.current = true;
+        setIsPanning(true);
+        controls.enabled = true;
+        controls.enablePan = true;
+        controls.enableRotate = false;
+        if (sceneRefs.current) {
+          sceneRefs.current.brushGroup.visible = false;
+          sceneRefs.current.snapGhostGroup.visible = false;
+        }
+        return;
+      }
+
+      if (e.button === 2 && !propsRef.current.cameraAngleLocked) {
+        isPanDragRef.current = true;
+        setIsPanning(true);
+      }
+
       const {
         tool: curTool,
         brush: curBrush,
@@ -1029,6 +1058,10 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
     };
 
     const onPointerMove = (e: PointerEvent) => {
+      if (e.shiftKey !== shiftHeldRef.current) {
+        shiftHeldRef.current = e.shiftKey;
+        setShiftHeld(e.shiftKey);
+      }
       if (Math.hypot(e.clientX - pointerDownPos.x, e.clientY - pointerDownPos.y) > 5) {
         movedFar = true;
       }
@@ -1039,6 +1072,14 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
         brushFalloff: falloff,
       } = propsRef.current;
       const refs = sceneRefs.current;
+
+      if (e.shiftKey || isPanDragRef.current) {
+        if (refs) {
+          refs.brushGroup.visible = false;
+          refs.snapGhostGroup.visible = false;
+        }
+        return;
+      }
 
       if (curTool === 'terrain' && refs) {
         const hit = raycastGround(e.clientX, e.clientY);
@@ -1129,11 +1170,16 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
 
     const onPointerUp = (e: PointerEvent) => {
       const wasMode = activeMode;
+      const wasPanDrag = isPanDragRef.current;
+      isPanDragRef.current = false;
+      setIsPanning(false);
+      shiftHeldRef.current = e.shiftKey;
+      setShiftHeld(e.shiftKey);
       activeMode = 'none';
       activeEntityId = null;
       controls.enabled = true;
-      controls.enableRotate = !propsRef.current.cameraAngleLocked;
-      controls.enablePan = !propsRef.current.cameraAngleLocked;
+      controls.enableRotate = !propsRef.current.cameraAngleLocked && !e.shiftKey;
+      controls.enablePan = !propsRef.current.cameraAngleLocked || e.shiftKey;
       if (sceneRefs.current) {
         sceneRefs.current.snapGhostGroup.visible = false;
       }
@@ -1146,6 +1192,10 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
           setSculptFinalizeNonce((n) => n + 1);
         }
         lastSculptAreaRef.current = null;
+        return;
+      }
+
+      if (wasPanDrag || e.shiftKey) {
         return;
       }
 
@@ -1207,6 +1257,15 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
       if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.tagName === 'SELECT')) {
         return;
       }
+      if (e.key === 'Shift' || e.shiftKey) {
+        shiftHeldRef.current = true;
+        setShiftHeld(true);
+        controls.enablePan = true;
+        controls.enableRotate = false;
+        if (sceneRefs.current) {
+          sceneRefs.current.brushGroup.visible = false;
+        }
+      }
       if (e.key.toLowerCase() === 'r') {
         const { selectedEntityID: selId, level: curLevel, tool: curTool } = propsRef.current;
         const delta = e.shiftKey ? -90 : 90;
@@ -1224,11 +1283,35 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
       }
     };
 
+    const onKeyUp = (e: KeyboardEvent) => {
+      if (e.key === 'Shift' || !e.shiftKey) {
+        const nextShift = e.shiftKey && e.key !== 'Shift';
+        shiftHeldRef.current = nextShift;
+        setShiftHeld(nextShift);
+        if (!isPanDragRef.current) {
+          controls.enableRotate = !propsRef.current.cameraAngleLocked && !nextShift;
+          controls.enablePan = !propsRef.current.cameraAngleLocked || nextShift;
+        }
+      }
+    };
+
+    const onWindowBlur = () => {
+      shiftHeldRef.current = false;
+      isPanDragRef.current = false;
+      setShiftHeld(false);
+      setIsPanning(false);
+      controls.enableRotate = !propsRef.current.cameraAngleLocked;
+      controls.enablePan = !propsRef.current.cameraAngleLocked;
+    };
+
     let dom = renderer.domElement;
     dom.addEventListener('pointerdown', onPointerDown);
     window.addEventListener('pointermove', onPointerMove);
     window.addEventListener('pointerup', onPointerUp);
+    window.addEventListener('pointercancel', onWindowBlur);
     window.addEventListener('keydown', onKeyDown);
+    window.addEventListener('keyup', onKeyUp);
+    window.addEventListener('blur', onWindowBlur);
 
     let lastResizeW = container.clientWidth || 640;
     let lastResizeH = Math.max(1, container.clientHeight || 420);
@@ -1579,16 +1662,16 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
       container.innerHTML = '';
       container.appendChild(renderer.domElement);
       dom = renderer.domElement;
-      dom.addEventListener('pointerdown', onPointerDown);
       controls = new OrbitControls(camera, dom);
+      dom.addEventListener('pointerdown', onPointerDown);
       controls.target.set(0, 1.2, 0);
       controls.enableDamping = !isSoftwareGl;
       controls.dampingFactor = 0.08;
       controls.minDistance = 8;
       controls.maxDistance = 360;
       controls.maxPolarAngle = Math.PI * 0.47;
-      controls.enableRotate = !propsRef.current.cameraAngleLocked;
-      controls.enablePan = !propsRef.current.cameraAngleLocked;
+      controls.enableRotate = !propsRef.current.cameraAngleLocked && !shiftHeldRef.current;
+      controls.enablePan = !propsRef.current.cameraAngleLocked || shiftHeldRef.current;
       controls.update();
       controls.addEventListener('change', saveCurrentCameraPose);
       controls.addEventListener('start', cancelCameraFly);
@@ -1736,7 +1819,10 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
       dom.removeEventListener('pointerdown', onPointerDown);
       window.removeEventListener('pointermove', onPointerMove);
       window.removeEventListener('pointerup', onPointerUp);
+      window.removeEventListener('pointercancel', onWindowBlur);
       window.removeEventListener('keydown', onKeyDown);
+      window.removeEventListener('keyup', onKeyUp);
+      window.removeEventListener('blur', onWindowBlur);
       controls.removeEventListener('change', saveCurrentCameraPose);
       controls.removeEventListener('start', cancelCameraFly);
       controls.dispose();
@@ -2050,13 +2136,27 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
     sculptFinalizeNonce,
   ]);
 
-  // Camera angle lock sync
+  // Camera angle lock & Shift pan sync
   useEffect(() => {
     const refs = sceneRefs.current;
     if (!refs) return;
-    refs.controls.enableRotate = !cameraAngleLocked;
-    refs.controls.enablePan = !cameraAngleLocked;
-  }, [cameraAngleLocked]);
+    refs.controls.enableRotate = !cameraAngleLocked && !shiftHeld;
+    refs.controls.enablePan = !cameraAngleLocked || shiftHeld;
+  }, [cameraAngleLocked, shiftHeld]);
+
+  // Sync live cursor directly onto Three.js canvas element
+  useEffect(() => {
+    const refs = sceneRefs.current;
+    if (!refs) return;
+    const nextCursor = isPanning
+      ? 'grabbing'
+      : shiftHeld
+      ? 'grab'
+      : tool === 'terrain' || tool === 'add'
+      ? 'crosshair'
+      : 'default';
+    refs.renderer.domElement.style.cursor = nextCursor;
+  }, [isPanning, shiftHeld, tool]);
 
   // Smooth fly-to camera focus when clicking items in Left Contents or Inspector
   useEffect(() => {
@@ -2779,8 +2879,28 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
       <div
         ref={mountRef}
         className="w-full h-full"
-        style={{ cursor: tool === 'terrain' || tool === 'add' ? 'crosshair' : 'grab' }}
+        style={{
+          cursor: isPanning
+            ? 'grabbing'
+            : shiftHeld
+            ? 'grab'
+            : tool === 'terrain' || tool === 'add'
+            ? 'crosshair'
+            : 'default',
+        }}
       />
+      {(isPanning || shiftHeld) && (
+        <div
+          className="pointer-events-none absolute top-3 left-1/2 -translate-x-1/2 z-20 inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-black/82 text-white text-[11px] font-bold border border-white/20 shadow-lg"
+          data-testid="pan-hand-indicator"
+        >
+          <Hand
+            size={14}
+            className={isPanning ? 'text-[#20B46A] scale-95' : 'text-amber-300'}
+          />
+          <span>{isPanning ? 'Panning' : 'Shift · Drag to Pan'}</span>
+        </div>
+      )}
       {/* Compact Framerate Viewer & Expandable Performance HUD */}
       <div
         className="absolute bottom-3 left-3 z-10 flex flex-col items-start gap-1.5"

@@ -271,30 +271,32 @@ export const EditorShell: React.FC<{ store: MakerStore }> = ({ store }) => {
           {/* Center: Inline Stage Tabs */}
           <nav
             aria-label="Editor Stages"
-            className="flex-1 min-w-0 flex items-center justify-start lg:justify-center gap-1 overflow-x-auto maker-scroll px-1"
+            className="flex-1 min-w-0 overflow-x-auto maker-scroll"
           >
-            {STAGE_TABS.map((tab) => {
-              const active = store.selectedTab === tab.id;
-              return (
-                <button
-                  key={tab.id}
-                  type="button"
-                  onClick={() => store.setSelectedTab(tab.id)}
-                  className={`flex items-center gap-1.5 px-2.5 sm:px-3 py-1.5 rounded-xl text-xs font-extrabold transition-all shrink-0 whitespace-nowrap ${
-                    active
-                      ? 'bg-[#7C5CFF] text-white shadow-xs'
-                      : 'text-slate-600 dark:text-[#949BB0] hover:bg-slate-100 dark:hover:bg-[#1F2430] hover:text-slate-900 dark:hover:text-white'
-                  }`}
-                >
-                  <MakerIcon
-                    symbol={tab.symbol}
-                    size={13}
-                    color={active ? '#FFFFFF' : 'currentColor'}
-                  />
-                  <span>{tab.title}</span>
-                </button>
-              );
-            })}
+            <div className="flex items-center gap-1 min-w-max mx-auto px-1">
+              {STAGE_TABS.map((tab) => {
+                const active = store.selectedTab === tab.id;
+                return (
+                  <button
+                    key={tab.id}
+                    type="button"
+                    onClick={() => store.setSelectedTab(tab.id)}
+                    className={`flex items-center gap-1.5 px-2.5 sm:px-3 py-1.5 rounded-xl text-xs font-extrabold transition-all shrink-0 whitespace-nowrap ${
+                      active
+                        ? 'bg-[#7C5CFF] text-white shadow-xs'
+                        : 'text-slate-600 dark:text-[#949BB0] hover:bg-slate-100 dark:hover:bg-[#1F2430] hover:text-slate-900 dark:hover:text-white'
+                    }`}
+                  >
+                    <MakerIcon
+                      symbol={tab.symbol}
+                      size={13}
+                      color={active ? '#FFFFFF' : 'currentColor'}
+                    />
+                    <span>{tab.title}</span>
+                  </button>
+                );
+              })}
+            </div>
           </nav>
 
           {/* Right: Create Menu + Atmosphere + Global Utilities + Play */}

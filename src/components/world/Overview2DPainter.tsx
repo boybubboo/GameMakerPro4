@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   Eraser,
   Flower2,
+  Hand,
   MousePointer2,
   Mountain,
   RotateCcw,
@@ -82,12 +83,46 @@ export const Overview2DPainter: React.FC<Overview2DPainterProps> = ({
   const [zoom, setZoom] = useState<number>(1);
   const [pan, setPan] = useState<[number, number]>([0, 0]);
   const [hoverWorld, setHoverWorld] = useState<[number, number] | null>(null);
+  const [shiftHeld, setShiftHeld] = useState(false);
+  const [isPanning, setIsPanning] = useState(false);
 
   const paintingRef = useRef(false);
   const panningRef = useRef<{ startX: number; startY: number; origPan: [number, number] } | null>(
     null
   );
   const lastStrokeMsRef = useRef(0);
+
+  useEffect(() => {
+    const syncShift = (e: KeyboardEvent) => {
+      const target = e.target as HTMLElement | null;
+      if (
+        e.type === 'keydown' &&
+        target &&
+        (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.tagName === 'SELECT')
+      ) {
+        return;
+      }
+      if (e.key === 'Shift' || e.shiftKey) {
+        setShiftHeld(e.shiftKey);
+      } else {
+        setShiftHeld(false);
+      }
+    };
+    const onBlur = () => {
+      setShiftHeld(false);
+      setIsPanning(false);
+      panningRef.current = null;
+      paintingRef.current = false;
+    };
+    window.addEventListener('keydown', syncShift);
+    window.addEventListener('keyup', syncShift);
+    window.addEventListener('blur', onBlur);
+    return () => {
+      window.removeEventListener('keydown', syncShift);
+      window.removeEventListener('keyup', syncShift);
+      window.removeEventListener('blur', onBlur);
+    };
+  }, []);
 
   const terrain = useMemo(
     () => currentLevel?.terrain ?? createInitialTerrain(),
@@ -323,7 +358,7 @@ export const Overview2DPainter: React.FC<Overview2DPainterProps> = ({
     }
 
     // Hover brush ring
-    if (hoverWorld && tool !== 'inspect') {
+    if (hoverWorld && tool !== 'inspect' && !shiftHeld && !isPanning) {
       const [px, py] = toPx(hoverWorld[0], hoverWorld[1]);
       const activeMeta = PAINTER_2D_TOOLS.find((t) => t.id === tool);
       ctx.strokeStyle = activePlacementAssetId ? '#20B46A' : activeMeta?.accent ?? '#FFFFFF';
@@ -351,6 +386,8 @@ export const Overview2DPainter: React.FC<Overview2DPainterProps> = ({
     tool,
     brushRadius,
     activePlacementAssetId,
+    shiftHeld,
+    isPanning,
     store.selectedEntityID,
     store.selectedWaterBodyId,
     store.selectedCaveId,
@@ -442,14 +479,30 @@ export const Overview2DPainter: React.FC<Overview2DPainterProps> = ({
     >
       <canvas
         ref={canvasRef}
-        className="w-full h-full block cursor-crosshair touch-none"
+        className="w-full h-full block touch-none"
+        style={{
+          cursor: isPanning
+            ? 'grabbing'
+            : shiftHeld
+            ? 'grab'
+            : tool === 'inspect'
+            ? 'default'
+            : 'crosshair',
+        }}
         onPointerDown={(e) => {
+          setShiftHeld(e.shiftKey);
           if (e.button === 1 || e.button === 2 || e.shiftKey) {
             panningRef.current = {
               startX: e.clientX,
               startY: e.clientY,
               origPan: [...pan] as [number, number],
             };
+            setIsPanning(true);
+            try {
+              e.currentTarget.setPointerCapture(e.pointerId);
+            } catch {
+              // ignore pointer capture fallback
+            }
             return;
           }
           paintingRef.current = true;
@@ -458,6 +511,9 @@ export const Overview2DPainter: React.FC<Overview2DPainterProps> = ({
           applyStrokeAtPoint(wx, wz, true);
         }}
         onPointerMove={(e) => {
+          if (e.shiftKey !== shiftHeld) {
+            setShiftHeld(e.shiftKey);
+          }
           if (panningRef.current) {
             const dx = e.clientX - panningRef.current.startX;
             const dy = e.clientY - panningRef.current.startY;
@@ -470,14 +526,29 @@ export const Overview2DPainter: React.FC<Overview2DPainterProps> = ({
             applyStrokeAtPoint(wx, wz, false);
           }
         }}
-        onPointerUp={() => {
+        onPointerUp={(e) => {
           paintingRef.current = false;
           panningRef.current = null;
+          setIsPanning(false);
+          setShiftHeld(e.shiftKey);
+          try {
+            if (e.currentTarget.hasPointerCapture(e.pointerId)) {
+              e.currentTarget.releasePointerCapture(e.pointerId);
+            }
+          } catch {
+            // ignore release fallback
+          }
+        }}
+        onPointerCancel={() => {
+          paintingRef.current = false;
+          panningRef.current = null;
+          setIsPanning(false);
         }}
         onPointerLeave={() => {
-          paintingRef.current = false;
-          panningRef.current = null;
-          setHoverWorld(null);
+          if (!panningRef.current) {
+            paintingRef.current = false;
+            setHoverWorld(null);
+          }
         }}
         onContextMenu={(e) => e.preventDefault()}
         onWheel={(e) => {
@@ -486,6 +557,19 @@ export const Overview2DPainter: React.FC<Overview2DPainterProps> = ({
           setZoom((z) => Math.max(0.65, Math.min(3.5, z * factor)));
         }}
       />
+
+      {(isPanning || shiftHeld) && (
+        <div
+          className="pointer-events-none absolute top-3 left-1/2 -translate-x-1/2 z-20 inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-black/82 text-white text-[11px] font-bold border border-white/20 shadow-lg"
+          data-testid="pan-hand-indicator"
+        >
+          <Hand
+            size={14}
+            className={isPanning ? 'text-[#20B46A] scale-95' : 'text-amber-300'}
+          />
+          <span>{isPanning ? 'Panning' : 'Shift · Drag to Pan'}</span>
+        </div>
+      )}
 
       {/* Generic 2D World Blocking Palette */}
       <div className="absolute left-3 bottom-3 right-3 flex flex-wrap items-center justify-between gap-2 pointer-events-none">

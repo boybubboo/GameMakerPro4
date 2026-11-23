@@ -84,73 +84,150 @@ export function computeShiftedHexColor(
   return `#${c.getHexString()}`;
 }
 
+type AnyVertexAttr = THREE.BufferAttribute | THREE.InterleavedBufferAttribute;
+
 /**
  * Ensures a BufferGeometry has mutable `color` (RGB linear), `aPaintHsv` (hue, sat, val),
- * and multi-form weathering/degradation attributes (`aDegrade0`, `aDegrade1`, `aDegradeWet`),
- * plus immutable baseline snapshots (including vertex positions & normals for physical chipping/erasing).
+ * and multi-form weathering/degradation attributes (`aDegrade0`, `aDegrade1`, `aDegradeWet`)
+ * packed into a SINGLE `THREE.InterleavedBuffer` (stride = 15 floats) so skinned & UV-mapped
+ * meshes never exceed WebGPU's 8-vertex-buffer hardware limit, plus immutable baseline
+ * snapshots for non-destructive erasing.
  */
 export function ensureGeometryVertexPaintAttributes(geo: THREE.BufferGeometry): void {
-  const pos = geo.attributes.position as THREE.BufferAttribute | undefined;
+  const pos = geo.attributes.position as AnyVertexAttr | undefined;
   if (!pos) return;
   const count = pos.count;
 
   if (!geo.attributes.normal) {
     geo.computeVertexNormals();
   }
-  const norm = geo.attributes.normal as THREE.BufferAttribute | undefined;
+  const norm = geo.attributes.normal as AnyVertexAttr | undefined;
 
-  let colAttr = geo.attributes.color as THREE.BufferAttribute | undefined;
-  if (!colAttr || colAttr.count !== count || colAttr.itemSize !== 3) {
-    const arr = new Float32Array(count * 3);
-    arr.fill(1.0);
-    colAttr = new THREE.BufferAttribute(arr, 3);
-    geo.setAttribute('color', colAttr);
-  } else if (!(colAttr.array instanceof Float32Array)) {
-    const arr = new Float32Array(count * 3);
+  const existingCol = geo.attributes.color as AnyVertexAttr | undefined;
+  const existingHsv = geo.attributes.aPaintHsv as AnyVertexAttr | undefined;
+  const existingDeg0 = geo.attributes.aDegrade0 as AnyVertexAttr | undefined;
+  const existingDeg1 = geo.attributes.aDegrade1 as AnyVertexAttr | undefined;
+  const existingDegWet = geo.attributes.aDegradeWet as AnyVertexAttr | undefined;
+
+  const isAlreadyPacked =
+    geo.userData._vpPackedInterleaved === true &&
+    existingCol instanceof THREE.InterleavedBufferAttribute &&
+    existingHsv instanceof THREE.InterleavedBufferAttribute &&
+    existingDeg0 instanceof THREE.InterleavedBufferAttribute &&
+    existingDeg1 instanceof THREE.InterleavedBufferAttribute &&
+    existingDegWet instanceof THREE.InterleavedBufferAttribute &&
+    existingCol.data === existingHsv.data &&
+    existingHsv.data === existingDeg0.data &&
+    existingDeg0.data === existingDeg1.data &&
+    existingDeg1.data === existingDegWet.data &&
+    existingHsv.data.stride === 15 &&
+    existingHsv.count === count;
+
+  let colAttr: AnyVertexAttr;
+  let hsvAttr: AnyVertexAttr;
+
+  if (isAlreadyPacked) {
+    colAttr = existingCol;
+    hsvAttr = existingHsv;
+  } else {
+    const packed = new Float32Array(count * 15);
+    const hasCol = Boolean(existingCol && existingCol.count === count && existingCol.itemSize >= 3);
+    const hasHsv = Boolean(existingHsv && existingHsv.count === count && existingHsv.itemSize >= 3);
+    const hasDeg0 = Boolean(existingDeg0 && existingDeg0.count === count && existingDeg0.itemSize >= 4);
+    const hasDeg1 = Boolean(existingDeg1 && existingDeg1.count === count && existingDeg1.itemSize >= 4);
+    const hasDegWet = Boolean(existingDegWet && existingDegWet.count === count && existingDegWet.itemSize >= 1);
+
     for (let i = 0; i < count; i++) {
-      arr[i * 3] = colAttr.getX(i);
-      arr[i * 3 + 1] = colAttr.getY(i);
-      arr[i * 3 + 2] = colAttr.getZ(i);
+      const o = i * 15;
+      if (hasCol && existingCol) {
+        packed[o] = existingCol.getX(i);
+        packed[o + 1] = existingCol.getY(i);
+        packed[o + 2] = existingCol.getZ(i);
+      } else {
+        packed[o] = 1.0;
+        packed[o + 1] = 1.0;
+        packed[o + 2] = 1.0;
+      }
+      if (hasHsv && existingHsv) {
+        packed[o + 3] = existingHsv.getX(i);
+        packed[o + 4] = existingHsv.getY(i);
+        packed[o + 5] = existingHsv.getZ(i);
+      }
+      if (hasDeg0 && existingDeg0) {
+        packed[o + 6] = existingDeg0.getX(i);
+        packed[o + 7] = existingDeg0.getY(i);
+        packed[o + 8] = existingDeg0.getZ(i);
+        packed[o + 9] = existingDeg0.getW(i);
+      }
+      if (hasDeg1 && existingDeg1) {
+        packed[o + 10] = existingDeg1.getX(i);
+        packed[o + 11] = existingDeg1.getY(i);
+        packed[o + 12] = existingDeg1.getZ(i);
+        packed[o + 13] = existingDeg1.getW(i);
+      }
+      if (hasDegWet && existingDegWet) {
+        packed[o + 14] = existingDegWet.getX(i);
+      }
     }
-    colAttr = new THREE.BufferAttribute(arr, 3);
+
+    const ib = new THREE.InterleavedBuffer(packed, 15);
+    colAttr = new THREE.InterleavedBufferAttribute(ib, 3, 0, false);
+    hsvAttr = new THREE.InterleavedBufferAttribute(ib, 3, 3, false);
+    const deg0Attr = new THREE.InterleavedBufferAttribute(ib, 4, 6, false);
+    const deg1Attr = new THREE.InterleavedBufferAttribute(ib, 4, 10, false);
+    const degWetAttr = new THREE.InterleavedBufferAttribute(ib, 1, 14, false);
+
     geo.setAttribute('color', colAttr);
-  }
-
-  let hsvAttr = geo.attributes.aPaintHsv as THREE.BufferAttribute | undefined;
-  if (!hsvAttr || hsvAttr.count !== count || hsvAttr.itemSize !== 3) {
-    hsvAttr = new THREE.BufferAttribute(new Float32Array(count * 3), 3);
     geo.setAttribute('aPaintHsv', hsvAttr);
-  }
-
-  let deg0Attr = geo.attributes.aDegrade0 as THREE.BufferAttribute | undefined;
-  if (!deg0Attr || deg0Attr.count !== count || deg0Attr.itemSize !== 4) {
-    deg0Attr = new THREE.BufferAttribute(new Float32Array(count * 4), 4);
     geo.setAttribute('aDegrade0', deg0Attr);
-  }
-
-  let deg1Attr = geo.attributes.aDegrade1 as THREE.BufferAttribute | undefined;
-  if (!deg1Attr || deg1Attr.count !== count || deg1Attr.itemSize !== 4) {
-    deg1Attr = new THREE.BufferAttribute(new Float32Array(count * 4), 4);
     geo.setAttribute('aDegrade1', deg1Attr);
-  }
-
-  let degWetAttr = geo.attributes.aDegradeWet as THREE.BufferAttribute | undefined;
-  if (!degWetAttr || degWetAttr.count !== count || degWetAttr.itemSize !== 1) {
-    degWetAttr = new THREE.BufferAttribute(new Float32Array(count), 1);
     geo.setAttribute('aDegradeWet', degWetAttr);
+    geo.userData._vpPackedInterleaved = true;
   }
 
   if (!geo.userData.vpBaseColors) {
-    geo.userData.vpBaseColors = new Float32Array(colAttr.array as Float32Array);
+    const snap = new Float32Array(count * 3);
+    for (let i = 0; i < count; i++) {
+      snap[i * 3] = colAttr.getX(i);
+      snap[i * 3 + 1] = colAttr.getY(i);
+      snap[i * 3 + 2] = colAttr.getZ(i);
+    }
+    geo.userData.vpBaseColors = snap;
   }
   if (!geo.userData.vpBaseHsv) {
-    geo.userData.vpBaseHsv = new Float32Array(hsvAttr.array as Float32Array);
+    const snap = new Float32Array(count * 3);
+    for (let i = 0; i < count; i++) {
+      snap[i * 3] = hsvAttr.getX(i);
+      snap[i * 3 + 1] = hsvAttr.getY(i);
+      snap[i * 3 + 2] = hsvAttr.getZ(i);
+    }
+    geo.userData.vpBaseHsv = snap;
   }
-  if (!geo.userData.vpBasePositions && pos.array instanceof Float32Array) {
-    geo.userData.vpBasePositions = new Float32Array(pos.array);
+  if (!geo.userData.vpBasePositions) {
+    if (pos instanceof THREE.BufferAttribute && pos.array instanceof Float32Array) {
+      geo.userData.vpBasePositions = new Float32Array(pos.array);
+    } else {
+      const snap = new Float32Array(count * 3);
+      for (let i = 0; i < count; i++) {
+        snap[i * 3] = pos.getX(i);
+        snap[i * 3 + 1] = pos.getY(i);
+        snap[i * 3 + 2] = pos.getZ(i);
+      }
+      geo.userData.vpBasePositions = snap;
+    }
   }
-  if (!geo.userData.vpBaseNormals && norm && norm.array instanceof Float32Array) {
-    geo.userData.vpBaseNormals = new Float32Array(norm.array);
+  if (!geo.userData.vpBaseNormals && norm) {
+    if (norm instanceof THREE.BufferAttribute && norm.array instanceof Float32Array) {
+      geo.userData.vpBaseNormals = new Float32Array(norm.array);
+    } else {
+      const snap = new Float32Array(count * 3);
+      for (let i = 0; i < count; i++) {
+        snap[i * 3] = norm.getX(i);
+        snap[i * 3 + 1] = norm.getY(i);
+        snap[i * 3 + 2] = norm.getZ(i);
+      }
+      geo.userData.vpBaseNormals = snap;
+    }
   }
   if (typeof geo.userData.vpGeoScale !== 'number') {
     geo.computeBoundingBox();
@@ -274,40 +351,71 @@ export function resetObjectVertexPaint(root: THREE.Object3D): void {
     const baseHsv = geo.userData.vpBaseHsv as Float32Array | undefined;
     const basePos = geo.userData.vpBasePositions as Float32Array | undefined;
     const baseNorm = geo.userData.vpBaseNormals as Float32Array | undefined;
-    const colAttr = geo.attributes.color as THREE.BufferAttribute | undefined;
-    const hsvAttr = geo.attributes.aPaintHsv as THREE.BufferAttribute | undefined;
-    const posAttr = geo.attributes.position as THREE.BufferAttribute | undefined;
-    const normAttr = geo.attributes.normal as THREE.BufferAttribute | undefined;
-    const deg0Attr = geo.attributes.aDegrade0 as THREE.BufferAttribute | undefined;
-    const deg1Attr = geo.attributes.aDegrade1 as THREE.BufferAttribute | undefined;
-    const degWetAttr = geo.attributes.aDegradeWet as THREE.BufferAttribute | undefined;
+    const colAttr = geo.attributes.color as AnyVertexAttr | undefined;
+    const hsvAttr = geo.attributes.aPaintHsv as AnyVertexAttr | undefined;
+    const posAttr = geo.attributes.position as AnyVertexAttr | undefined;
+    const normAttr = geo.attributes.normal as AnyVertexAttr | undefined;
+    const deg0Attr = geo.attributes.aDegrade0 as AnyVertexAttr | undefined;
+    const deg1Attr = geo.attributes.aDegrade1 as AnyVertexAttr | undefined;
+    const degWetAttr = geo.attributes.aDegradeWet as AnyVertexAttr | undefined;
 
-    if (baseCols && colAttr && colAttr.array instanceof Float32Array) {
-      colAttr.array.set(baseCols);
+    if (baseCols && colAttr) {
+      for (let i = 0; i < colAttr.count; i++) {
+        const i3 = i * 3;
+        colAttr.setXYZ(i, baseCols[i3] ?? 1, baseCols[i3 + 1] ?? 1, baseCols[i3 + 2] ?? 1);
+      }
       colAttr.needsUpdate = true;
     }
-    if (baseHsv && hsvAttr && hsvAttr.array instanceof Float32Array) {
-      hsvAttr.array.set(baseHsv);
+    if (hsvAttr) {
+      for (let i = 0; i < hsvAttr.count; i++) {
+        const i3 = i * 3;
+        hsvAttr.setXYZ(
+          i,
+          baseHsv ? baseHsv[i3] ?? 0 : 0,
+          baseHsv ? baseHsv[i3 + 1] ?? 0 : 0,
+          baseHsv ? baseHsv[i3 + 2] ?? 0 : 0
+        );
+      }
       hsvAttr.needsUpdate = true;
     }
-    if (basePos && posAttr && posAttr.array instanceof Float32Array) {
-      posAttr.array.set(basePos);
+    if (basePos && posAttr) {
+      if (posAttr instanceof THREE.BufferAttribute && posAttr.array instanceof Float32Array) {
+        posAttr.array.set(basePos);
+      } else {
+        for (let i = 0; i < posAttr.count; i++) {
+          const i3 = i * 3;
+          posAttr.setXYZ(i, basePos[i3] ?? 0, basePos[i3 + 1] ?? 0, basePos[i3 + 2] ?? 0);
+        }
+      }
       posAttr.needsUpdate = true;
     }
-    if (baseNorm && normAttr && normAttr.array instanceof Float32Array) {
-      normAttr.array.set(baseNorm);
+    if (baseNorm && normAttr) {
+      if (normAttr instanceof THREE.BufferAttribute && normAttr.array instanceof Float32Array) {
+        normAttr.array.set(baseNorm);
+      } else {
+        for (let i = 0; i < normAttr.count; i++) {
+          const i3 = i * 3;
+          normAttr.setXYZ(i, baseNorm[i3] ?? 0, baseNorm[i3 + 1] ?? 0, baseNorm[i3 + 2] ?? 0);
+        }
+      }
       normAttr.needsUpdate = true;
     }
-    if (deg0Attr && deg0Attr.array instanceof Float32Array) {
-      deg0Attr.array.fill(0);
+    if (deg0Attr) {
+      for (let i = 0; i < deg0Attr.count; i++) {
+        deg0Attr.setXYZW(i, 0, 0, 0, 0);
+      }
       deg0Attr.needsUpdate = true;
     }
-    if (deg1Attr && deg1Attr.array instanceof Float32Array) {
-      deg1Attr.array.fill(0);
+    if (deg1Attr) {
+      for (let i = 0; i < deg1Attr.count; i++) {
+        deg1Attr.setXYZW(i, 0, 0, 0, 0);
+      }
       deg1Attr.needsUpdate = true;
     }
-    if (degWetAttr && degWetAttr.array instanceof Float32Array) {
-      degWetAttr.array.fill(0);
+    if (degWetAttr) {
+      for (let i = 0; i < degWetAttr.count; i++) {
+        degWetAttr.setX(i, 0);
+      }
       degWetAttr.needsUpdate = true;
     }
   });
@@ -370,12 +478,12 @@ export function applyVertexPaintDab(
     if (!matchesTarget(mesh, settings.target)) continue;
 
     const geo = mesh.geometry;
-    const posAttr = geo.attributes.position as THREE.BufferAttribute | undefined;
-    const colAttr = geo.attributes.color as THREE.BufferAttribute | undefined;
-    const hsvAttr = geo.attributes.aPaintHsv as THREE.BufferAttribute | undefined;
-    const deg0Attr = geo.attributes.aDegrade0 as THREE.BufferAttribute | undefined;
-    const deg1Attr = geo.attributes.aDegrade1 as THREE.BufferAttribute | undefined;
-    const degWetAttr = geo.attributes.aDegradeWet as THREE.BufferAttribute | undefined;
+    const posAttr = geo.attributes.position as AnyVertexAttr | undefined;
+    const colAttr = geo.attributes.color as AnyVertexAttr | undefined;
+    const hsvAttr = geo.attributes.aPaintHsv as AnyVertexAttr | undefined;
+    const deg0Attr = geo.attributes.aDegrade0 as AnyVertexAttr | undefined;
+    const deg1Attr = geo.attributes.aDegrade1 as AnyVertexAttr | undefined;
+    const degWetAttr = geo.attributes.aDegradeWet as AnyVertexAttr | undefined;
     if (!posAttr || !colAttr || !hsvAttr || !deg0Attr || !deg1Attr || !degWetAttr) continue;
 
     // Matrix transforming vertex position from mesh local space into `root` local space

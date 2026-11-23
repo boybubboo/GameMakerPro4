@@ -1434,7 +1434,30 @@ export type WorldDomainId =
 
 export type WorldViewMode = '3d' | '2d';
 
+export type WorldEditorScope = 'worldMap' | string;
+
+export interface WorldLandRegion {
+  id: string;
+  /** Numeric grid code stored in WorldMapData.regionGrid (1..255) */
+  code: number;
+  name: string;
+  colorHex: string;
+  /** Linked GameLevel ID inside GameProject.levels */
+  levelId: string;
+}
+
+export interface WorldMapData {
+  gridSize: number;
+  /** 0 = ocean, 1 = painted landmass (unassigned yellow terrain or assigned land) */
+  landMask: number[];
+  /** 0 = unassigned yellow terrain, >0 = WorldLandRegion.code */
+  regionGrid: number[];
+  regions: WorldLandRegion[];
+  revision: number;
+}
+
 export type TerrainBrush =
+  | 'terrain'
   | 'raiseGround'
   | 'lowerGround'
   | 'smoothGround'
@@ -1607,6 +1630,8 @@ export interface TerrainData {
   waterBodies?: WaterBodyConfig[];
   dirtAndRoadConfig?: DirtAndRoadConfig;
   roads?: RoadSpline[];
+  /** True when created from scratch or synced from WorldMapData (removes circular shore cutoff) */
+  freeformWorld?: boolean;
   revision: number;
 }
 
@@ -1867,6 +1892,7 @@ export interface GameProject {
   colorHex: string;
   updatedAt: string; // ISO
   levels: GameLevel[];
+  worldMap?: WorldMapData;
   heroName: string;
   heroBody: string;
   heroColors: {

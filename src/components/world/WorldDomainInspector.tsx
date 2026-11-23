@@ -1,7 +1,9 @@
 import React, { useMemo, useState } from 'react';
 import {
+  ArrowRight,
   Box,
   Crosshair,
+  Globe,
   MessageCircle,
   Mountain,
   Paintbrush,
@@ -80,6 +82,12 @@ import {
   levelBoardToWorld,
   sampleTerrainHeight,
 } from '../../utils/terrain';
+import {
+  LAND_REGION_PALETTE,
+  WORLD_BORDER_GRAY,
+  WORLD_TERRAIN_YELLOW,
+  type WorldMapBrushMode,
+} from '../../utils/worldMap';
 import { AssetThumbnail } from '../shared/AssetThumbnail';
 import { CanopyTreeInspector } from '../shared/CanopyTreeInspector';
 import { FxEmitterInspector } from '../shared/FxEmitterInspector';
@@ -186,6 +194,7 @@ export const WorldDomainInspector: React.FC<WorldDomainInspectorProps> = ({
   const { currentLevel, currentEntity } = store;
   const [savingBuildingAsset, setSavingBuildingAsset] = useState(false);
   const [savedBuildingAssetNote, setSavedBuildingAssetNote] = useState<string | null>(null);
+  const [newLandName, setNewLandName] = useState('');
 
   const domain = store.activeWorldDomain;
   const terrain = useMemo(
@@ -195,6 +204,236 @@ export const WorldDomainInspector: React.FC<WorldDomainInspectorProps> = ({
 
   if (!currentLevel) return null;
   const envType = getEnvironmentType(currentLevel);
+
+  // --- WORLD MAP OVERVIEW INSPECTOR ---
+  if (envType === 'openWorld' && store.worldEditorScope === 'worldMap') {
+    const wm = store.resolvedWorldMap;
+    const regions = wm?.regions ?? [];
+    const selectedRegion = regions.find((r) => r.code === store.selectedWorldLandCode) ?? null;
+
+    const wmBrushes: { id: WorldMapBrushMode; label: string; accent: string; note: string }[] = [
+      { id: 'terrain', label: 'Terrain', accent: WORLD_TERRAIN_YELLOW, note: 'Paint landmass' },
+      {
+        id: 'paintLand',
+        label: 'Land Color',
+        accent: selectedRegion?.colorHex ?? '#20B46A',
+        note: selectedRegion ? selectedRegion.name : 'Pick a Land below',
+      },
+      { id: 'eraseTerrain', label: 'Erase Land', accent: '#F2545B', note: 'Carve to ocean' },
+      { id: 'clearLand', label: 'Unassign', accent: '#94A3B8', note: 'Keep yellow land' },
+    ];
+
+    const handleCreateLand = () => {
+      const created = store.addWorldLandRegion(newLandName.trim() || undefined);
+      setNewLandName('');
+      if (created) {
+        setTool('terrain');
+      }
+    };
+
+    return (
+      <aside className="w-full lg:w-76 shrink-0 lg:h-full lg:min-h-0 bg-white dark:bg-[#171A23] border-t lg:border-t-0 lg:border-l border-slate-200/80 dark:border-white/[0.08] lg:overflow-y-auto maker-scroll p-4 space-y-4">
+        <div className="flex items-center justify-between gap-2">
+          <div className="flex items-center gap-2">
+            <Globe size={16} style={{ color: WORLD_TERRAIN_YELLOW }} />
+            <h2 className="text-sm font-extrabold">World Map Planner</h2>
+          </div>
+          <span className="text-[10px] font-bold text-slate-400 tabular-nums">
+            {regions.length} {regions.length === 1 ? 'Land' : 'Lands'}
+          </span>
+        </div>
+
+        <p className="text-[11px] text-slate-500 dark:text-[#949BB0] leading-relaxed">
+          Block out continents and islands in yellow <strong className="text-slate-700 dark:text-slate-200">Terrain</strong>, assign a color to each Land, then select any Land in the top dropdown to terraform it (neighboring lands turn gray).
+        </p>
+
+        {/* World Map Brushes */}
+        <div className="p-3 rounded-2xl bg-slate-100 dark:bg-[#1F2430] space-y-2.5">
+          <FieldLabel text="Geography Brushes" />
+          <div className="grid grid-cols-2 gap-1.5">
+            {wmBrushes.map((b) => {
+              const active = activeTool === 'terrain' && store.worldMapBrushMode === b.id;
+              return (
+                <button
+                  key={b.id}
+                  type="button"
+                  onClick={() => {
+                    setTool('terrain');
+                    store.setWorldMapBrushMode(b.id);
+                    if (b.id === 'paintLand' && !selectedRegion && regions.length > 0) {
+                      store.setSelectedWorldLandCode(regions[0].code);
+                    }
+                  }}
+                  className={`flex items-center gap-2 px-2.5 py-2 rounded-xl text-left border transition-colors ${
+                    active
+                      ? 'bg-slate-900 dark:bg-white text-white dark:text-slate-900 border-transparent shadow-xs'
+                      : 'bg-white dark:bg-[#171A23] border-transparent text-slate-700 dark:text-[#C8D0E4] hover:border-slate-300 dark:hover:border-white/15'
+                  }`}
+                >
+                  <span
+                    className="w-3 h-3 rounded-sm border border-black/20 shrink-0"
+                    style={{ backgroundColor: b.accent }}
+                  />
+                  <span className="min-w-0">
+                    <span className="block text-[11px] font-extrabold leading-tight truncate">
+                      {b.label}
+                    </span>
+                    <span className="block text-[9px] opacity-70 truncate">{b.note}</span>
+                  </span>
+                </button>
+              );
+            })}
+          </div>
+
+          <label className="flex items-center justify-between gap-2 text-[11px] font-semibold cursor-pointer pt-1">
+            <span>Auto-create land on ocean</span>
+            <input
+              type="checkbox"
+              checked={store.worldMapAutoLand}
+              onChange={(e) => store.setWorldMapAutoLand(e.target.checked)}
+              className="accent-[#20B46A] w-3.5 h-3.5"
+            />
+          </label>
+
+          <div className="pt-1">
+            <div className="flex justify-between text-[11px] font-bold mb-1">
+              <span>Brush Size</span>
+              <span className="tabular-nums text-[#7C5CFF]">{brushRadius}m</span>
+            </div>
+            <input
+              type="range"
+              min={3}
+              max={36}
+              step={1}
+              value={brushRadius}
+              onChange={(e) => setBrushRadius(Number(e.target.value))}
+              className="w-full accent-[#7C5CFF]"
+            />
+          </div>
+        </div>
+
+        {/* Named Lands / Levels */}
+        <div className="p-3 rounded-2xl bg-slate-100 dark:bg-[#1F2430] space-y-2.5">
+          <div className="flex items-center justify-between">
+            <FieldLabel text="Lands &amp; Levels" />
+            <span
+              className="w-2.5 h-2.5 rounded-full"
+              style={{ backgroundColor: WORLD_BORDER_GRAY }}
+              title="Bordering lands appear gray when editing one land"
+            />
+          </div>
+
+          <div className="flex gap-1.5">
+            <input
+              type="text"
+              value={newLandName}
+              onChange={(e) => setNewLandName(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') handleCreateLand();
+              }}
+              placeholder={`Land ${regions.length + 1} name…`}
+              className="flex-1 min-w-0 px-2.5 py-1.5 rounded-xl bg-white dark:bg-[#171A23] text-xs font-semibold border border-slate-200/80 dark:border-white/[0.08] outline-none focus:border-[#7C5CFF]"
+            />
+            <button
+              type="button"
+              onClick={handleCreateLand}
+              className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-xl bg-[#7C5CFF] hover:bg-[#6D4CFF] text-white text-[11px] font-extrabold shrink-0"
+            >
+              <Plus size={12} />
+              <span>New</span>
+            </button>
+          </div>
+
+          {regions.length === 0 ? (
+            <div className="p-3 rounded-xl bg-white/80 dark:bg-[#171A23]/80 text-[11px] text-slate-500 dark:text-[#949BB0] space-y-1">
+              <p className="font-semibold text-slate-700 dark:text-slate-200">
+                No named Lands yet
+              </p>
+              <p>
+                Paint yellow <strong>Terrain</strong> first, then click <strong>+ New</strong> to
+                color-code and name your first Land or Level.
+              </p>
+            </div>
+          ) : (
+            <div className="space-y-2">
+              {regions.map((reg) => {
+                const isSelected = store.selectedWorldLandCode === reg.code;
+                return (
+                  <div
+                    key={reg.id}
+                    className={`p-2.5 rounded-xl border transition-colors space-y-2 ${
+                      isSelected
+                        ? 'bg-white dark:bg-[#171A23] border-[#7C5CFF]'
+                        : 'bg-white/75 dark:bg-[#171A23]/75 border-transparent hover:border-slate-300 dark:hover:border-white/15'
+                    }`}
+                  >
+                    <div className="flex items-center gap-1.5">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          store.setSelectedWorldLandCode(reg.code);
+                          store.setWorldMapBrushMode('paintLand');
+                          setTool('terrain');
+                        }}
+                        title={`Paint ${reg.name} on the world map`}
+                        className="w-5 h-5 rounded-lg shrink-0 border border-black/20 flex items-center justify-center"
+                        style={{ backgroundColor: reg.colorHex }}
+                      />
+                      <input
+                        type="text"
+                        value={reg.name}
+                        onChange={(e) =>
+                          store.updateWorldLandRegion(reg.id, { name: e.target.value })
+                        }
+                        onFocus={() => store.setSelectedWorldLandCode(reg.code)}
+                        className="flex-1 min-w-0 px-1.5 py-0.5 rounded-lg bg-transparent hover:bg-slate-100 dark:hover:bg-[#1F2430] focus:bg-slate-100 dark:focus:bg-[#1F2430] text-xs font-bold outline-none"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => store.enterWorldEditorScope(reg.levelId)}
+                        title={`Terraform & populate ${reg.name}`}
+                        className="inline-flex items-center gap-1 px-2 py-1 rounded-lg bg-[#7C5CFF]/12 hover:bg-[#7C5CFF] text-[#7C5CFF] hover:text-white text-[10px] font-extrabold shrink-0 transition-colors"
+                      >
+                        <span>Edit</span>
+                        <ArrowRight size={10} />
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => store.deleteWorldLandRegion(reg.id)}
+                        title="Remove Land assignment"
+                        className="p-1 rounded-lg text-slate-400 hover:text-[#F2545B] shrink-0"
+                      >
+                        <Trash2 size={12} />
+                      </button>
+                    </div>
+
+                    {isSelected && (
+                      <div className="flex flex-wrap items-center gap-1 pt-0.5">
+                        {LAND_REGION_PALETTE.map((hex) => (
+                          <button
+                            key={hex}
+                            type="button"
+                            onClick={() => store.updateWorldLandRegion(reg.id, { colorHex: hex })}
+                            className={`w-4 h-4 rounded-md border ${
+                              reg.colorHex.toUpperCase() === hex.toUpperCase()
+                                ? 'border-slate-900 dark:border-white scale-110'
+                                : 'border-black/20 opacity-80 hover:opacity-100'
+                            }`}
+                            style={{ backgroundColor: hex }}
+                            title={`Color ${hex}`}
+                          />
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      </aside>
+    );
+  }
 
   const selectedEntityCustom = currentEntity?.customAssetId
     ? store.customAssets.find((a) => a.id === currentEntity.customAssetId) ?? null
@@ -235,6 +474,7 @@ export const WorldDomainInspector: React.FC<WorldDomainInspectorProps> = ({
       );
     };
     const shapeBrushes: { id: TerrainBrush; label: string }[] = [
+      { id: 'terrain', label: 'Expand Terrain' },
       { id: 'raiseGround', label: 'Raise Peak' },
       { id: 'lowerGround', label: 'Carve Valley' },
       { id: 'smoothGround', label: 'Smooth' },

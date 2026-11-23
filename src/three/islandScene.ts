@@ -86,7 +86,12 @@ import type {
   VistaPresetId,
   VisualStyleId,
   WaterBodyConfig,
+  WorldMapData,
 } from '../types/maker';
+import {
+  sampleWorldMapAtWorld,
+  WORLD_TERRAIN_YELLOW,
+} from '../utils/worldMap';
 import {
   applySeamlessBoxUVs,
   applySurfaceTextureToMaterial,
@@ -193,6 +198,12 @@ export interface HarvestableScatterHandle {
   batchedEntries: BatchEntryRef[];
 }
 
+export interface WorldMapRenderContext {
+  worldMap?: WorldMapData;
+  mode: 'worldMap' | 'land';
+  activeRegionCode?: number;
+}
+
 export interface IslandSceneHandles {
   group: THREE.Group;
   timeUniform: { value: number };
@@ -212,12 +223,14 @@ export interface IslandSceneHandles {
   updateMountainUniforms?: (cfg?: MountainProfileConfig) => void;
   updateDirtUniforms?: (cfg?: DirtAndRoadConfig) => void;
   updateWaterBodiesUniforms?: (bodies?: WaterBodyConfig[], selectedWaterBodyId?: string | null) => void;
+  updateWorldMapUniforms?: (ctx?: WorldMapRenderContext) => void;
 }
 
 export interface BuildIslandMeshOptions {
   deferFoliage?: boolean;
   deferFoliageSignal?: AbortSignal;
   onDeferredBatchReady?: (obj: THREE.Object3D) => Promise<void> | void;
+  worldMapContext?: WorldMapRenderContext;
 }
 
 export function detectSoftwareGl(): boolean {
@@ -1033,6 +1046,7 @@ interface TerrainMaterialBundle {
   material: THREE.Material;
   updateMountainUniforms: (cfg?: MountainProfileConfig) => void;
   updateDirtUniforms: (cfg?: DirtAndRoadConfig) => void;
+  updateWorldMapUniforms: (ctx?: WorldMapRenderContext) => void;
 }
 
 function createTerrainMaterial(
@@ -1043,7 +1057,8 @@ function createTerrainMaterial(
   timeUniform?: { value: number },
   windUniform?: { value: number },
   mountainConfig?: MountainProfileConfig,
-  dirtConfig?: DirtAndRoadConfig
+  dirtConfig?: DirtAndRoadConfig,
+  worldMapContext?: WorldMapRenderContext
 ): TerrainMaterialBundle {
   const atlas = getTerrainTextureAtlas();
   const grassTint = new THREE.Color(biomeGroundHex);
@@ -1066,6 +1081,15 @@ function createTerrainMaterial(
   const uDirtNoiseContrast = uniform(dCfg.noiseContrast);
   const uDirtBumpStrength = uniform(dCfg.bumpStrength);
   const uDirtDegrade = uniform(dCfg.degradeAmount);
+
+  const uWorldMapMode = uniform(worldMapContext?.mode === 'worldMap' ? 1 : 0);
+  const uGrayOtherLand = uniform(
+    worldMapContext?.mode === 'land' &&
+      worldMapContext?.worldMap &&
+      (worldMapContext.activeRegionCode ?? 0) > 0
+      ? 1
+      : 0
+  );
 
   const customGrass = getProcessedSurfaceTextures(sceneryTextures?.grass);
   const customPath = getProcessedSurfaceTextures(sceneryTextures?.pathRoad);
@@ -1322,6 +1346,18 @@ function createTerrainMaterial(
     const submerged = float(1.0).sub(smoothstep(-2.08, -1.52, wp.y));
     texCol.assign(mix(texCol, vec3(0.11, 0.28, 0.58), submerged.mul(0.78)));
 
+    const vColorAttr = attribute('color', 'vec3');
+    const otherLandMask = smoothstep(0.25, 0.75, vColorAttr.r)
+      .mul(uGrayOtherLand)
+      .mul(float(1.0).sub(uWorldMapMode));
+    const grayLandTone = vec3(0.41, 0.44, 0.49)
+      .mul(float(0.88).add(clamp(wp.y.mul(0.025), 0.0, 0.14)))
+      .mul(float(0.92).add(clamp(wn.y, 0.0, 1.0).mul(0.08)));
+    texCol.assign(mix(texCol, grayLandTone, otherLandMask));
+
+    const worldMapShaded = vColorAttr.mul(float(0.93).add(clamp(wn.y, 0.0, 1.0).mul(0.08)));
+    texCol.assign(mix(texCol, worldMapShaded, uWorldMapMode));
+
     // Gentle drifting world-space cloud shadows across open sunlit terrain
     texCol.mulAssign(createDriftingCloudShadowNode(wpXZ));
 
@@ -1383,6 +1419,11 @@ function createTerrainMaterial(
       uDirtNoiseContrast.value = dc.noiseContrast;
       uDirtBumpStrength.value = dc.bumpStrength;
       uDirtDegrade.value = dc.degradeAmount;
+    },
+    updateWorldMapUniforms: (ctx?: WorldMapRenderContext) => {
+      uWorldMapMode.value = ctx?.mode === 'worldMap' ? 1 : 0;
+      uGrayOtherLand.value =
+        ctx?.mode === 'land' && ctx.worldMap && (ctx.activeRegionCode ?? 0) > 0 ? 1 : 0;
     },
   };
 }
@@ -2290,6 +2331,11 @@ interface TerrainSnapshotEntry {
   size: number;
   renderSize: number;
   waterDepthTexSize: number;
+  freeformWorld: boolean;
+  worldMapMode: 'worldMap' | 'land';
+  worldMapActiveCode: number;
+  worldMapRevision: number;
+  regionPaletteSig: string;
   positions: Float32Array;
   colors: Float32Array;
   w0: Float32Array;
@@ -2382,6 +2428,15 @@ export function buildIslandMesh(
   const biome = getBiome(level.biome);
   const timeUniform = getSharedBotwUniforms().uTime;
   const windUniform = uniform(computeWeatherWindFactor(level.weather, level.wind));
+  const worldMapContext = options?.worldMapContext;
+  const isWorldMapMode = worldMapContext?.mode === 'worldMap';
+  const isFreeform = Boolean(terrain.freeformWorld || worldMapContext?.worldMap);
+  const wmMode = worldMapContext?.mode ?? 'land';
+  const wmActiveCode = worldMapContext?.activeRegionCode ?? 0;
+  const wmRevision = worldMapContext?.worldMap?.revision ?? 0;
+  const regionPaletteSig = worldMapContext?.worldMap
+    ? worldMapContext.worldMap.regions.map((r) => `${r.code}:${r.colorHex}`).join('|')
+    : '';
 
   const renderSize = Math.min(312, terrain.size * 2);
   const renderWidth = renderSize + 1;
@@ -2405,7 +2460,12 @@ export function buildIslandMesh(
       s.revision === (terrain.revision ?? 0) &&
       s.size === terrain.size &&
       s.renderSize === renderSize &&
-      s.waterDepthTexSize === waterDepthTexSize
+      s.waterDepthTexSize === waterDepthTexSize &&
+      s.freeformWorld === isFreeform &&
+      s.worldMapMode === wmMode &&
+      s.worldMapActiveCode === wmActiveCode &&
+      s.worldMapRevision === wmRevision &&
+      s.regionPaletteSig === regionPaletteSig
   );
 
   const geo = new THREE.BufferGeometry();
@@ -2443,14 +2503,16 @@ export function buildIslandMesh(
       w0,
       w1,
       weather0,
-      weather1
+      weather1,
+      undefined,
+      worldMapContext
     );
 
     for (let row = 0; row < renderSize; row++) {
       for (let col = 0; col < renderSize; col++) {
         const vx = -worldRadius + (col + 0.5) * renderStep;
         const vz = -worldRadius + (row + 0.5) * renderStep;
-        if (Math.hypot(vx, vz) > IslandTerrain.shoreRadius) continue;
+        if (!isFreeform && Math.hypot(vx, vz) > IslandTerrain.shoreRadius) continue;
 
         const a = row * renderWidth + col;
         const b = a + 1;
@@ -2491,6 +2553,11 @@ export function buildIslandMesh(
       size: terrain.size,
       renderSize,
       waterDepthTexSize,
+      freeformWorld: isFreeform,
+      worldMapMode: wmMode,
+      worldMapActiveCode: wmActiveCode,
+      worldMapRevision: wmRevision,
+      regionPaletteSig,
       positions: positions.slice(),
       colors: colors.slice(),
       w0: w0.slice(),
@@ -2514,7 +2581,8 @@ export function buildIslandMesh(
     timeUniform,
     windUniform,
     terrain.mountainConfig,
-    terrain.dirtAndRoadConfig
+    terrain.dirtAndRoadConfig,
+    worldMapContext
   );
   const terrainMesh = new THREE.Mesh(geo, terrainMatBundle.material);
   terrainMesh.receiveShadow = true;
@@ -2522,19 +2590,21 @@ export function buildIslandMesh(
   terrainMesh.userData.isGround = true;
   islandGroup.add(terrainMesh);
 
-  // Island cliff underbelly
-  const bellyGeo = new THREE.ConeGeometry(IslandTerrain.shoreRadius * 0.94, 48, 36);
-  const bellyMat = enableDiffuseRoughnessEon(
-    new THREE.MeshStandardMaterial({
-      color: new THREE.Color(biome.detail).multiplyScalar(0.52),
-      roughness: 0.92,
-    }),
-    0.92
-  );
-  const belly = new THREE.Mesh(bellyGeo, bellyMat);
-  belly.rotation.x = Math.PI;
-  belly.position.y = -25.5;
-  islandGroup.add(belly);
+  if (!isFreeform) {
+    // Island cliff underbelly for classic circular island levels
+    const bellyGeo = new THREE.ConeGeometry(IslandTerrain.shoreRadius * 0.94, 48, 36);
+    const bellyMat = enableDiffuseRoughnessEon(
+      new THREE.MeshStandardMaterial({
+        color: new THREE.Color(biome.detail).multiplyScalar(0.52),
+        roughness: 0.92,
+      }),
+      0.92
+    );
+    const belly = new THREE.Mesh(bellyGeo, bellyMat);
+    belly.rotation.x = Math.PI;
+    belly.position.y = -25.5;
+    islandGroup.add(belly);
+  }
 
   // Animated Water Sea & River Plane with terrain-depth shoreline fade, organic foam & Fresnel sheen
   const atlas = getTerrainTextureAtlas();
@@ -2671,6 +2741,28 @@ export function buildIslandMesh(
   };
   islandGroup.add(water);
 
+  if (isWorldMapMode) {
+    applyBotwStyleToObject(islandGroup, style, { rimStrengthScale: 0.65, shadowLiftScale: 0.85 });
+    return {
+      group: islandGroup,
+      timeUniform,
+      windUniform,
+      customScatterGroups: new THREE.Group(),
+      torchLights: [],
+      flameMeshes: [],
+      choppableTrees: [],
+      harvestableScatter: [],
+      terrainMesh,
+      terrainRenderSize: renderSize,
+      waterDepthTex,
+      waterDepthTexData,
+      waterDepthTexSize,
+      updateMountainUniforms: (cfg) => terrainMatBundle.updateMountainUniforms(cfg),
+      updateDirtUniforms: (cfg) => terrainMatBundle.updateDirtUniforms(cfg),
+      updateWorldMapUniforms: (ctx) => terrainMatBundle.updateWorldMapUniforms(ctx),
+    };
+  }
+
   // Wooden Footbridge spanning the recessed river where the forest dirt trail crosses
   const bridgeGroup = new THREE.Group();
   bridgeGroup.position.set(RiverCrossing.x, RiverCrossing.deckY, RiverCrossing.z);
@@ -2733,7 +2825,9 @@ export function buildIslandMesh(
       bridgeGroup.add(post, piling);
     }
   }
-  islandGroup.add(bridgeGroup);
+  if (!isFreeform) {
+    islandGroup.add(bridgeGroup);
+  }
 
   // Per-Water-Body Selectable Lakes, Ponds, Rivers & Creeks
   const waterBodyGroupBundle = buildWaterBodiesGroup(
@@ -2788,6 +2882,7 @@ export function buildIslandMesh(
     updateDirtUniforms: (cfg) => terrainMatBundle.updateDirtUniforms(cfg),
     updateWaterBodiesUniforms: (bodies, selectedWaterBodyId) =>
       waterBodyGroupBundle.updateUniforms(bodies, selectedWaterBodyId),
+    updateWorldMapUniforms: (ctx) => terrainMatBundle.updateWorldMapUniforms(ctx),
   };
 
   const scatterPlan = createScatterBuildPlan(
@@ -2801,11 +2896,16 @@ export function buildIslandMesh(
     instancedGroup,
     customScatterGroups,
     choppableTrees,
-    harvestableScatter
+    harvestableScatter,
+    worldMapContext
   );
 
   const vistaPreset: VistaPresetId = level.vistaPreset ?? 'alpineValley';
   const hasVista = vistaPreset !== 'none' || (level.vistaItems?.length ?? 0) > 0;
+  const grassWorldMapCtx =
+    worldMapContext?.worldMap && worldMapContext.activeRegionCode
+      ? { worldMap: worldMapContext.worldMap, activeRegionCode: worldMapContext.activeRegionCode }
+      : undefined;
 
   if (!deferFoliage) {
     // Synchronous path (Play Mode, thumbnails, etc.)
@@ -2817,6 +2917,7 @@ export function buildIslandMesh(
       visualStyle: style,
       config: level.grass,
       isSoftwareGl,
+      worldMapCtx: grassWorldMapCtx,
     });
     applyBotwStyleToObject(grassSystem.group, style, { rimStrengthScale: 0.82, shadowLiftScale: 0.85 });
     grassContainer.add(grassSystem.group);
@@ -2937,11 +3038,13 @@ export function buildIslandMesh(
         timeUniform,
         windUniform,
         terrain.mountainConfig,
-        terrain.dirtAndRoadConfig
+        terrain.dirtAndRoadConfig,
+        worldMapContext
       );
       terrainMesh.material = refreshedBundle.material;
       handles.updateMountainUniforms = refreshedBundle.updateMountainUniforms;
       handles.updateDirtUniforms = refreshedBundle.updateDirtUniforms;
+      handles.updateWorldMapUniforms = refreshedBundle.updateWorldMapUniforms;
       if (Array.isArray(prevTerrainMat)) prevTerrainMat.forEach((m) => m.dispose());
       else prevTerrainMat.dispose();
       applyBotwStyleToObject(terrainMesh, style, { rimStrengthScale: 0.82, shadowLiftScale: 0.85 });
@@ -2975,6 +3078,7 @@ export function buildIslandMesh(
       visualStyle: style,
       config: level.grass,
       isSoftwareGl,
+      worldMapCtx: grassWorldMapCtx,
     });
     if (deferSignal?.aborted) {
       grassSystem.dispose();
@@ -3171,7 +3275,8 @@ function populateSubdividedTerrainAttributes(
   w1: Float32Array,
   weather0: Float32Array,
   weather1: Float32Array,
-  bounds?: { minRow: number; maxRow: number; minCol: number; maxCol: number }
+  bounds?: { minRow: number; maxRow: number; minCol: number; maxCol: number },
+  worldMapContext?: WorldMapRenderContext
 ) {
   const srcSize = terrain.size;
   const srcWidth = srcSize + 1;
@@ -3185,6 +3290,22 @@ function populateSubdividedTerrainAttributes(
   const hasWeathering =
     Boolean(terrain.weathering) && terrain.weathering!.length === srcWidth * srcWidth;
 
+  const wm = worldMapContext?.worldMap;
+  const isWorldMap = worldMapContext?.mode === 'worldMap' && Boolean(wm);
+  const activeRegionCode = worldMapContext?.activeRegionCode ?? 0;
+  const checkOtherLand =
+    worldMapContext?.mode === 'land' && Boolean(wm) && activeRegionCode > 0;
+
+  const oceanCol = new THREE.Color('#1B6B93');
+  const yellowTerrainCol = new THREE.Color(WORLD_TERRAIN_YELLOW);
+  const regionColMap = new Map<number, THREE.Color>();
+  if (wm) {
+    for (const r of wm.regions) {
+      regionColMap.set(r.code, new THREE.Color(r.colorHex));
+    }
+  }
+  const tmpWorldCol = new THREE.Color();
+
   // Separable 5-tap Gaussian weights [1, 4, 6, 4, 1] for buttery multi-material edge blending
   const gauss = [1, 4, 6, 4, 1];
   const acc = new Float32Array(7);
@@ -3197,7 +3318,15 @@ function populateSubdividedTerrainAttributes(
     for (let col = cStart; col <= cEnd; col++) {
       const vx = -worldRadius + col * renderStep;
       const idx = row * renderWidth + col;
-      const h = sampleTerrainHeight(terrain, vx, vz);
+      let h = sampleTerrainHeight(terrain, vx, vz);
+
+      let wmSample: { land: number; regionCode: number; isBorder: boolean } | null = null;
+      if (isWorldMap && wm) {
+        wmSample = sampleWorldMapAtWorld(wm, vx, vz);
+        h = wmSample.land === 1 ? (wmSample.isBorder ? 0.55 : IslandTerrain.baseTop) : IslandTerrain.seaFloor;
+      } else if (checkOtherLand && wm) {
+        wmSample = sampleWorldMapAtWorld(wm, vx, vz);
+      }
 
       positions[idx * 3] = vx;
       positions[idx * 3 + 1] = h;
@@ -3267,10 +3396,30 @@ function populateSubdividedTerrainAttributes(
         w1[idx * 3 + 2] = acc[6] * inv; // worn dirt trail
       }
 
-      const shade = THREE.MathUtils.clamp(0.92 + h * 0.017, 0.82, 1.14);
-      colors[idx * 3] = shade;
-      colors[idx * 3 + 1] = shade;
-      colors[idx * 3 + 2] = shade;
+      if (isWorldMap && wmSample) {
+        if (wmSample.land === 0) {
+          tmpWorldCol.copy(oceanCol);
+        } else {
+          const regCol = wmSample.regionCode > 0 ? regionColMap.get(wmSample.regionCode) : undefined;
+          tmpWorldCol.copy(regCol ?? yellowTerrainCol);
+          if (wmSample.isBorder) {
+            tmpWorldCol.multiplyScalar(0.74);
+          }
+        }
+        colors[idx * 3] = tmpWorldCol.r;
+        colors[idx * 3 + 1] = tmpWorldCol.g;
+        colors[idx * 3 + 2] = tmpWorldCol.b;
+      } else if (checkOtherLand && wmSample) {
+        const isOther = wmSample.land === 1 && wmSample.regionCode !== activeRegionCode ? 1.0 : 0.0;
+        colors[idx * 3] = isOther;
+        colors[idx * 3 + 1] = isOther;
+        colors[idx * 3 + 2] = isOther;
+      } else {
+        const shade = THREE.MathUtils.clamp(0.92 + h * 0.017, 0.82, 1.14);
+        colors[idx * 3] = shade;
+        colors[idx * 3 + 1] = shade;
+        colors[idx * 3 + 2] = shade;
+      }
 
       if (hasWeathering) {
         const ws = sampleTerrainWeathering(terrain, vx, vz);
@@ -3297,7 +3446,8 @@ function populateSubdividedTerrainAttributes(
 export function updateIslandTerrainGeometryInPlace(
   handles: IslandSceneHandles | null | undefined,
   rawTerrain: TerrainData | undefined,
-  brushArea?: { x: number; z: number; radius: number }
+  brushArea?: { x: number; z: number; radius: number },
+  worldMapContext?: WorldMapRenderContext
 ): boolean {
   if (!handles?.terrainMesh || !handles.terrainRenderSize || !rawTerrain) return false;
   const terrain = ensureUpgradedTerrain(rawTerrain);
@@ -3332,7 +3482,8 @@ export function updateIslandTerrainGeometryInPlace(
     w1Attr.array as Float32Array,
     weather0Attr.array as Float32Array,
     weather1Attr.array as Float32Array,
-    bounds
+    bounds,
+    worldMapContext
   );
   posAttr.needsUpdate = true;
   colAttr.needsUpdate = true;
@@ -3342,7 +3493,24 @@ export function updateIslandTerrainGeometryInPlace(
   weather1Attr.needsUpdate = true;
   geo.computeVertexNormals();
   geo.computeBoundingSphere();
-  handles.grassSystem?.updateTerrainData(terrain, brushArea);
+  handles.updateWorldMapUniforms?.(worldMapContext);
+  if (worldMapContext?.mode === 'worldMap' && worldMapContext.worldMap) {
+    if (handles.waterDepthTex && handles.waterDepthTexData && handles.waterDepthTexSize) {
+      populateWaterDepthFromPositions(
+        posAttr.array as Float32Array,
+        renderSize,
+        handles.waterDepthTexData,
+        handles.waterDepthTexSize
+      );
+      handles.waterDepthTex.needsUpdate = true;
+    }
+    return true;
+  }
+  const grassWmCtx =
+    worldMapContext?.worldMap && worldMapContext.activeRegionCode
+      ? { worldMap: worldMapContext.worldMap, activeRegionCode: worldMapContext.activeRegionCode }
+      : undefined;
+  handles.grassSystem?.updateTerrainData(terrain, brushArea, grassWmCtx);
   if (handles.waterDepthTex && handles.waterDepthTexData && handles.waterDepthTexSize) {
     populateWaterDepthTexture(
       terrain,
@@ -4514,7 +4682,8 @@ function createScatterBuildPlan(
   instancedGroup: THREE.Group,
   _customScatterGroups: THREE.Group,
   choppableTrees: ChoppableTreeHandle[],
-  harvestableScatter: HarvestableScatterHandle[]
+  harvestableScatter: HarvestableScatterHandle[],
+  worldMapContext?: WorldMapRenderContext
 ) {
   const biome = getBiome(level.biome);
   const atlas = getTerrainTextureAtlas();
@@ -4566,7 +4735,18 @@ function createScatterBuildPlan(
     : null;
   const birchProfile = canopyCfg ? resolveSpeciesConfig(canopyCfg, 'birch') : null;
 
+  const filterOtherLand =
+    worldMapContext?.mode === 'land' &&
+    Boolean(worldMapContext.worldMap) &&
+    (worldMapContext.activeRegionCode ?? 0) > 0;
+
   for (const item of scatter) {
+    if (filterOtherLand && worldMapContext?.worldMap) {
+      const wmSample = sampleWorldMapAtWorld(worldMapContext.worldMap, item.x, item.z);
+      if (wmSample.land === 1 && wmSample.regionCode !== worldMapContext.activeRegionCode) {
+        continue;
+      }
+    }
     const { y } = groundAt(item.x, item.z);
     const minY =
       item.kind === 'reed' || item.kind === 'cattail' || item.kind === 'rock'

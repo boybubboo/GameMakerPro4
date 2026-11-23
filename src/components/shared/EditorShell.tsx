@@ -6,6 +6,7 @@ import {
   Clapperboard,
   CloudSun,
   FileArchive,
+  Globe,
   Layers,
   Lightbulb,
   Map as MapIcon,
@@ -27,6 +28,8 @@ import {
 } from 'lucide-react';
 import type { MakerStore } from '../../store/useMakerStore';
 import type { StageTab } from '../../types/maker';
+import { getEnvironmentType } from '../../utils/terrain';
+import { WORLD_TERRAIN_YELLOW } from '../../utils/worldMap';
 import { PlayModeView } from '../play/PlayModeView';
 import { ActionsStage } from '../stages/ActionsStage';
 import { CastStage } from '../stages/CastStage';
@@ -197,58 +200,126 @@ export const EditorShell: React.FC<{ store: MakerStore }> = ({ store }) => {
             </div>
 
             {/* Level Switcher */}
-            <div className="relative">
-              <button
-                type="button"
-                onClick={() => {
-                  setLevelMenuOpen((v) => !v);
-                  setCreateMenuOpen(false);
-                }}
-                className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-xl bg-slate-100 dark:bg-[#1F2430] hover:bg-slate-200 dark:hover:bg-[#272D3C] text-xs font-bold whitespace-nowrap"
-              >
-                <MapIcon size={12} className="text-[#7C5CFF]" />
-                <span className="max-w-[92px] truncate">{currentLevel?.name ?? 'Level'}</span>
-                <ChevronDown size={11} />
-              </button>
+            {(() => {
+              const hasOpenWorld = currentProject.levels.some(
+                (l) => getEnvironmentType(l) === 'openWorld'
+              );
+              const isWmActive = hasOpenWorld && store.worldEditorScope === 'worldMap';
+              const wmRegions = store.resolvedWorldMap?.regions ?? [];
+              const activeRegion = currentLevel
+                ? wmRegions.find((r) => r.levelId === currentLevel.id)
+                : undefined;
 
-              {levelMenuOpen && (
-                <>
-                  <div
-                    className="fixed inset-0 z-20"
-                    onClick={() => setLevelMenuOpen(false)}
-                  />
-                  <div className="absolute left-0 mt-2 w-56 rounded-2xl bg-white dark:bg-[#171A23] shadow-xl border border-slate-200/80 dark:border-white/[0.1] py-1.5 z-30">
-                    {currentProject.levels.map((lvl, idx) => (
-                      <button
-                        key={lvl.id}
-                        type="button"
-                        onClick={() => {
-                          store.setSelectedLevelID(lvl.id);
-                          store.setSelectedEntityID(lvl.entities[0]?.id ?? null);
-                          setLevelMenuOpen(false);
-                        }}
-                        className={`w-full flex items-center gap-2 px-3.5 py-2 text-left text-xs font-semibold hover:bg-slate-100 dark:hover:bg-[#1F2430] ${
-                          lvl.id === currentLevel?.id ? 'text-[#7C5CFF] font-bold' : ''
-                        }`}
-                      >
-                        <span className="w-4 text-[11px] text-slate-400 tabular-nums">
-                          {idx + 1}.
-                        </span>
-                        <span className="truncate flex-1">{lvl.name}</span>
-                      </button>
-                    ))}
-                    <div className="my-1 border-t border-slate-200/70 dark:border-white/[0.08]" />
-                    <button
-                      type="button"
-                      onClick={() => {
-                        store.addLevel();
-                        setLevelMenuOpen(false);
-                      }}
-                      className="w-full flex items-center gap-2 px-3.5 py-2 text-left text-xs font-bold text-[#7C5CFF] hover:bg-[#7C5CFF]/10"
-                    >
-                      <Plus size={13} />
-                      <span>Add a level</span>
-                    </button>
+              return (
+                <div className="relative">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setLevelMenuOpen((v) => !v);
+                      setCreateMenuOpen(false);
+                    }}
+                    className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-xl bg-slate-100 dark:bg-[#1F2430] hover:bg-slate-200 dark:hover:bg-[#272D3C] text-xs font-bold whitespace-nowrap"
+                  >
+                    {isWmActive ? (
+                      <Globe size={12} style={{ color: WORLD_TERRAIN_YELLOW }} />
+                    ) : activeRegion ? (
+                      <span
+                        className="w-2.5 h-2.5 rounded-sm border border-black/20 shrink-0"
+                        style={{ backgroundColor: activeRegion.colorHex }}
+                      />
+                    ) : (
+                      <MapIcon size={12} className="text-[#7C5CFF]" />
+                    )}
+                    <span className="max-w-[100px] truncate">
+                      {isWmActive ? 'World Map' : currentLevel?.name ?? 'Level'}
+                    </span>
+                    <ChevronDown size={11} />
+                  </button>
+
+                  {levelMenuOpen && (
+                    <>
+                      <div
+                        className="fixed inset-0 z-20"
+                        onClick={() => setLevelMenuOpen(false)}
+                      />
+                      <div className="absolute left-0 mt-2 w-56 rounded-2xl bg-white dark:bg-[#171A23] shadow-xl border border-slate-200/80 dark:border-white/[0.1] py-1.5 z-30">
+                        {hasOpenWorld && (
+                          <>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                store.enterWorldEditorScope('worldMap');
+                                setLevelMenuOpen(false);
+                              }}
+                              className={`w-full flex items-center gap-2 px-3.5 py-2 text-left text-xs font-extrabold hover:bg-slate-100 dark:hover:bg-[#1F2430] ${
+                                isWmActive ? 'text-[#7C5CFF]' : ''
+                              }`}
+                            >
+                              <Globe size={12} style={{ color: WORLD_TERRAIN_YELLOW }} />
+                              <span className="truncate flex-1">World Map (Overview)</span>
+                            </button>
+                            <div className="my-1 border-t border-slate-200/70 dark:border-white/[0.08]" />
+                          </>
+                        )}
+                        {currentProject.levels
+                          .filter((lvl) => {
+                            if (!hasOpenWorld) return true;
+                            if (
+                              wmRegions.length === 0 &&
+                              getEnvironmentType(lvl) === 'openWorld' &&
+                              lvl.entities.length === 0 &&
+                              (lvl.terrain?.scatter.length ?? 0) === 0
+                            ) {
+                              return false;
+                            }
+                            return true;
+                          })
+                          .map((lvl, idx) => {
+                            const reg = wmRegions.find((r) => r.levelId === lvl.id);
+                            const active = !isWmActive && lvl.id === currentLevel?.id;
+                            return (
+                              <button
+                                key={lvl.id}
+                                type="button"
+                                onClick={() => {
+                                  store.enterWorldEditorScope(lvl.id);
+                                  setLevelMenuOpen(false);
+                                }}
+                                className={`w-full flex items-center gap-2 px-3.5 py-2 text-left text-xs font-semibold hover:bg-slate-100 dark:hover:bg-[#1F2430] ${
+                                  active ? 'text-[#7C5CFF] font-bold' : ''
+                                }`}
+                              >
+                                {reg ? (
+                                  <span
+                                    className="w-2.5 h-2.5 rounded-sm border border-black/20 shrink-0"
+                                    style={{ backgroundColor: reg.colorHex }}
+                                  />
+                                ) : (
+                                  <span className="w-4 text-[11px] text-slate-400 tabular-nums">
+                                    {idx + 1}.
+                                  </span>
+                                )}
+                                <span className="truncate flex-1">{reg?.name ?? lvl.name}</span>
+                              </button>
+                            );
+                          })}
+                        <div className="my-1 border-t border-slate-200/70 dark:border-white/[0.08]" />
+                        <button
+                          type="button"
+                          onClick={() => {
+                            if (hasOpenWorld) {
+                              const created = store.addWorldLandRegion();
+                              if (created) store.enterWorldEditorScope(created.levelId);
+                            } else {
+                              store.addLevel();
+                            }
+                            setLevelMenuOpen(false);
+                          }}
+                          className="w-full flex items-center gap-2 px-3.5 py-2 text-left text-xs font-bold text-[#7C5CFF] hover:bg-[#7C5CFF]/10"
+                        >
+                          <Plus size={13} />
+                          <span>{hasOpenWorld ? 'Add a Land / Level' : 'Add a level'}</span>
+                        </button>
                     {currentProject.levels.length > 1 && (
                       <button
                         type="button"
@@ -262,10 +333,12 @@ export const EditorShell: React.FC<{ store: MakerStore }> = ({ store }) => {
                         <span>Delete current level</span>
                       </button>
                     )}
-                  </div>
-                </>
-              )}
-            </div>
+                      </div>
+                    </>
+                  )}
+                </div>
+              );
+            })()}
           </div>
 
           {/* Center: Inline Stage Tabs */}

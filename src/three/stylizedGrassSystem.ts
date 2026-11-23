@@ -42,6 +42,7 @@ import type {
   GrassQuality,
   TerrainData,
   VisualStyleId,
+  WorldMapData,
 } from '../types/maker';
 import {
   type BotwFogUniformBundle,
@@ -49,6 +50,7 @@ import {
   getSharedBotwUniforms,
 } from './botwStyleUtils';
 import { ensureUpgradedTerrain, IslandTerrain, sampleTerrainHeight } from '../utils/terrain';
+import { sampleWorldMapAtWorld } from '../utils/worldMap';
 
 export function createDefaultGrassConfig(): GrassFieldConfig {
   return {
@@ -308,6 +310,11 @@ function buildChunkInstancedGeometry(
   return { geometry: instGeo, instanceCount: totalInstances };
 }
 
+export interface GrassWorldMapMaskContext {
+  worldMap?: WorldMapData;
+  activeRegionCode?: number;
+}
+
 /**
  * Packs terrain height (R), feathered grass mask (G), surface slope normal (B=nx, A=nz),
  * AND ground paint tint color map (`groundColorData`, RGBA8) for terrain-matched meadow coloring.
@@ -319,7 +326,8 @@ function populateTerrainAndColorTextures(
   densityBias: number,
   biomeGroundHex: string,
   biomeDetailHex: string,
-  bounds?: { minRow: number; maxRow: number; minCol: number; maxCol: number }
+  bounds?: { minRow: number; maxRow: number; minCol: number; maxCol: number },
+  worldMapCtx?: GrassWorldMapMaskContext
 ): void {
   const size = terrain.size;
   const width = size + 1;
@@ -448,6 +456,13 @@ function populateTerrainAndColorTextures(
       const edgeDist = Math.max(Math.abs(wx), Math.abs(wz));
       const insideIsland = 1.0 - THREE.MathUtils.smoothstep(edgeDist, worldRadius - 6.0, worldRadius - 1.2);
       mask *= insideIsland * densityBias;
+
+      if (worldMapCtx?.worldMap && worldMapCtx.activeRegionCode && worldMapCtx.activeRegionCode > 0) {
+        const wm = sampleWorldMapAtWorld(worldMapCtx.worldMap, wx, wz);
+        if (wm.land === 1 && wm.regionCode !== worldMapCtx.activeRegionCode) {
+          mask = 0;
+        }
+      }
 
       const o = idx * 4;
       texData[o] = h;
@@ -1181,6 +1196,8 @@ interface BakedGrassMapSnapshot {
   biomeGroundHex: string;
   biomeDetailHex: string;
   maxBladeHeightMilli: number;
+  worldMapRevision: number;
+  activeRegionCode: number;
   terrainTexData: Float32Array;
   terrainTexHalfData: Uint16Array;
   groundColorData: Uint8Array;
@@ -1260,6 +1277,8 @@ export class StylizedGrassSystem {
   private readonly _sunDir = new THREE.Vector3();
   private readonly _tileBox = new THREE.Box3();
 
+  private worldMapCtx?: GrassWorldMapMaskContext;
+
   constructor(opts: {
     terrain: TerrainData;
     biome: BiomeId;
@@ -1268,10 +1287,12 @@ export class StylizedGrassSystem {
     visualStyle: VisualStyleId;
     config?: Partial<GrassFieldConfig>;
     isSoftwareGl?: boolean;
+    worldMapCtx?: GrassWorldMapMaskContext;
   }) {
     this.group = new THREE.Group();
     this.group.name = 'StylizedGrassSystem';
     this.group.userData.disposeExtra = () => this.dispose();
+    this.worldMapCtx = opts.worldMapCtx;
 
     const resolved = resolveGrassConfig(opts.config);
     if (opts.isSoftwareGl && resolved.quality !== 'off') {
@@ -1298,6 +1319,9 @@ export class StylizedGrassSystem {
     this.worldGridCols = halfSpanChunks * 2;
     const totalWorldCells = this.worldGridCols * this.worldGridCols;
 
+    const wmRev = opts.worldMapCtx?.worldMap?.revision ?? 0;
+    const wmCode = opts.worldMapCtx?.activeRegionCode ?? 0;
+
     const cacheIdx = bakedGrassMapCache.findIndex(
       (c) =>
         c.heightsRef === upgraded.heights &&
@@ -1307,7 +1331,9 @@ export class StylizedGrassSystem {
         c.biome === opts.biome &&
         c.biomeGroundHex === this.biomeGroundHex &&
         c.biomeDetailHex === this.biomeDetailHex &&
-        c.maxBladeHeightMilli === maxBladeHeightMilli
+        c.maxBladeHeightMilli === maxBladeHeightMilli &&
+        c.worldMapRevision === wmRev &&
+        c.activeRegionCode === wmCode
     );
 
     if (cacheIdx >= 0) {
@@ -1332,7 +1358,9 @@ export class StylizedGrassSystem {
         this.groundColorData,
         this.densityBias,
         this.biomeGroundHex,
-        this.biomeDetailHex
+        this.biomeDetailHex,
+        undefined,
+        this.worldMapCtx
       );
       packTerrainHalfFloat(this.terrainTexData, this.terrainTexHalfData, this.terrainTexSize);
 
@@ -1350,6 +1378,8 @@ export class StylizedGrassSystem {
         biomeGroundHex: this.biomeGroundHex,
         biomeDetailHex: this.biomeDetailHex,
         maxBladeHeightMilli,
+        worldMapRevision: wmRev,
+        activeRegionCode: wmCode,
         terrainTexData: this.terrainTexData,
         terrainTexHalfData: this.terrainTexHalfData,
         groundColorData: this.groundColorData,
@@ -1661,8 +1691,12 @@ export class StylizedGrassSystem {
 
   public updateTerrainData(
     rawTerrain: TerrainData,
-    brushArea?: { x: number; z: number; radius: number }
+    brushArea?: { x: number; z: number; radius: number },
+    worldMapCtx?: GrassWorldMapMaskContext
   ): void {
+    if (worldMapCtx) {
+      this.worldMapCtx = worldMapCtx;
+    }
     const terrain = ensureUpgradedTerrain(rawTerrain);
     if (terrain.size + 1 !== this.terrainTexSize) return;
 
@@ -1698,7 +1732,8 @@ export class StylizedGrassSystem {
       this.densityBias,
       this.biomeGroundHex,
       this.biomeDetailHex,
-      bounds
+      bounds,
+      this.worldMapCtx
     );
     packTerrainHalfFloat(this.terrainTexData, this.terrainTexHalfData, this.terrainTexSize, bounds);
     this.terrainTex.needsUpdate = true;

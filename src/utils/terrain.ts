@@ -1826,7 +1826,7 @@ export function ensureUpgradedTerrain(terrain: TerrainData | undefined): Terrain
   if (
     terrain.size === IslandTerrain.gridSize &&
     terrain.heights.length === (terrain.size + 1) * (terrain.size + 1) &&
-    hasForestEcosystem
+    (terrain.freeformWorld || hasForestEcosystem)
   ) {
     if (
       terrain.mountainConfig &&
@@ -1865,7 +1865,13 @@ export function ensureUpgradedTerrain(terrain: TerrainData | undefined): Terrain
 
 export function sampleTerrainHeight(terrain: TerrainData | undefined, x: number, z: number): number {
   const dist = Math.hypot(x, z);
-  if (dist > IslandTerrain.shoreRadius) return IslandTerrain.seaFloor;
+  if (!terrain?.freeformWorld && dist > IslandTerrain.shoreRadius) return IslandTerrain.seaFloor;
+  if (
+    terrain?.freeformWorld &&
+    (Math.abs(x) > IslandTerrain.radius || Math.abs(z) > IslandTerrain.radius)
+  ) {
+    return IslandTerrain.seaFloor;
+  }
   if (
     !terrain ||
     terrain.size !== IslandTerrain.gridSize ||
@@ -2071,6 +2077,38 @@ export function applyTerrainBrush(
   const maxCol = Math.min(size, Math.ceil(((x + radius + worldRadius) / (2 * worldRadius)) * size) + 1);
   const minRow = Math.max(0, Math.floor(((z - radius + worldRadius) / (2 * worldRadius)) * size) - 1);
   const maxRow = Math.min(size, Math.ceil(((z + radius + worldRadius) / (2 * worldRadius)) * size) + 1);
+
+  if (brush === 'terrain') {
+    const updatedHeights = [...terrain.heights];
+    const updatedLayers = [...terrain.layers];
+    for (let row = minRow; row <= maxRow; row++) {
+      for (let col = minCol; col <= maxCol; col++) {
+        const vx = -worldRadius + col * step;
+        const vz = -worldRadius + row * step;
+        const d = Math.hypot(vx - x, vz - z);
+        if (d > radius) continue;
+        const idx = row * width + col;
+        const targetY = IslandTerrain.baseTop;
+        if (updatedHeights[idx] < targetY) {
+          const edgeT = Math.max(0, Math.min(1, 1 - d / Math.max(0.001, radius)));
+          updatedHeights[idx] =
+            edgeT > 0.38 ? targetY : Math.max(updatedHeights[idx], 0.35 + edgeT * 0.9);
+        }
+        if (updatedHeights[idx] < 0.7 && d > radius * 0.72) {
+          updatedLayers[idx] = 1;
+        } else if (updatedLayers[idx] === 1 && updatedHeights[idx] >= 0.65) {
+          updatedLayers[idx] = 0;
+        }
+      }
+    }
+    return {
+      ...terrain,
+      freeformWorld: true,
+      heights: updatedHeights,
+      layers: updatedLayers,
+      revision: terrain.revision + 1,
+    };
+  }
 
   if (brush === 'paintGrassErase') {
     const updatedLayers = [...terrain.layers];
@@ -2355,7 +2393,13 @@ export function applyTerrainBrush(
     const dist = kind === 'custom' ? Math.random() * Math.min(1.5, radius * 0.35) : Math.random() * radius;
     const sx = x + Math.cos(angle) * dist;
     const sz = z + Math.sin(angle) * dist;
-    if (Math.hypot(sx, sz) >= IslandTerrain.radius * 0.94) continue;
+    if (
+      terrain.freeformWorld
+        ? Math.abs(sx) >= IslandTerrain.radius * 0.96 || Math.abs(sz) >= IslandTerrain.radius * 0.96
+        : Math.hypot(sx, sz) >= IslandTerrain.radius * 0.94
+    ) {
+      continue;
+    }
     const spacing = kind === 'flower' ? 0.85 : kind === 'custom' ? 2.0 : 1.7;
     const tooClose = nextScatter.some((item) => Math.hypot(item.x - sx, item.z - sz) < spacing);
     if (tooClose) continue;
@@ -3093,6 +3137,7 @@ export function applyRoadSplineToTerrain(
 }
 
 export type Overview2DBrushId =
+  | 'terrain'
   | 'coniferWoods'
   | 'deciduousWoods'
   | 'bushes'
@@ -3121,10 +3166,39 @@ export function apply2DOverviewBrushStroke(
   const worldRadius = IslandTerrain.radius;
   const step = (2 * worldRadius) / size;
   const r = Math.max(2, radius);
-  const minCol = Math.max(0, Math.floor(((x - r + worldRadius) / (2 * worldRadius)) * size) - 1);
-  const maxCol = Math.min(size, Math.ceil(((x + r + worldRadius) / (2 * worldRadius)) * size) + 1);
-  const minRow = Math.max(0, Math.floor(((z - r + worldRadius) / (2 * worldRadius)) * size) - 1);
-  const maxRow = Math.min(size, Math.ceil(((z + r + worldRadius) / (2 * worldRadius)) * size) + 1);
+  const minCol = Math.max(1, Math.floor(((x - r + worldRadius) / (2 * worldRadius)) * size) - 1);
+  const maxCol = Math.min(size - 1, Math.ceil(((x + r + worldRadius) / (2 * worldRadius)) * size) + 1);
+  const minRow = Math.max(1, Math.floor(((z - r + worldRadius) / (2 * worldRadius)) * size) - 1);
+  const maxRow = Math.min(size - 1, Math.ceil(((z + r + worldRadius) / (2 * worldRadius)) * size) + 1);
+
+  if (brushId === 'terrain') {
+    const nextHeights = [...terrain.heights];
+    const nextLayers = [...terrain.layers];
+    for (let row = minRow; row <= maxRow; row++) {
+      for (let col = minCol; col <= maxCol; col++) {
+        const vx = -worldRadius + col * step;
+        const vz = -worldRadius + row * step;
+        const d = Math.hypot(vx - x, vz - z);
+        if (d > r) continue;
+        const idx = row * width + col;
+        const soft = quinticSmooth(1 - d / r);
+        const targetH = IslandTerrain.baseTop;
+        if (nextHeights[idx] < targetH) {
+          nextHeights[idx] = nextHeights[idx] + (targetH - nextHeights[idx]) * Math.min(1, soft * 0.92 + 0.12);
+        }
+        if (soft > 0.2 && nextHeights[idx] <= IslandTerrain.baseTop + 0.6) {
+          nextLayers[idx] = 1; // warm yellow sand/terrain surface
+        }
+      }
+    }
+    return {
+      ...terrain,
+      heights: nextHeights,
+      layers: nextLayers,
+      freeformWorld: true,
+      revision: terrain.revision + 1,
+    };
+  }
 
   if (brushId === 'hills') {
     return applyTerrainBrush(terrain, 'raiseGround', x, z, r, undefined, {
@@ -3301,7 +3375,13 @@ export function apply2DOverviewBrushStroke(
     const dist = Math.sqrt(Math.random()) * r;
     const sx = x + Math.cos(ang) * dist;
     const sz = z + Math.sin(ang) * dist;
-    if (Math.hypot(sx, sz) >= IslandTerrain.radius * 0.94) continue;
+    if (
+      terrain.freeformWorld
+        ? Math.abs(sx) >= IslandTerrain.radius * 0.96 || Math.abs(sz) >= IslandTerrain.radius * 0.96
+        : Math.hypot(sx, sz) >= IslandTerrain.radius * 0.94
+    ) {
+      continue;
+    }
     if (nextScatter.some((item) => Math.hypot(item.x - sx, item.z - sz) < minSpacing)) continue;
     let kind: ScatterItem['kind'] = 'oak';
     if (brushId === 'coniferWoods') kind = 'pine';

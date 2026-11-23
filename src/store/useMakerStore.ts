@@ -84,8 +84,22 @@ import type {
   WaterBodyKind,
   WidgetKind,
   WorldDomainId,
+  WorldEditorScope,
+  WorldLandRegion,
+  WorldMapData,
   WorldViewMode,
 } from '../types/maker';
+import {
+  applyWorldMapStroke,
+  createEmptyWorldMap,
+  createLandLevelFromTemplate,
+  createScratchOceanTerrain,
+  ensureWorldMapForProject,
+  findNextRegionCode,
+  pickNextRegionColor,
+  syncLevelTerrainWithWorldMap,
+  type WorldMapBrushMode,
+} from '../utils/worldMap';
 import {
   BUILDING_SHAPES,
   DEFAULT_DOOR_CONFIG,
@@ -459,7 +473,11 @@ export function useMakerStore() {
 
   const [worldTool, setWorldTool] = useState<ViewportTool>('move');
   const [worldGridSnap, setWorldGridSnap] = useState<0 | 0.5 | 1 | 2>(1);
-  const [worldViewMode, setWorldViewMode] = useState<WorldViewMode>('3d');
+  const [worldViewMode, setWorldViewMode] = useState<WorldViewMode>('2d');
+  const [worldEditorScope, setWorldEditorScope] = useState<WorldEditorScope>('worldMap');
+  const [selectedWorldLandCode, setSelectedWorldLandCode] = useState<number | null>(null);
+  const [worldMapBrushMode, setWorldMapBrushMode] = useState<WorldMapBrushMode>('terrain');
+  const [worldMapAutoLand, setWorldMapAutoLand] = useState<boolean>(false);
   const [activeWorldDomain, setActiveWorldDomain] = useState<WorldDomainId>('select');
   const [cameraAngleLocked, setCameraAngleLocked] = useState(false);
   const [cameraFocusRequest, setCameraFocusRequest] = useState<{
@@ -885,6 +903,16 @@ export function useMakerStore() {
     return currentProject.hud.widgets.find((w) => w.id === selectedWidgetID) ?? null;
   }, [currentProject, selectedWidgetID]);
 
+  const resolvedWorldMap = useMemo<WorldMapData | undefined>(() => {
+    if (!currentProject) return undefined;
+    return currentProject.worldMap ?? ensureWorldMapForProject(currentProject);
+  }, [currentProject]);
+
+  const activeWorldRegionCode = useMemo<number | undefined>(() => {
+    if (worldEditorScope === 'worldMap' || !resolvedWorldMap || !currentLevel) return undefined;
+    return resolvedWorldMap.regions.find((r) => r.levelId === currentLevel.id)?.code;
+  }, [worldEditorScope, resolvedWorldMap, currentLevel]);
+
   const commit = useCallback(
     (label: string, mutator: (prev: GameProject[]) => GameProject[], recordUndo = true) => {
       setProjects((prev) => {
@@ -932,9 +960,15 @@ export function useMakerStore() {
       if (!target) return;
       setCurrentProjectID(id);
       const firstLevel = target.levels[0] ?? null;
+      const firstEnv = firstLevel ? getEnvironmentType(firstLevel) : 'openWorld';
       setSelectedLevelID(firstLevel?.id ?? null);
       setSelectedEntityID(firstLevel?.entities[0]?.id ?? null);
       setSelectedWidgetID(target.hud.widgets[0]?.id ?? null);
+      setWorldViewMode(firstEnv === 'openWorld' ? '2d' : '3d');
+      setWorldEditorScope(firstEnv === 'openWorld' ? 'worldMap' : firstLevel?.id ?? 'worldMap');
+      setSelectedWorldLandCode(null);
+      setWorldMapBrushMode('terrain');
+      setActiveWorldDomain('select');
       setPlayerTelemetry(null);
       setSelectedTab('world');
       setPast([]);
@@ -957,9 +991,15 @@ export function useMakerStore() {
     setProjects((prev) => [next, ...prev]);
     setCurrentProjectID(next.id);
     const firstLevel = next.levels[0] ?? null;
+    const firstEnv = firstLevel ? getEnvironmentType(firstLevel) : 'openWorld';
     setSelectedLevelID(firstLevel?.id ?? null);
     setSelectedEntityID(firstLevel?.entities[0]?.id ?? null);
     setSelectedWidgetID(next.hud.widgets[0]?.id ?? null);
+    setWorldViewMode(firstEnv === 'openWorld' ? '2d' : '3d');
+    setWorldEditorScope(firstEnv === 'openWorld' ? 'worldMap' : firstLevel?.id ?? 'worldMap');
+    setSelectedWorldLandCode(null);
+    setWorldMapBrushMode('terrain');
+    setActiveWorldDomain('select');
     setPlayFromPoint(null);
     setPlayerTelemetry(null);
     setSelectedTab('world');
@@ -1060,6 +1100,30 @@ export function useMakerStore() {
       customAssetId?: string,
       options?: TerrainBrushOptions
     ) => {
+      if (brush === 'terrain' && currentProject && currentLevel) {
+        updateProject(
+          'paint terrain landmass',
+          (proj) => {
+            const wm = proj.worldMap ?? ensureWorldMapForProject(proj);
+            const region = wm.regions.find((r) => r.levelId === currentLevel.id);
+            const nextWm = applyWorldMapStroke(wm, 'terrain', x, z, radius, region?.code);
+            return {
+              ...proj,
+              worldMap: nextWm,
+              levels: proj.levels.map((lvl) => {
+                if (lvl.id !== currentLevel.id) return lvl;
+                const base = lvl.terrain ?? createInitialTerrain();
+                return {
+                  ...lvl,
+                  terrain: applyTerrainBrush(base, 'terrain', x, z, radius, customAssetId, options),
+                };
+              }),
+            };
+          },
+          recordUndo
+        );
+        return;
+      }
       updateLevel(
         'sculpt terrain',
         (lvl) => {
@@ -1072,7 +1136,7 @@ export function useMakerStore() {
         recordUndo
       );
     },
-    [updateLevel]
+    [currentLevel, currentProject, updateLevel, updateProject]
   );
 
   const resetTerrain = useCallback(() => {
@@ -1267,6 +1331,38 @@ export function useMakerStore() {
       isStrokeStart = false,
       recordUndo = false
     ) => {
+      if (brushId === 'terrain' && currentProject && currentLevel) {
+        updateProject(
+          '2D paint terrain',
+          (proj) => {
+            const wm = proj.worldMap ?? ensureWorldMapForProject(proj);
+            const region = wm.regions.find((r) => r.levelId === currentLevel.id);
+            const nextWm = applyWorldMapStroke(wm, 'terrain', worldX, worldZ, radius, region?.code);
+            return {
+              ...proj,
+              worldMap: nextWm,
+              levels: proj.levels.map((lvl) => {
+                if (lvl.id !== currentLevel.id) return lvl;
+                const base = lvl.terrain ?? createInitialTerrain();
+                return {
+                  ...lvl,
+                  terrain: apply2DOverviewBrushStroke(
+                    base,
+                    brushId,
+                    worldX,
+                    worldZ,
+                    radius,
+                    density,
+                    isStrokeStart
+                  ),
+                };
+              }),
+            };
+          },
+          recordUndo
+        );
+        return;
+      }
       updateLevel(
         `2D paint ${brushId}`,
         (lvl) => {
@@ -1287,7 +1383,320 @@ export function useMakerStore() {
         recordUndo
       );
     },
-    [updateLevel]
+    [currentLevel, currentProject, updateLevel, updateProject]
+  );
+
+  const ensureProjectWorldMap = useCallback((): WorldMapData | null => {
+    if (!currentProject) return null;
+    if (currentProject.worldMap) return currentProject.worldMap;
+    const wm = ensureWorldMapForProject(currentProject);
+    updateProject(
+      'init world map',
+      (proj) => (proj.worldMap ? proj : { ...proj, worldMap: wm }),
+      false
+    );
+    return wm;
+  }, [currentProject, updateProject]);
+
+  const addWorldLandRegion = useCallback(
+    (customName?: string, customColorHex?: string): WorldLandRegion | null => {
+      if (!currentProject) return null;
+      const baseWm = currentProject.worldMap ?? ensureWorldMapForProject(currentProject);
+      const nextCode = findNextRegionCode(baseWm.regions);
+      const colorHex = customColorHex ?? pickNextRegionColor(baseWm.regions);
+      const name = (customName ?? `Land ${baseWm.regions.length + 1}`).trim() || `Land ${baseWm.regions.length + 1}`;
+
+      // Reuse a clean blank openWorld starter level if there are no regions yet
+      const firstOpenLvl = currentProject.levels.find(
+        (l) => (!l.environmentType || l.environmentType === 'openWorld') &&
+          baseWm.regions.every((r) => r.levelId !== l.id)
+      );
+      const canReuseFirst =
+        Boolean(firstOpenLvl) &&
+        baseWm.regions.length === 0 &&
+        firstOpenLvl!.entities.length === 0 &&
+        (firstOpenLvl!.terrain?.scatter.length ?? 0) === 0;
+
+      const targetLevel = canReuseFirst
+        ? {
+            ...firstOpenLvl!,
+            name,
+            terrain: syncLevelTerrainWithWorldMap(firstOpenLvl!.terrain, baseWm, nextCode),
+          }
+        : createLandLevelFromTemplate(currentLevel ?? currentProject.levels[0], name, baseWm, nextCode);
+
+      const newRegion: WorldLandRegion = {
+        id: uid(),
+        code: nextCode,
+        name,
+        colorHex,
+        levelId: targetLevel.id,
+      };
+
+      updateProject(`add land ${name}`, (proj) => {
+        const wm = proj.worldMap ?? ensureWorldMapForProject(proj);
+        const nextWm: WorldMapData = {
+          ...wm,
+          regions: [...wm.regions, newRegion],
+          revision: wm.revision + 1,
+        };
+        const nextLevels = canReuseFirst
+          ? proj.levels.map((l) => (l.id === targetLevel.id ? targetLevel : l))
+          : [...proj.levels, targetLevel];
+        return {
+          ...proj,
+          worldMap: nextWm,
+          levels: nextLevels,
+        };
+      });
+
+      setSelectedWorldLandCode(nextCode);
+      setWorldMapBrushMode('paintLand');
+      return newRegion;
+    },
+    [currentLevel, currentProject, updateProject]
+  );
+
+  const updateWorldLandRegion = useCallback(
+    (regionId: string, patch: Partial<Pick<WorldLandRegion, 'name' | 'colorHex'>>) => {
+      if (!currentProject) return;
+      updateProject('update land region', (proj) => {
+        const wm = proj.worldMap ?? ensureWorldMapForProject(proj);
+        let linkedLevelId: string | null = null;
+        const nextRegions = wm.regions.map((r) => {
+          if (r.id !== regionId) return r;
+          linkedLevelId = r.levelId;
+          return { ...r, ...patch };
+        });
+        const nextLevels =
+          patch.name !== undefined && linkedLevelId
+            ? proj.levels.map((l) => (l.id === linkedLevelId ? { ...l, name: patch.name! } : l))
+            : proj.levels;
+        return {
+          ...proj,
+          worldMap: {
+            ...wm,
+            regions: nextRegions,
+            revision: wm.revision + 1,
+          },
+          levels: nextLevels,
+        };
+      });
+    },
+    [currentProject, updateProject]
+  );
+
+  const deleteWorldLandRegion = useCallback(
+    (regionId: string) => {
+      if (!currentProject) return;
+      const baseWm = currentProject.worldMap ?? ensureWorldMapForProject(currentProject);
+      const target = baseWm.regions.find((r) => r.id === regionId);
+      if (!target) return;
+
+      updateProject(`delete land ${target.name}`, (proj) => {
+        const wm = proj.worldMap ?? ensureWorldMapForProject(proj);
+        const nextRegionGrid = wm.regionGrid.map((c) => (c === target.code ? 0 : c));
+        const nextRegions = wm.regions.filter((r) => r.id !== regionId);
+        const canDropLevel = proj.levels.length > 1;
+        const nextLevels = canDropLevel
+          ? proj.levels.filter((l) => l.id !== target.levelId)
+          : proj.levels;
+        return {
+          ...proj,
+          worldMap: {
+            ...wm,
+            regionGrid: nextRegionGrid,
+            regions: nextRegions,
+            revision: wm.revision + 1,
+          },
+          levels: nextLevels,
+        };
+      });
+
+      if (selectedWorldLandCode === target.code) {
+        setSelectedWorldLandCode(null);
+      }
+      if (worldEditorScope === target.levelId) {
+        setWorldEditorScope('worldMap');
+        setActiveWorldDomain('select');
+      }
+    },
+    [currentProject, selectedWorldLandCode, updateProject, worldEditorScope]
+  );
+
+  const enterWorldEditorScope = useCallback(
+    (scope: WorldEditorScope) => {
+      if (!currentProject) {
+        setWorldEditorScope(scope);
+        return;
+      }
+      if (scope === 'worldMap') {
+        setWorldEditorScope('worldMap');
+        setActiveWorldDomain('select');
+        setSelectedEntityID(null);
+        if (!currentProject.worldMap) {
+          ensureProjectWorldMap();
+        }
+        return;
+      }
+
+      const wm = currentProject.worldMap ?? ensureWorldMapForProject(currentProject);
+      const targetLevel =
+        currentProject.levels.find((l) => l.id === scope) ??
+        currentProject.levels[0] ??
+        null;
+      if (!targetLevel) return;
+
+      const region = wm.regions.find((r) => r.levelId === targetLevel.id);
+      if (!currentProject.worldMap || region) {
+        updateProject(
+          `enter ${targetLevel.name}`,
+          (proj) => {
+            const nextWm = proj.worldMap ?? ensureWorldMapForProject(proj);
+            return {
+              ...proj,
+              worldMap: nextWm,
+              levels: proj.levels.map((l) =>
+                l.id === targetLevel.id
+                  ? {
+                      ...l,
+                      terrain: syncLevelTerrainWithWorldMap(l.terrain, nextWm, region?.code),
+                    }
+                  : l
+              ),
+            };
+          },
+          false
+        );
+      }
+
+      setSelectedLevelID(targetLevel.id);
+      setWorldEditorScope(targetLevel.id);
+      setSelectedEntityID(targetLevel.entities[0]?.id ?? null);
+    },
+    [currentProject, ensureProjectWorldMap, updateProject]
+  );
+
+  const applyWorldMapBrushStroke = useCallback(
+    (
+      mode: WorldMapBrushMode,
+      x: number,
+      z: number,
+      radius: number,
+      _isStart = false,
+      recordUndo = false,
+      explicitRegionCode?: number
+    ) => {
+      if (!currentProject) return;
+      updateProject(
+        `world map ${mode}`,
+        (proj) => {
+          const baseWm = proj.worldMap ?? ensureWorldMapForProject(proj);
+          const fallbackCode =
+            worldEditorScope !== 'worldMap' && currentLevel
+              ? baseWm.regions.find((r) => r.levelId === currentLevel.id)?.code
+              : selectedWorldLandCode ?? undefined;
+          const targetCode = explicitRegionCode ?? fallbackCode;
+          const nextWm = applyWorldMapStroke(
+            baseWm,
+            mode,
+            x,
+            z,
+            radius,
+            targetCode,
+            mode === 'paintLand' && worldMapAutoLand
+          );
+          if (nextWm === baseWm && proj.worldMap) return proj;
+          const nextLevels =
+            worldEditorScope !== 'worldMap' && currentLevel
+              ? proj.levels.map((lvl) => {
+                  if (lvl.id !== currentLevel.id) return lvl;
+                  const regCode = nextWm.regions.find((r) => r.levelId === lvl.id)?.code;
+                  return {
+                    ...lvl,
+                    terrain: syncLevelTerrainWithWorldMap(lvl.terrain, nextWm, regCode),
+                  };
+                })
+              : proj.levels;
+          return {
+            ...proj,
+            worldMap: nextWm,
+            levels: nextLevels,
+          };
+        },
+        recordUndo
+      );
+    },
+    [
+      currentLevel,
+      currentProject,
+      selectedWorldLandCode,
+      updateProject,
+      worldEditorScope,
+      worldMapAutoLand,
+    ]
+  );
+
+  const startWorldFromScratch = useCallback(
+    (mode: 'world' | 'currentLand') => {
+      if (!currentProject) return;
+      if (mode === 'world') {
+        const blankWm = createEmptyWorldMap();
+        const scratchLvl: GameLevel = {
+          ...(currentLevel ?? createBlankLevel('World Ocean', 'island')),
+          id: currentLevel?.id ?? uid(),
+          name: 'Land 1',
+          entities: [],
+          terrain: createScratchOceanTerrain(),
+        };
+        updateProject('start world from scratch', (proj) => ({
+          ...proj,
+          worldMap: blankWm,
+          levels: [scratchLvl],
+        }));
+        setSelectedLevelID(scratchLvl.id);
+        setSelectedEntityID(null);
+        setSelectedWaterBodyId(null);
+        setSelectedCaveId(null);
+        setSelectedRoadId(null);
+        setWorldEditorScope('worldMap');
+        setWorldViewMode('2d');
+        setSelectedWorldLandCode(null);
+        setWorldMapBrushMode('terrain');
+        setActiveWorldDomain('select');
+      } else if (currentLevel) {
+        updateProject('reset current land', (proj) => {
+          const baseWm = proj.worldMap ?? ensureWorldMapForProject(proj);
+          const reg = baseWm.regions.find((r) => r.levelId === currentLevel.id);
+          const nextWm = reg
+            ? {
+                ...baseWm,
+                revision: baseWm.revision + 1,
+              }
+            : baseWm;
+          return {
+            ...proj,
+            worldMap: nextWm,
+            levels: proj.levels.map((l) =>
+              l.id === currentLevel.id
+                ? {
+                    ...l,
+                    entities: [],
+                    terrain: reg
+                      ? syncLevelTerrainWithWorldMap(createScratchOceanTerrain(), nextWm, reg.code)
+                      : createScratchOceanTerrain(),
+                  }
+                : l
+            ),
+          };
+        });
+        setSelectedEntityID(null);
+        setSelectedWaterBodyId(null);
+        setSelectedCaveId(null);
+        setSelectedRoadId(null);
+      }
+    },
+    [currentLevel, currentProject, updateProject]
   );
 
   const addEntity = useCallback(
@@ -2872,6 +3281,23 @@ export function useMakerStore() {
     setWorldGridSnap,
     worldViewMode,
     setWorldViewMode,
+    worldEditorScope,
+    setWorldEditorScope,
+    selectedWorldLandCode,
+    setSelectedWorldLandCode,
+    worldMapBrushMode,
+    setWorldMapBrushMode,
+    worldMapAutoLand,
+    setWorldMapAutoLand,
+    resolvedWorldMap,
+    activeWorldRegionCode,
+    ensureProjectWorldMap,
+    addWorldLandRegion,
+    updateWorldLandRegion,
+    deleteWorldLandRegion,
+    enterWorldEditorScope,
+    applyWorldMapBrushStroke,
+    startWorldFromScratch,
     activeWorldDomain,
     setActiveWorldDomain,
     cameraAngleLocked,

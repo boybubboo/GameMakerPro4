@@ -19,16 +19,25 @@ import type {
   ViewportShadowQuality,
   ViewportTool,
   WorldDomainId,
+  WorldEditorScope,
+  WorldMapData,
 } from '../../types/maker';
 import { buildCurveInstance, sampleCurveTransforms } from '../../three/curveGuide';
 import { registerDirectorViewportBridge } from '../../utils/directorBridge';
 import {
+  IslandTerrain,
+  createInitialTerrain,
   getEnvironmentType,
   levelBoardToWorld,
   levelWorldToBoard,
   PlatformMotion,
   sampleLevelHeight,
 } from '../../utils/terrain';
+import {
+  sampleWorldMapAtWorld,
+  WORLD_TERRAIN_YELLOW,
+  type WorldMapBrushMode,
+} from '../../utils/worldMap';
 import {
   applyVisualStyleToObject,
   getCachedAssetSync,
@@ -48,6 +57,7 @@ import {
   updateIslandTerrainGeometryInPlace,
   updateSkyClouds,
   type IslandSceneHandles,
+  type WorldMapRenderContext,
 } from '../../three/islandScene';
 import { isWebGPUFallbackAdapter } from '../../three/webglUtils';
 import { createDefaultFxEmitterConfig } from '../../data/fxEmitterPresets';
@@ -94,6 +104,7 @@ export interface BuildingCurveGuidePreview {
 }
 
 const HEIGHT_MODIFYING_BRUSHES = new Set<TerrainBrush>([
+  'terrain',
   'raiseGround',
   'lowerGround',
   'smoothGround',
@@ -108,6 +119,8 @@ const HEIGHT_MODIFYING_BRUSHES = new Set<TerrainBrush>([
 
 function getBrushAccentHex(brush: TerrainBrush): string {
   switch (brush) {
+    case 'terrain':
+      return WORLD_TERRAIN_YELLOW;
     case 'raiseGround':
       return '#20B46A';
     case 'lowerGround':
@@ -197,6 +210,11 @@ interface WorldViewport3DProps {
   activeWorldDomain?: WorldDomainId;
   selectedWaterBodyId?: string | null;
   selectedCaveId?: string | null;
+  worldMap?: WorldMapData;
+  worldEditorScope?: WorldEditorScope;
+  activeWorldRegionCode?: number;
+  worldMapBrushMode?: WorldMapBrushMode;
+  selectedWorldLandCode?: number | null;
   onSelectEntity: (id: string | null) => void;
   onSelectWaterBody?: (id: string | null) => void;
   onSelectCave?: (id: string | null) => void;
@@ -205,6 +223,8 @@ interface WorldViewport3DProps {
   onRotateActiveTool?: (deltaDeg: number) => void;
   onScaleEntity: (id: string, scale: number) => void;
   onBrushStroke: (x: number, z: number, meta?: TerrainBrushStrokeMeta) => void;
+  onWorldMapBrushStroke?: (x: number, z: number, meta?: { isStart: boolean }) => void;
+  onSelectWorldLandFrom3D?: (regionCode: number | null) => void;
   onAddAtPoint: (pos: { x: number; y: number }, elevationY?: number) => void;
   onDropFxTemplate?: (templateId: string, pos: { x: number; y: number }) => void;
   onDropCustomAsset?: (assetId: string, pos: { x: number; y: number }, elevationY?: number) => void;
@@ -238,6 +258,11 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
   activeWorldDomain = 'select',
   selectedWaterBodyId = null,
   selectedCaveId = null,
+  worldMap,
+  worldEditorScope = 'worldMap',
+  activeWorldRegionCode,
+  worldMapBrushMode = 'terrain',
+  selectedWorldLandCode = null,
   onSelectEntity,
   onSelectWaterBody,
   onSelectCave,
@@ -246,6 +271,8 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
   onRotateActiveTool,
   onScaleEntity,
   onBrushStroke,
+  onWorldMapBrushStroke,
+  onSelectWorldLandFrom3D,
   onAddAtPoint,
   onDropFxTemplate,
   onDropCustomAsset,
@@ -279,6 +306,8 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
   const lastSculptAreaRef = useRef<{ x: number; z: number; radius: number } | null>(null);
   const isSculptDraggingRef = useRef(false);
   const lastIslandStructKeyRef = useRef<string>('');
+  const lastTerrainRevRef = useRef<number>(-1);
+  const lastWorldMapRevRef = useRef<number>(-1);
   const lastEntityStructKeyRef = useRef<string>('');
   const islandBuildAbortRef = useRef<AbortController | null>(null);
   const entityBuildAbortRef = useRef<AbortController | null>(null);
@@ -313,6 +342,8 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
     onRotateActiveTool,
     onScaleEntity,
     onBrushStroke,
+    onWorldMapBrushStroke,
+    onSelectWorldLandFrom3D,
     onAddAtPoint,
     onDropFxTemplate,
     onDropCustomAsset,
@@ -322,6 +353,11 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
     activeWorldDomain,
     selectedWaterBodyId,
     selectedCaveId,
+    worldMap,
+    worldEditorScope,
+    activeWorldRegionCode,
+    worldMapBrushMode,
+    selectedWorldLandCode,
     onSelectWaterBody,
     onSelectCave,
   });
@@ -349,6 +385,8 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
     onRotateActiveTool,
     onScaleEntity,
     onBrushStroke,
+    onWorldMapBrushStroke,
+    onSelectWorldLandFrom3D,
     onAddAtPoint,
     onDropFxTemplate,
     onDropCustomAsset,
@@ -358,6 +396,11 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
     activeWorldDomain,
     selectedWaterBodyId,
     selectedCaveId,
+    worldMap,
+    worldEditorScope,
+    activeWorldRegionCode,
+    worldMapBrushMode,
+    selectedWorldLandCode,
     onSelectWaterBody,
     onSelectCave,
   };
@@ -710,7 +753,27 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
       updatePointer(clientX, clientY);
       raycaster.setFromCamera(pointerNdc, camera);
       const hits = raycaster.intersectObjects(refs.groundMeshes, false);
-      return hits[0]?.point ?? null;
+      const meshHit = hits[0]?.point ?? null;
+      const curState = propsRef.current;
+      const isWm = curState.worldEditorScope === 'worldMap';
+      const allowOceanPlane =
+        isWm || Boolean(curState.level.terrain?.freeformWorld) || curState.brush === 'terrain';
+      if (meshHit && (!allowOceanPlane || meshHit.y >= IslandTerrain.waterLevel - 0.1)) {
+        return meshHit;
+      }
+      if (allowOceanPlane) {
+        const waterPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), -IslandTerrain.waterLevel);
+        const planeHit = new THREE.Vector3();
+        if (raycaster.ray.intersectPlane(waterPlane, planeHit)) {
+          const rMax = IslandTerrain.radius;
+          if (Math.abs(planeHit.x) <= rMax + 2 && Math.abs(planeHit.z) <= rMax + 2) {
+            planeHit.x = Math.max(-rMax, Math.min(rMax, planeHit.x));
+            planeHit.z = Math.max(-rMax, Math.min(rMax, planeHit.z));
+            return planeHit;
+          }
+        }
+      }
+      return meshHit;
     };
 
     const raycastPlacementSurface = (
@@ -1008,13 +1071,33 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
         level: curLevel,
       } = propsRef.current;
 
-      // Left-click sculpts terrain; right/middle-click still orbits smoothly
+      const getWorldMapAccent = (): string => {
+        const wmMode = propsRef.current.worldMapBrushMode ?? 'terrain';
+        if (wmMode === 'eraseTerrain') return '#F2545B';
+        if (wmMode === 'clearLand') return '#94A3B8';
+        if (wmMode === 'paintLand') {
+          const selCode = propsRef.current.selectedWorldLandCode;
+          const reg = propsRef.current.worldMap?.regions.find((item) => item.code === selCode);
+          return reg?.colorHex ?? '#20B46A';
+        }
+        return WORLD_TERRAIN_YELLOW;
+      };
+
+      // Left-click sculpts terrain or paints World Map; right/middle-click still orbits smoothly
       if (curTool === 'terrain' && e.button === 0) {
         const hit = raycastGround(e.clientX, e.clientY);
         if (hit) {
           activeMode = 'brush';
           isSculptDraggingRef.current = true;
           controls.enabled = false;
+          if (propsRef.current.worldEditorScope === 'worldMap') {
+            strokeSampledHeight = IslandTerrain.waterLevel;
+            strokeModifiedHeight = false;
+            lastSculptAreaRef.current = { x: hit.x, z: hit.z, radius: r };
+            lastStrokeTimeMs = performance.now();
+            propsRef.current.onWorldMapBrushStroke?.(hit.x, hit.z, { isStart: true });
+            return;
+          }
           strokeSampledHeight = sampleLevelHeight(curLevel, hit.x, hit.z);
           const nearCaveForWeather =
             curBrush.startsWith('weather') &&
@@ -1033,6 +1116,10 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
       }
 
       if (curTool === 'terrain') return;
+
+      if (propsRef.current.worldEditorScope === 'worldMap') {
+        return;
+      }
 
       const hitEntityId = raycastEntity(e.clientX, e.clientY);
 
@@ -1082,12 +1169,25 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
       }
 
       if (curTool === 'terrain' && refs) {
+        const isWorldMapEdit = propsRef.current.worldEditorScope === 'worldMap';
         const hit = raycastGround(e.clientX, e.clientY);
         if (hit) {
-          const accent = getBrushAccentHex(curBrush);
+          let accent = getBrushAccentHex(curBrush);
+          if (isWorldMapEdit) {
+            const wmMode = propsRef.current.worldMapBrushMode ?? 'terrain';
+            if (wmMode === 'eraseTerrain') accent = '#F2545B';
+            else if (wmMode === 'clearLand') accent = '#94A3B8';
+            else if (wmMode === 'paintLand') {
+              const selCode = propsRef.current.selectedWorldLandCode;
+              const reg = propsRef.current.worldMap?.regions.find((item) => item.code === selCode);
+              accent = reg?.colorHex ?? '#20B46A';
+            } else {
+              accent = WORLD_TERRAIN_YELLOW;
+            }
+          }
           refs.brushOuterMat.color.set(accent);
           refs.brushInnerMat.color.set(accent);
-          refs.brushInnerRing.scale.setScalar(getFalloffInnerRatio(falloff));
+          refs.brushInnerRing.scale.setScalar(isWorldMapEdit ? 0.88 : getFalloffInnerRatio(falloff));
           refs.brushGroup.visible = true;
           refs.brushGroup.position.set(hit.x, hit.y + 0.16, hit.z);
           refs.brushGroup.scale.setScalar(r);
@@ -1096,6 +1196,10 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
             if (now - lastStrokeTimeMs >= 22) {
               lastStrokeTimeMs = now;
               lastSculptAreaRef.current = { x: hit.x, z: hit.z, radius: r };
+              if (isWorldMapEdit) {
+                propsRef.current.onWorldMapBrushStroke?.(hit.x, hit.z, { isStart: false });
+                return;
+              }
               if (
                 HEIGHT_MODIFYING_BRUSHES.has(curBrush) ||
                 (curBrush.startsWith('weather') &&
@@ -1201,6 +1305,18 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
 
       if (!movedFar && wasMode === 'none') {
         const { tool: curTool, level: curLevel, activeWorldDomain: domMode } = propsRef.current;
+        if (propsRef.current.worldEditorScope === 'worldMap') {
+          if (curTool !== 'terrain') {
+            const hit = raycastGround(e.clientX, e.clientY);
+            if (hit && propsRef.current.worldMap) {
+              const res = sampleWorldMapAtWorld(propsRef.current.worldMap, hit.x, hit.z);
+              propsRef.current.onSelectWorldLandFrom3D?.(
+                res.land === 1 && res.regionCode > 0 ? res.regionCode : null
+              );
+            }
+          }
+          return;
+        }
         if (curTool === 'add') {
           if (e.altKey) {
             const hitId = raycastEntity(e.clientX, e.clientY);
@@ -2025,9 +2141,27 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
       ])
     );
 
+    const isWorldMapMode = worldEditorScope === 'worldMap' && Boolean(worldMap);
+    const worldMapContext: WorldMapRenderContext | undefined = worldMap
+      ? {
+          worldMap,
+          mode: isWorldMapMode ? 'worldMap' : 'land',
+          activeRegionCode: activeWorldRegionCode,
+        }
+      : undefined;
+    const regionPaletteSig = (worldMap?.regions ?? [])
+      .map((r) => `${r.code}:${r.colorHex}:${r.levelId}`)
+      .join('|');
+    const curTerrainRev = level.terrain?.revision ?? 0;
+    const curWorldMapRev = worldMap?.revision ?? 0;
+
     const structKey = JSON.stringify([
       level.id,
       env,
+      isWorldMapMode ? 'worldMap' : 'land',
+      activeWorldRegionCode ?? 0,
+      regionPaletteSig,
+      Boolean(level.terrain?.freeformWorld),
       level.biome,
       level.visualStyle ?? 'painterlyPBR',
       level.vistaPreset ?? '',
@@ -2048,20 +2182,24 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
       sculptFinalizeNonce,
     ]);
 
+    const liveTerrain = level.terrain ?? createInitialTerrain();
+
     // Fast 60fps in-place GPU vertex/splat/normal update while actively sculpting or painting
     if (
       env === 'openWorld' &&
       refs.islandHandles?.terrainMesh &&
       lastIslandStructKeyRef.current === structKey &&
-      lastSculptAreaRef.current !== null &&
-      level.terrain
+      lastSculptAreaRef.current !== null
     ) {
       const updated = updateIslandTerrainGeometryInPlace(
         refs.islandHandles,
-        level.terrain,
-        lastSculptAreaRef.current
+        liveTerrain,
+        lastSculptAreaRef.current,
+        worldMapContext
       );
       if (updated) {
+        lastTerrainRevRef.current = curTerrainRev;
+        lastWorldMapRevRef.current = curWorldMapRev;
         refs.markShadowDirty();
         return;
       }
@@ -2073,10 +2211,26 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
       lastIslandStructKeyRef.current === structKey &&
       lastSculptAreaRef.current === null
     ) {
+      if (
+        lastTerrainRevRef.current !== curTerrainRev ||
+        lastWorldMapRevRef.current !== curWorldMapRev
+      ) {
+        updateIslandTerrainGeometryInPlace(
+          refs.islandHandles,
+          liveTerrain,
+          undefined,
+          worldMapContext
+        );
+        lastTerrainRevRef.current = curTerrainRev;
+        lastWorldMapRevRef.current = curWorldMapRev;
+        refs.markShadowDirty();
+      }
       return;
     }
 
     lastIslandStructKeyRef.current = structKey;
+    lastTerrainRevRef.current = curTerrainRev;
+    lastWorldMapRevRef.current = curWorldMapRev;
 
     islandBuildAbortRef.current?.abort();
     const abortController = new AbortController();
@@ -2088,6 +2242,7 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
     const handles = buildIslandMesh(level, customAssets, refs.isSoftwareGl, {
       deferFoliage: true,
       deferFoliageSignal: abortController.signal,
+      worldMapContext,
       onDeferredBatchReady: async (obj) => {
         if (abortController.signal.aborted) return;
         await refs.precompileObject(obj);
@@ -2125,12 +2280,17 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
     level.terrain?.dirtAndRoadConfig?.pebbleHueVariance,
     level.terrain?.caves,
     level.terrain?.waterBodies,
+    level.terrain?.freeformWorld,
     level.customWallBoxes,
     level.roguelikeTorchAnchors,
     level.dungeonStyle,
     level.roguelikeConfig?.dungeonStyle,
     level.terrain?.revision,
     level.id,
+    worldEditorScope,
+    activeWorldRegionCode,
+    worldMap?.revision,
+    worldMap?.regions,
     customAssets,
     texInvalidationTick,
     sculptFinalizeNonce,
@@ -2242,7 +2402,9 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
       (env === 'sideScroller' ? { x: 0.1, y: 0.5 } : { x: 0.14, y: 0.8 });
     const portalBp = level.portalPoint ?? (env === 'sideScroller' ? { x: 0.92, y: 0.5 } : { x: 0.88, y: 0.24 });
 
+    const isWorldMapOnly = worldEditorScope === 'worldMap' && env === 'openWorld';
     const entityStructKey = JSON.stringify([
+      isWorldMapOnly ? 'worldMapOnly' : 'land',
       level.id,
       env,
       level.gameplayMode ?? 'adventure',
@@ -2263,6 +2425,28 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
       customAssets.length,
       texInvalidationTick,
     ]);
+
+    // Pure World Map view renders landmasses and region colors without level actors/props
+    if (isWorldMapOnly) {
+      if (lastEntityStructKeyRef.current !== entityStructKey) {
+        lastEntityStructKeyRef.current = entityStructKey;
+        entityBuildAbortRef.current?.abort();
+        disposeObject3D(refs.entitiesContainer);
+        refs.entitiesContainer.clear();
+        refs.entityGroups.clear();
+        refs.fxEmitters.forEach((fx) => fx.dispose());
+        refs.fxEmitters.clear();
+        refs.fxContainer.clear();
+        refs.floatSpinObjects = [];
+        refs.torchFlameObjects = [];
+        refs.customUpdaters = [];
+        refs.hasDynamicShadows = false;
+        refs.heroGroup = null;
+        refs.portalGroup = null;
+        refs.markShadowDirty();
+      }
+      return;
+    }
 
     // Fast Y-only re-grounding & zero-stutter NodeMaterialInstance uniform updates
     if (lastEntityStructKeyRef.current === entityStructKey && refs.entityGroups.size === level.entities.length) {
@@ -2721,6 +2905,7 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
     level.visualStyle,
     level.sceneryTextures,
     level.id,
+    worldEditorScope,
     project.heroBody,
     project.heroColors,
     project.heroCustomAssetId,

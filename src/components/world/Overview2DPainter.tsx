@@ -2,9 +2,11 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   Eraser,
   Flower2,
+  Globe,
   Hand,
   MousePointer2,
   Mountain,
+  Plus,
   RotateCcw,
   Route,
   Shrub,
@@ -23,6 +25,13 @@ import {
   levelBoardToWorld,
   sampleTerrainHeight,
 } from '../../utils/terrain';
+import {
+  WORLD_BORDER_GRAY,
+  WORLD_TERRAIN_YELLOW,
+  computeRegionCentroids,
+  sampleWorldMapAtWorld,
+  type WorldMapBrushMode,
+} from '../../utils/worldMap';
 import { MAKER_ASSET_DRAG_MIME } from './LeftAssetsPanel';
 
 type Painter2DTool = Overview2DBrushId | 'inspect';
@@ -36,13 +45,14 @@ interface BrushMeta {
 
 const PAINTER_2D_TOOLS: BrushMeta[] = [
   { id: 'inspect', label: 'Select', accent: '#7C5CFF', Icon: MousePointer2 },
+  { id: 'terrain', label: 'Terrain', accent: WORLD_TERRAIN_YELLOW, Icon: Globe },
   { id: 'coniferWoods', label: 'Conifers', accent: '#1F5C36', Icon: Trees },
   { id: 'deciduousWoods', label: 'Deciduous', accent: '#4EA343', Icon: Trees },
   { id: 'bushes', label: 'Bushes', accent: '#20B46A', Icon: Shrub },
   { id: 'wildflowers', label: 'Flowers', accent: '#EC4899', Icon: Flower2 },
   { id: 'rocks', label: 'Rocks', accent: '#64748B', Icon: Mountain },
   { id: 'hills', label: 'Hills', accent: '#F59E0B', Icon: Mountain },
-  { id: 'beaches', label: 'Beach', accent: '#E5C67E', Icon: Umbrella },
+  { id: 'beaches', label: 'Beach', accent: '#D6B66A', Icon: Umbrella },
   { id: 'lakes', label: 'Lake', accent: '#0EA5E9', Icon: Waves },
   { id: 'rivers', label: 'Creek', accent: '#2A9D8F', Icon: Waves },
   { id: 'caves', label: 'Cave', accent: '#A855F7', Icon: Mountain },
@@ -77,7 +87,8 @@ export const Overview2DPainter: React.FC<Overview2DPainterProps> = ({
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
 
-  const [tool, setTool] = useState<Painter2DTool>('coniferWoods');
+  const [tool, setTool] = useState<Painter2DTool>('terrain');
+  const [worldMapSelectMode, setWorldMapSelectMode] = useState(false);
   const [brushRadius, setBrushRadius] = useState<number>(11);
   const [density, setDensity] = useState<number>(0.65);
   const [zoom, setZoom] = useState<number>(1);
@@ -91,6 +102,16 @@ export const Overview2DPainter: React.FC<Overview2DPainterProps> = ({
     null
   );
   const lastStrokeMsRef = useRef(0);
+  const lastLandClickRef = useRef<{ code: number; time: number } | null>(null);
+
+  const isWorldMapMode = store.worldEditorScope === 'worldMap';
+  const worldMap = store.resolvedWorldMap;
+  const activeRegionCode = store.activeWorldRegionCode;
+  const terrain = useMemo(
+    () => currentLevel?.terrain ?? createInitialTerrain(),
+    [currentLevel?.terrain]
+  );
+  const isFreeform = Boolean(terrain.freeformWorld || worldMap || isWorldMapMode);
 
   useEffect(() => {
     const syncShift = (e: KeyboardEvent) => {
@@ -123,11 +144,6 @@ export const Overview2DPainter: React.FC<Overview2DPainterProps> = ({
       window.removeEventListener('blur', onBlur);
     };
   }, []);
-
-  const terrain = useMemo(
-    () => currentLevel?.terrain ?? createInitialTerrain(),
-    [currentLevel?.terrain]
-  );
 
   const screenToWorld = useCallback(
     (clientX: number, clientY: number): [number, number] => {
@@ -177,57 +193,237 @@ export const Overview2DPainter: React.FC<Overview2DPainterProps> = ({
     ];
     const scaleM = halfSpan / IslandTerrain.shoreRadius;
 
-    // Subtle ocean ripple rings
-    ctx.strokeStyle = 'rgba(56, 189, 248, 0.14)';
-    ctx.lineWidth = 1.5;
-    for (const rMul of [1.02, 1.12, 1.24]) {
+    if (!isFreeform) {
+      // Classic circular ocean ripple rings & island base shadow
+      ctx.strokeStyle = 'rgba(56, 189, 248, 0.14)';
+      ctx.lineWidth = 1.5;
+      for (const rMul of [1.02, 1.12, 1.24]) {
+        ctx.beginPath();
+        ctx.arc(cx, cy, IslandTerrain.shoreRadius * scaleM * rMul, 0, Math.PI * 2);
+        ctx.stroke();
+      }
+      ctx.fillStyle = '#18364A';
       ctx.beginPath();
-      ctx.arc(cx, cy, IslandTerrain.shoreRadius * scaleM * rMul, 0, Math.PI * 2);
-      ctx.stroke();
+      ctx.arc(cx, cy, IslandTerrain.shoreRadius * scaleM, 0, Math.PI * 2);
+      ctx.fill();
+    } else {
+      // Subtle navigable world grid over open ocean
+      const worldHalfPx = IslandTerrain.radius * scaleM;
+      ctx.save();
+      ctx.strokeStyle = 'rgba(125, 211, 252, 0.08)';
+      ctx.lineWidth = 1;
+      for (let g = -IslandTerrain.radius; g <= IslandTerrain.radius; g += 20) {
+        const [gx] = toPx(g, 0);
+        const [, gy] = toPx(0, g);
+        ctx.beginPath();
+        ctx.moveTo(gx, cy - worldHalfPx);
+        ctx.lineTo(gx, cy + worldHalfPx);
+        ctx.stroke();
+        ctx.beginPath();
+        ctx.moveTo(cx - worldHalfPx, gy);
+        ctx.lineTo(cx + worldHalfPx, gy);
+        ctx.stroke();
+      }
+      ctx.strokeStyle = 'rgba(125, 211, 252, 0.2)';
+      ctx.setLineDash([6, 6]);
+      ctx.strokeRect(cx - worldHalfPx, cy - worldHalfPx, worldHalfPx * 2, worldHalfPx * 2);
+      ctx.setLineDash([]);
+      ctx.restore();
     }
 
-    // Island base circle shadow
-    ctx.fillStyle = '#18364A';
-    ctx.beginPath();
-    ctx.arc(cx, cy, IslandTerrain.shoreRadius * scaleM, 0, Math.PI * 2);
-    ctx.fill();
+    if (isWorldMapMode && worldMap) {
+      const size = worldMap.gridSize;
+      const width = size + 1;
+      const stepM = (2 * IslandTerrain.radius) / size;
+      const cellPx = Math.max(1.8, stepM * scaleM + 0.65);
+      const regionColorMap = new Map<number, string>();
+      for (const r of worldMap.regions) {
+        regionColorMap.set(r.code, r.colorHex);
+      }
 
-    // Render terrain cells
+      for (let row = 0; row < size; row++) {
+        const vz = -IslandTerrain.radius + (row + 0.5) * stepM;
+        for (let col = 0; col < size; col++) {
+          const vx = -IslandTerrain.radius + (col + 0.5) * stepM;
+          const idx = row * width + col;
+          const hasLand = worldMap.landMask[idx] === 1;
+          const [px, py] = toPx(vx, vz);
+
+          if (!hasLand) {
+            const nearLand =
+              (row > 0 && worldMap.landMask[(row - 1) * width + col] === 1) ||
+              (row < size && worldMap.landMask[(row + 1) * width + col] === 1) ||
+              (col > 0 && worldMap.landMask[row * width + (col - 1)] === 1) ||
+              (col < size && worldMap.landMask[row * width + (col + 1)] === 1);
+            if (nearLand) {
+              ctx.fillStyle = '#144B6E';
+              ctx.fillRect(px - cellPx * 0.5, py - cellPx * 0.5, cellPx, cellPx);
+            }
+            continue;
+          }
+
+          const code = worldMap.regionGrid[idx] ?? 0;
+          const baseColor = code > 0 ? regionColorMap.get(code) ?? WORLD_TERRAIN_YELLOW : WORLD_TERRAIN_YELLOW;
+          ctx.fillStyle = baseColor;
+          ctx.fillRect(px - cellPx * 0.5, py - cellPx * 0.5, cellPx, cellPx);
+
+          const isEdge =
+            row === 0 ||
+            row >= size - 1 ||
+            col === 0 ||
+            col >= size - 1 ||
+            worldMap.landMask[(row - 1) * width + col] === 0 ||
+            worldMap.landMask[(row + 1) * width + col] === 0 ||
+            worldMap.landMask[row * width + (col - 1)] === 0 ||
+            worldMap.landMask[row * width + (col + 1)] === 0 ||
+            worldMap.regionGrid[(row - 1) * width + col] !== code ||
+            worldMap.regionGrid[(row + 1) * width + col] !== code ||
+            worldMap.regionGrid[row * width + (col - 1)] !== code ||
+            worldMap.regionGrid[row * width + (col + 1)] !== code;
+          if (isEdge) {
+            ctx.fillStyle = 'rgba(15, 23, 42, 0.34)';
+            ctx.fillRect(px - cellPx * 0.5, py - cellPx * 0.5, cellPx, cellPx);
+          }
+        }
+      }
+
+      // Land region labels
+      const centroids = computeRegionCentroids(worldMap);
+      ctx.save();
+      ctx.font = '800 12px ui-sans-serif, system-ui, sans-serif';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      for (const region of worldMap.regions) {
+        const c = centroids.get(region.code);
+        if (!c || c.cellCount === 0) continue;
+        const [lx, ly] = toPx(c.x, c.z);
+        const text = region.name || `Land ${region.code}`;
+        const metrics = ctx.measureText(text);
+        const pillW = Math.max(48, metrics.width + 18);
+        const pillH = 22;
+        const selected = store.selectedWorldLandCode === region.code;
+        ctx.fillStyle = 'rgba(15, 23, 42, 0.84)';
+        ctx.beginPath();
+        ctx.roundRect(lx - pillW * 0.5, ly - pillH * 0.5, pillW, pillH, 8);
+        ctx.fill();
+        ctx.strokeStyle = selected ? '#FFFFFF' : region.colorHex;
+        ctx.lineWidth = selected ? 2.2 : 1.5;
+        ctx.stroke();
+        ctx.fillStyle = '#FFFFFF';
+        ctx.fillText(text, lx, ly + 0.5);
+      }
+      ctx.restore();
+
+      // Hover brush ring in World Map mode
+      if (hoverWorld && !worldMapSelectMode && !shiftHeld && !isPanning) {
+        const [px, py] = toPx(hoverWorld[0], hoverWorld[1]);
+        const activeRegion = worldMap.regions.find((r) => r.code === store.selectedWorldLandCode);
+        const ringColor =
+          store.worldMapBrushMode === 'terrain'
+            ? WORLD_TERRAIN_YELLOW
+            : store.worldMapBrushMode === 'eraseTerrain'
+            ? '#F2545B'
+            : store.worldMapBrushMode === 'clearLand'
+            ? '#94A3B8'
+            : activeRegion?.colorHex ?? '#20B46A';
+        ctx.strokeStyle = ringColor;
+        ctx.lineWidth = 2.2;
+        ctx.setLineDash([4, 4]);
+        ctx.beginPath();
+        ctx.arc(px, py, Math.max(6, brushRadius * scaleM), 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.setLineDash([]);
+      }
+
+      ctx.restore();
+      return;
+    }
+
+    // LAND EDIT MODE: Render terrain cells + turn bordering/other lands gray
     const size = terrain.size;
     const width = size + 1;
     const stepM = (2 * IslandTerrain.radius) / size;
-    const cellPx = Math.max(1.5, stepM * scaleM + 0.6);
+    const cellPx = Math.max(1.6, stepM * scaleM + 0.65);
 
     for (let row = 0; row < size; row++) {
       const vz = -IslandTerrain.radius + (row + 0.5) * stepM;
       for (let col = 0; col < size; col++) {
         const vx = -IslandTerrain.radius + (col + 0.5) * stepM;
         const dist = Math.hypot(vx, vz);
-        if (dist > IslandTerrain.shoreRadius * 0.99) continue;
+        if (!isFreeform && dist > IslandTerrain.shoreRadius * 0.99) continue;
         const idx = row * width + col;
+
+        const isGrayNeighbor =
+          Boolean(worldMap) &&
+          Boolean(activeRegionCode && activeRegionCode > 0) &&
+          worldMap!.landMask[idx] === 1 &&
+          worldMap!.regionGrid[idx] !== activeRegionCode;
+
         const height = terrain.heights[idx];
         const layer = terrain.layers[idx] ?? 0;
 
-        let color = LAYER_COLORS[layer] ?? LAYER_COLORS[0];
-        if (height <= IslandTerrain.waterLevel - 0.15) {
-          color = '#1B6B93';
-        } else if (height > (terrain.mountainConfig?.snowStartHeight ?? 10.5)) {
-          color = '#E2E8F0';
-        } else if (height > (terrain.mountainConfig?.rockStartHeight ?? 5.5) && layer === 0) {
-          color = '#767D89';
+        let color: string;
+        if (isGrayNeighbor) {
+          color = WORLD_BORDER_GRAY;
+        } else {
+          color = LAYER_COLORS[layer] ?? LAYER_COLORS[0];
+          if (height <= IslandTerrain.waterLevel - 0.15) {
+            if (isFreeform) continue;
+            color = '#1B6B93';
+          } else if (height > (terrain.mountainConfig?.snowStartHeight ?? 10.5)) {
+            color = '#E2E8F0';
+          } else if (height > (terrain.mountainConfig?.rockStartHeight ?? 5.5) && layer === 0) {
+            color = '#767D89';
+          }
         }
 
         const [px, py] = toPx(vx, vz);
         ctx.fillStyle = color;
         ctx.fillRect(px - cellPx * 0.5, py - cellPx * 0.5, cellPx, cellPx);
 
-        // Hilltop shading contour boost
-        if (height > 2.2 && height > IslandTerrain.waterLevel) {
+        if (isGrayNeighbor && worldMap) {
+          const code = worldMap.regionGrid[idx] ?? 0;
+          const borderNeighbor =
+            row === 0 ||
+            col === 0 ||
+            worldMap.landMask[(row - 1) * width + col] === 0 ||
+            worldMap.landMask[(row + 1) * width + col] === 0 ||
+            worldMap.landMask[row * width + (col - 1)] === 0 ||
+            worldMap.landMask[row * width + (col + 1)] === 0 ||
+            worldMap.regionGrid[(row - 1) * width + col] !== code ||
+            worldMap.regionGrid[(row + 1) * width + col] !== code ||
+            worldMap.regionGrid[row * width + (col - 1)] !== code ||
+            worldMap.regionGrid[row * width + (col + 1)] !== code;
+          if (borderNeighbor) {
+            ctx.fillStyle = 'rgba(15, 23, 42, 0.28)';
+            ctx.fillRect(px - cellPx * 0.5, py - cellPx * 0.5, cellPx, cellPx);
+          }
+        } else if (height > 2.2 && height > IslandTerrain.waterLevel) {
           const shadeAlpha = Math.min(0.32, (height - 2.2) * 0.025);
           ctx.fillStyle = `rgba(255,255,255,${shadeAlpha.toFixed(3)})`;
           ctx.fillRect(px - cellPx * 0.5, py - cellPx * 0.5, cellPx, cellPx);
         }
       }
+    }
+
+    // Dimmed labels on neighboring gray lands for spatial orientation
+    if (worldMap && activeRegionCode) {
+      const centroids = computeRegionCentroids(worldMap);
+      ctx.save();
+      ctx.font = '700 11px ui-sans-serif, system-ui, sans-serif';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      for (const region of worldMap.regions) {
+        if (region.code === activeRegionCode) continue;
+        const c = centroids.get(region.code);
+        if (!c || c.cellCount === 0) continue;
+        const [lx, ly] = toPx(c.x, c.z);
+        ctx.fillStyle = 'rgba(15, 23, 42, 0.55)';
+        ctx.fillText(region.name, lx + 1, ly + 1);
+        ctx.fillStyle = 'rgba(226, 232, 240, 0.65)';
+        ctx.fillText(region.name, lx, ly);
+      }
+      ctx.restore();
     }
 
     // Water bodies overlay
@@ -291,6 +487,10 @@ export const Overview2DPainter: React.FC<Overview2DPainterProps> = ({
 
     // Scatter foliage/rock dots
     for (const item of terrain.scatter) {
+      if (worldMap && activeRegionCode) {
+        const wmS = sampleWorldMapAtWorld(worldMap, item.x, item.z);
+        if (wmS.land === 1 && wmS.regionCode !== activeRegionCode) continue;
+      }
       const [px, py] = toPx(item.x, item.z);
       if (item.kind === 'pine') {
         ctx.fillStyle = '#154D2B';
@@ -380,6 +580,11 @@ export const Overview2DPainter: React.FC<Overview2DPainterProps> = ({
   }, [
     currentLevel,
     terrain,
+    worldMap,
+    isWorldMapMode,
+    isFreeform,
+    activeRegionCode,
+    worldMapSelectMode,
     zoom,
     pan,
     hoverWorld,
@@ -392,10 +597,49 @@ export const Overview2DPainter: React.FC<Overview2DPainterProps> = ({
     store.selectedWaterBodyId,
     store.selectedCaveId,
     store.selectedRoadId,
+    store.selectedWorldLandCode,
+    store.worldMapBrushMode,
   ]);
 
   const applyStrokeAtPoint = useCallback(
     (wx: number, wz: number, isStart: boolean) => {
+      if (isWorldMapMode) {
+        if (worldMapSelectMode) {
+          if (!isStart || !worldMap) return;
+          const res = sampleWorldMapAtWorld(worldMap, wx, wz);
+          if (res.land === 1 && res.regionCode > 0) {
+            const now = performance.now();
+            const prev = lastLandClickRef.current;
+            store.setSelectedWorldLandCode(res.regionCode);
+            if (prev && prev.code === res.regionCode && now - prev.time < 360) {
+              const targetRegion = worldMap.regions.find((r) => r.code === res.regionCode);
+              if (targetRegion) {
+                store.enterWorldEditorScope(targetRegion.levelId);
+              }
+              lastLandClickRef.current = null;
+            } else {
+              lastLandClickRef.current = { code: res.regionCode, time: now };
+            }
+          } else {
+            store.setSelectedWorldLandCode(null);
+            lastLandClickRef.current = null;
+          }
+          return;
+        }
+        const now = performance.now();
+        if (!isStart && now - lastStrokeMsRef.current < 45) return;
+        lastStrokeMsRef.current = now;
+        store.applyWorldMapBrushStroke(
+          store.worldMapBrushMode,
+          wx,
+          wz,
+          brushRadius,
+          isStart,
+          isStart
+        );
+        return;
+      }
+
       if (activePlacementAssetId) {
         if (isStart) {
           onPlaceCustomAssetAtWorldPoint(activePlacementAssetId, wx, wz);
@@ -448,12 +692,15 @@ export const Overview2DPainter: React.FC<Overview2DPainterProps> = ({
       brushRadius,
       currentLevel,
       density,
+      isWorldMapMode,
       onPlaceCustomAssetAtWorldPoint,
       onSelectEntityFrom2D,
       store,
       terrain.caves,
       terrain.waterBodies,
       tool,
+      worldMap,
+      worldMapSelectMode,
     ]
   );
 
@@ -464,12 +711,13 @@ export const Overview2DPainter: React.FC<Overview2DPainterProps> = ({
       ref={containerRef}
       className="w-full h-full relative bg-[#0D2438] select-none overflow-hidden"
       onDragOver={(e) => {
-        if (e.dataTransfer.types.includes(MAKER_ASSET_DRAG_MIME)) {
+        if (!isWorldMapMode && e.dataTransfer.types.includes(MAKER_ASSET_DRAG_MIME)) {
           e.preventDefault();
           e.dataTransfer.dropEffect = 'copy';
         }
       }}
       onDrop={(e) => {
+        if (isWorldMapMode) return;
         const assetId = e.dataTransfer.getData(MAKER_ASSET_DRAG_MIME);
         if (!assetId) return;
         e.preventDefault();
@@ -485,7 +733,7 @@ export const Overview2DPainter: React.FC<Overview2DPainterProps> = ({
             ? 'grabbing'
             : shiftHeld
             ? 'grab'
-            : tool === 'inspect'
+            : (isWorldMapMode ? worldMapSelectMode : tool === 'inspect')
             ? 'default'
             : 'crosshair',
         }}
@@ -571,30 +819,152 @@ export const Overview2DPainter: React.FC<Overview2DPainterProps> = ({
         </div>
       )}
 
-      {/* Generic 2D World Blocking Palette */}
+      {/* Generic 2D World Blocking Palette (World Map vs Land Edit) */}
       <div className="absolute left-3 bottom-3 right-3 flex flex-wrap items-center justify-between gap-2 pointer-events-none">
-        <div className="pointer-events-auto flex flex-wrap items-center gap-1 p-1.5 rounded-2xl bg-[#111521]/95 border border-white/15 shadow-xl max-w-3xl">
-          {PAINTER_2D_TOOLS.map((item) => {
-            const Icon = item.Icon;
-            const active = !activePlacementAssetId && tool === item.id;
-            return (
-              <button
-                key={item.id}
-                type="button"
-                onClick={() => setTool(item.id)}
-                className={`inline-flex items-center gap-1 px-2 py-1 rounded-xl text-[11px] font-bold transition-colors whitespace-nowrap ${
-                  active
-                    ? 'text-white shadow-xs'
-                    : 'text-slate-300 hover:bg-white/10 hover:text-white'
-                }`}
-                style={active ? { backgroundColor: item.accent } : undefined}
-              >
-                <Icon size={12} />
-                <span>{item.label}</span>
-              </button>
-            );
-          })}
-        </div>
+        {isWorldMapMode && worldMap ? (
+          <div className="pointer-events-auto flex flex-wrap items-center gap-1 p-1.5 rounded-2xl bg-[#111521]/95 border border-white/15 shadow-xl max-w-3xl">
+            <button
+              type="button"
+              onClick={() => setWorldMapSelectMode(true)}
+              className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-xl text-[11px] font-bold transition-colors whitespace-nowrap ${
+                worldMapSelectMode
+                  ? 'bg-[#7C5CFF] text-white'
+                  : 'text-slate-300 hover:bg-white/10 hover:text-white'
+              }`}
+            >
+              <MousePointer2 size={12} />
+              <span>Select</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setWorldMapSelectMode(false);
+                store.setWorldMapBrushMode('terrain');
+              }}
+              className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-xl text-[11px] font-extrabold transition-colors whitespace-nowrap ${
+                !worldMapSelectMode && store.worldMapBrushMode === 'terrain'
+                  ? 'bg-[#E5C67E] text-slate-900 shadow-xs'
+                  : 'text-slate-300 hover:bg-white/10 hover:text-white'
+              }`}
+            >
+              <span
+                className="w-2.5 h-2.5 rounded-full border border-black/25 shrink-0"
+                style={{ backgroundColor: WORLD_TERRAIN_YELLOW }}
+              />
+              <span>Terrain</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setWorldMapSelectMode(false);
+                store.setWorldMapBrushMode('eraseTerrain');
+              }}
+              className={`inline-flex items-center gap-1 px-2 py-1 rounded-xl text-[11px] font-bold transition-colors whitespace-nowrap ${
+                !worldMapSelectMode && store.worldMapBrushMode === 'eraseTerrain'
+                  ? 'bg-[#F2545B] text-white'
+                  : 'text-slate-300 hover:bg-white/10 hover:text-white'
+              }`}
+            >
+              <Eraser size={12} />
+              <span>Erase Land</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setWorldMapSelectMode(false);
+                store.setWorldMapBrushMode('clearLand');
+              }}
+              className={`inline-flex items-center gap-1 px-2 py-1 rounded-xl text-[11px] font-bold transition-colors whitespace-nowrap ${
+                !worldMapSelectMode && store.worldMapBrushMode === 'clearLand'
+                  ? 'bg-slate-500 text-white'
+                  : 'text-slate-300 hover:bg-white/10 hover:text-white'
+              }`}
+            >
+              <span>Unassign</span>
+            </button>
+
+            <div className="h-4 w-px bg-white/15 mx-0.5" />
+
+            {worldMap.regions.map((region) => {
+              const paintingThisLand =
+                !worldMapSelectMode &&
+                store.worldMapBrushMode === 'paintLand' &&
+                store.selectedWorldLandCode === region.code;
+              return (
+                <button
+                  key={region.id}
+                  type="button"
+                  onClick={() => {
+                    setWorldMapSelectMode(false);
+                    store.setSelectedWorldLandCode(region.code);
+                    store.setWorldMapBrushMode('paintLand');
+                  }}
+                  onDoubleClick={() => store.enterWorldEditorScope(region.levelId)}
+                  title="Paint this Land color on terrain (Double-click to edit Land)"
+                  className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-xl text-[11px] font-extrabold transition-colors whitespace-nowrap ${
+                    paintingThisLand
+                      ? 'text-white shadow-xs ring-2 ring-white/70'
+                      : 'bg-white/10 text-slate-200 hover:bg-white/20'
+                  }`}
+                  style={paintingThisLand ? { backgroundColor: region.colorHex } : undefined}
+                >
+                  <span
+                    className="w-2.5 h-2.5 rounded-full border border-white/50 shrink-0"
+                    style={{ backgroundColor: region.colorHex }}
+                  />
+                  <span className="max-w-[96px] truncate">{region.name}</span>
+                </button>
+              );
+            })}
+
+            <button
+              type="button"
+              onClick={() => {
+                setWorldMapSelectMode(false);
+                store.addWorldLandRegion();
+              }}
+              className="inline-flex items-center gap-1 px-2.5 py-1 rounded-xl bg-[#7C5CFF] hover:bg-[#6A48F5] text-white text-[11px] font-extrabold whitespace-nowrap"
+            >
+              <Plus size={12} />
+              <span>New Land</span>
+            </button>
+
+            <label className="inline-flex items-center gap-1 px-2 py-1 rounded-xl bg-white/5 text-slate-300 text-[10px] font-bold cursor-pointer">
+              <input
+                type="checkbox"
+                checked={store.worldMapAutoLand}
+                onChange={(e) => store.setWorldMapAutoLand(e.target.checked)}
+                className="accent-[#20B46A]"
+              />
+              <span>Auto-Land</span>
+            </label>
+          </div>
+        ) : (
+          <div className="pointer-events-auto flex flex-wrap items-center gap-1 p-1.5 rounded-2xl bg-[#111521]/95 border border-white/15 shadow-xl max-w-3xl">
+            {PAINTER_2D_TOOLS.map((item) => {
+              const Icon = item.Icon;
+              const active = !activePlacementAssetId && tool === item.id;
+              return (
+                <button
+                  key={item.id}
+                  type="button"
+                  onClick={() => setTool(item.id)}
+                  className={`inline-flex items-center gap-1 px-2 py-1 rounded-xl text-[11px] font-bold transition-colors whitespace-nowrap ${
+                    active
+                      ? item.id === 'terrain'
+                        ? 'text-slate-900 shadow-xs'
+                        : 'text-white shadow-xs'
+                      : 'text-slate-300 hover:bg-white/10 hover:text-white'
+                  }`}
+                  style={active ? { backgroundColor: item.accent } : undefined}
+                >
+                  <Icon size={12} />
+                  <span>{item.label}</span>
+                </button>
+              );
+            })}
+          </div>
+        )}
 
         {/* Brush Radius / Density / Zoom */}
         <div className="pointer-events-auto flex items-center gap-2.5 px-3 py-1.5 rounded-2xl bg-[#111521]/95 border border-white/15 text-white text-[11px] font-bold shadow-xl">
@@ -611,18 +981,20 @@ export const Overview2DPainter: React.FC<Overview2DPainterProps> = ({
             />
             <span className="tabular-nums w-7">{brushRadius}m</span>
           </label>
-          <label className="inline-flex items-center gap-1.5">
-            <span className="text-slate-400">Density</span>
-            <input
-              type="range"
-              min={0.2}
-              max={1}
-              step={0.05}
-              value={density}
-              onChange={(e) => setDensity(Number(e.target.value))}
-              className="w-14 accent-[#20B46A]"
-            />
-          </label>
+          {!isWorldMapMode && (
+            <label className="inline-flex items-center gap-1.5">
+              <span className="text-slate-400">Density</span>
+              <input
+                type="range"
+                min={0.2}
+                max={1}
+                step={0.05}
+                value={density}
+                onChange={(e) => setDensity(Number(e.target.value))}
+                className="w-14 accent-[#20B46A]"
+              />
+            </label>
+          )}
           <div className="flex items-center gap-0.5 pl-1 border-l border-white/15">
             <button
               type="button"

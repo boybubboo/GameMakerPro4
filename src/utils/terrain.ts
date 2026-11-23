@@ -1,9 +1,12 @@
 import type {
   BoardPoint,
   CaveGrotto,
+  DirtAndRoadConfig,
   EnvironmentType,
   GameLevel,
+  MountainProfileConfig,
   PropPresetId,
+  RoadSpline,
   ScatterItem,
   TerrainBrush,
   TerrainBrushFalloff,
@@ -11,8 +14,119 @@ import type {
   TerrainData,
   VistaPresetId,
   WallColliderBox,
+  WaterBodyConfig,
 } from '../types/maker';
 export type { WallColliderBox } from '../types/maker';
+
+export function createDefaultMountainConfig(): MountainProfileConfig {
+  return {
+    rockStartHeight: 5.5,
+    snowStartHeight: 10.6,
+    bandTransition: 0.45,
+    roughness: 0.72,
+    noiseType: 'fbm',
+    noiseScale: 1.0,
+    randomness: 0.35,
+    autoSlopeWeathering: 0.68,
+  };
+}
+
+export function createDefaultDirtAndRoadConfig(): DirtAndRoadConfig {
+  return {
+    heroColor: '#9C734B',
+    secondaryColor: '#6F4F32',
+    noiseKind: 'fineLoam',
+    noiseContrast: 0.48,
+    bumpStrength: 0.55,
+    degradeAmount: 0.28,
+    pebbleDensity: 0.55,
+    pebbleSpread: 0.65,
+    pebbleShapeRandomness: 0.62,
+    pebbleColor: '#8B877E',
+    pebbleHueVariance: 0.28,
+    defaultRoadWidth: 2.4,
+    defaultRoadRecess: 0.32,
+    defaultRoadBankAngle: 0.5,
+    defaultRoadEdgeTransition: 0.45,
+    defaultBorderKind: 'wildflowers',
+    defaultBorderDensity: 0.65,
+    defaultBorderRandomness: 0.55,
+  };
+}
+
+export function createDefaultWaterBodies(): WaterBodyConfig[] {
+  return [
+    {
+      id: 'water-whispering-river',
+      name: 'Whispering River',
+      kind: 'river',
+      center: [0, 6],
+      points: [
+        [-140, 22],
+        [-70, -14],
+        [0, 12],
+        [70, -18],
+        [140, 14],
+      ],
+      radiusX: 140,
+      radiusZ: 12,
+      width: 9.2,
+      waterLevelOffset: 0,
+      waterColor: '#2A9D8F',
+      deepMurkColor: '#0E3E44',
+      opacity: 0.84,
+      depth: 2.1,
+      foamAmount: 0.72,
+      waveSpeed: 0.95,
+      windRipple: 0.65,
+      flowSpeed: 1.15,
+      flowAngleDeg: 18,
+      bankSlope: 0.52,
+      bankSmoothness: 0.72,
+      shoreNoise: 0.35,
+    },
+    {
+      id: 'water-whispering-lake',
+      name: 'Crystal Forest Lake',
+      kind: 'lake',
+      center: [-48, -62],
+      radiusX: 21,
+      radiusZ: 15.5,
+      width: 18,
+      waterLevelOffset: 0,
+      waterColor: '#2E86AB',
+      deepMurkColor: '#0C2D48',
+      opacity: 0.86,
+      depth: 2.6,
+      foamAmount: 0.55,
+      waveSpeed: 0.65,
+      windRipple: 0.48,
+      flowSpeed: 0.25,
+      flowAngleDeg: 0,
+      bankSlope: 0.64,
+      bankSmoothness: 0.78,
+      shoreNoise: 0.4,
+    },
+  ];
+}
+
+export function normalizeCaveGrotto(cave: CaveGrotto, index = 0): CaveGrotto {
+  return {
+    ...cave,
+    name: cave.name?.trim() || (index === 0 ? 'Shadowrock Cavern' : `Cave Grotto ${index + 1}`),
+    entranceWidth: cave.entranceWidth ?? 1.0,
+    entranceHeight: cave.entranceHeight ?? 1.0,
+    archSharpness: cave.archSharpness ?? 0.5,
+    cavityDepth: cave.cavityDepth ?? 1.0,
+    cavityWidth: cave.cavityWidth ?? 1.0,
+    stalactiteDensity: cave.stalactiteDensity ?? 0.65,
+    stalagmiteDensity: cave.stalagmiteDensity ?? 0.55,
+    crystalDensity: cave.crystalDensity ?? 0.35,
+    crystalColor: cave.crystalColor ?? '#5EEAD4',
+    hasSpring: cave.hasSpring ?? false,
+    springFlow: cave.springFlow ?? 0.65,
+  };
+}
 
 function quinticSmooth(t: number): number {
   const c = Math.max(0, Math.min(1, t));
@@ -1655,28 +1769,51 @@ export function createInitialTerrain(): TerrainData {
     layers,
     scatter: defaultScatter(),
     caves: [
-      {
-        id: uid(),
-        x: MountainCave.x,
-        z: MountainCave.z,
-        rotation: MountainCave.yaw,
-        scale: 1.0,
-      },
-      {
-        id: uid(),
-        x: 54,
-        z: -48,
-        rotation: 0.65,
-        scale: 1.55,
-      },
-      {
-        id: uid(),
-        x: -14,
-        z: -84,
-        rotation: 0.2,
-        scale: 1.45,
-      },
+      normalizeCaveGrotto(
+        {
+          id: uid(),
+          name: 'Shadowrock Cavern',
+          x: MountainCave.x,
+          z: MountainCave.z,
+          rotation: MountainCave.yaw,
+          scale: 1.0,
+          crystalDensity: 0.45,
+          crystalColor: '#38BDF8',
+          hasSpring: false,
+        },
+        0
+      ),
+      normalizeCaveGrotto(
+        {
+          id: uid(),
+          name: 'Eastern Ridge Cave',
+          x: 54,
+          z: -48,
+          rotation: 0.65,
+          scale: 1.55,
+          crystalDensity: 0.5,
+          crystalColor: '#A78BFA',
+        },
+        1
+      ),
+      normalizeCaveGrotto(
+        {
+          id: uid(),
+          name: 'North Hollow Grotto',
+          x: -14,
+          z: -84,
+          rotation: 0.2,
+          scale: 1.45,
+          crystalDensity: 0.35,
+          crystalColor: '#5EEAD4',
+        },
+        2
+      ),
     ],
+    mountainConfig: createDefaultMountainConfig(),
+    waterBodies: createDefaultWaterBodies(),
+    dirtAndRoadConfig: createDefaultDirtAndRoadConfig(),
+    roads: [],
     revision: 1,
   };
 }
@@ -1691,7 +1828,23 @@ export function ensureUpgradedTerrain(terrain: TerrainData | undefined): Terrain
     terrain.heights.length === (terrain.size + 1) * (terrain.size + 1) &&
     hasForestEcosystem
   ) {
-    return terrain;
+    if (
+      terrain.mountainConfig &&
+      terrain.waterBodies &&
+      terrain.dirtAndRoadConfig &&
+      terrain.roads &&
+      terrain.caves?.every((c) => Boolean(c.name))
+    ) {
+      return terrain;
+    }
+    return {
+      ...terrain,
+      mountainConfig: terrain.mountainConfig ?? createDefaultMountainConfig(),
+      waterBodies: terrain.waterBodies ?? createDefaultWaterBodies(),
+      dirtAndRoadConfig: terrain.dirtAndRoadConfig ?? createDefaultDirtAndRoadConfig(),
+      roads: terrain.roads ?? [],
+      caves: (terrain.caves ?? []).map((c, idx) => normalizeCaveGrotto(c, idx)),
+    };
   }
   // Automatically upgrade legacy or older-grid islands to the 5x forest/river/trail island
   const prevScale = terrain.size < 96 ? 64 : IslandTerrain.radius;
@@ -1899,7 +2052,9 @@ export function applyTerrainBrush(
     brush === 'smoothGround' ||
     brush === 'flattenGround' ||
     brush === 'plateauCliff' ||
-    brush === 'carveRiver';
+    brush === 'carveRiver' ||
+    brush === 'paintWaterLake' ||
+    brush === 'paintRoad';
 
   const paintLayerMap: Partial<Record<TerrainBrush, number>> = {
     paintGrass: 0,
@@ -1916,6 +2071,30 @@ export function applyTerrainBrush(
   const maxCol = Math.min(size, Math.ceil(((x + radius + worldRadius) / (2 * worldRadius)) * size) + 1);
   const minRow = Math.max(0, Math.floor(((z - radius + worldRadius) / (2 * worldRadius)) * size) - 1);
   const maxRow = Math.min(size, Math.ceil(((z + radius + worldRadius) / (2 * worldRadius)) * size) + 1);
+
+  if (brush === 'paintGrassErase') {
+    const updatedLayers = [...terrain.layers];
+    for (let row = minRow; row <= maxRow; row++) {
+      for (let col = minCol; col <= maxCol; col++) {
+        const vx = -worldRadius + col * step;
+        const vz = -worldRadius + row * step;
+        const d = Math.hypot(vx - x, vz - z);
+        if (d > radius) continue;
+        if (updatedLayers[row * width + col] === 0 || updatedLayers[row * width + col] === 4) {
+          updatedLayers[row * width + col] = 6; // bare earth under cleared grass
+        }
+      }
+    }
+    const nextScatter = terrain.scatter.filter(
+      (s) => s.kind !== 'tallGrass' || Math.hypot(s.x - x, s.z - z) > radius
+    );
+    return {
+      ...terrain,
+      layers: updatedLayers,
+      scatter: nextScatter,
+      revision: terrain.revision + 1,
+    };
+  }
 
   if (brush === 'carveCave') {
     const caves: CaveGrotto[] = [...(terrain.caves ?? [])];
@@ -1941,13 +2120,18 @@ export function applyTerrainBrush(
     }
 
     if (!tooClose && caves.length < 18) {
-      caves.push({
-        id: uid(),
-        x,
-        z,
-        rotation: Math.atan2(-x, -z),
-        scale: Math.max(0.95, Math.min(1.8, radius / 4)),
-      });
+      caves.push(
+        normalizeCaveGrotto(
+          {
+            id: uid(),
+            x,
+            z,
+            rotation: Math.atan2(-x, -z),
+            scale: Math.max(0.95, Math.min(1.8, radius / 4)),
+          },
+          caves.length
+        )
+      );
     }
 
     return {
@@ -1968,6 +2152,7 @@ export function applyTerrainBrush(
         ? options.flattenHeight
         : sampleTerrainHeight(terrain, x, z);
     const cliffTarget = Math.min(22, Math.ceil((centerH + 0.5) / 2.4) * 2.4);
+    const roadCfg = terrain.dirtAndRoadConfig ?? createDefaultDirtAndRoadConfig();
 
     for (let row = minRow; row <= maxRow; row++) {
       for (let col = minCol; col <= maxCol; col++) {
@@ -1983,7 +2168,6 @@ export function applyTerrainBrush(
         } else if (brush === 'lowerGround') {
           updated[idx] = Math.max(-4.2, original[idx] - soft * 0.92 * strength);
         } else if (brush === 'smoothGround') {
-          // 3x3 Gaussian-weighted 9-tap kernel for silky curved vertical-to-horizontal transitions
           const rUp = Math.max(0, row - 1);
           const rDn = Math.min(size, row + 1);
           const cLt = Math.max(0, col - 1);
@@ -2013,11 +2197,18 @@ export function applyTerrainBrush(
           if (distance >= radius * 0.48 && distance <= radius * 0.92) {
             updatedLayers[idx] = 2; // rock cliff wall
           }
-        } else if (brush === 'carveRiver') {
-          const riverFloor = IslandTerrain.waterLevel - 1.25;
+        } else if (brush === 'carveRiver' || brush === 'paintWaterLake') {
+          const riverFloor = IslandTerrain.waterLevel - (brush === 'paintWaterLake' ? 1.55 : 1.25);
           updated[idx] = original[idx] + (riverFloor - original[idx]) * Math.min(1, soft * 0.62 * strength);
-          if (soft > 0.2) {
+          if (soft > 0.18) {
             updatedLayers[idx] = 1; // sandy riverbed & banks
+          }
+        } else if (brush === 'paintRoad') {
+          const recess = roadCfg.defaultRoadRecess * soft * Math.min(1, strength);
+          const minSafe = IslandTerrain.waterLevel + 0.45;
+          updated[idx] = Math.max(minSafe, original[idx] - recess * 0.55);
+          if (soft > 1 - Math.max(0.2, roadCfg.defaultRoadEdgeTransition)) {
+            updatedLayers[idx] = 6; // dirt road
           }
         }
       }
@@ -2723,5 +2914,413 @@ export function createDrivingTerrain(): TerrainData {
     scatter: cleared,
     revision: base.revision + 1,
   };
+}
+
+export function carveWaterBodyIntoTerrain(
+  rawTerrain: TerrainData,
+  wb: WaterBodyConfig
+): TerrainData {
+  const terrain = ensureUpgradedTerrain(rawTerrain);
+  const size = terrain.size;
+  const width = size + 1;
+  const worldRadius = IslandTerrain.radius;
+  const step = (2 * worldRadius) / size;
+  const heights = [...terrain.heights];
+  const layers = [...terrain.layers];
+
+  const waterY = IslandTerrain.waterLevel + wb.waterLevelOffset;
+  const bedY = waterY - Math.max(0.5, wb.depth * 0.82);
+  const bankSpread = 0.24 + wb.bankSlope * 0.9; // steeper = smaller shoulder
+  const outerMult = 1 + bankSpread;
+
+  if (wb.kind === 'river' || wb.kind === 'stream') {
+    const pts: [number, number][] =
+      wb.points && wb.points.length >= 2
+        ? wb.points
+        : [
+            [wb.center[0] - wb.radiusX * 0.5, wb.center[1]],
+            [wb.center[0] + wb.radiusX * 0.5, wb.center[1]],
+          ];
+    const samples = samplePolylineSpline(pts, 120);
+    const innerHalf = Math.max(1.2, wb.width * 0.5);
+    const outerHalf = innerHalf * (1 + 0.55 + wb.bankSlope * 1.1);
+    for (let row = 0; row < width; row++) {
+      for (let col = 0; col < width; col++) {
+        const vx = -worldRadius + col * step;
+        const vz = -worldRadius + row * step;
+        const noise =
+          wb.shoreNoise *
+          (Math.sin(vx * 0.35 + vz * 0.28) * 0.8 + Math.cos(vz * 0.5 - vx * 0.2) * 0.5);
+        const d = distToSpline(samples, vx, vz) + noise;
+        if (d > outerHalf) continue;
+        const idx = row * width + col;
+        if (d <= innerHalf) {
+          heights[idx] = Math.min(heights[idx], bedY);
+          layers[idx] = 1;
+        } else {
+          const t = (d - innerHalf) / Math.max(0.1, outerHalf - innerHalf);
+          const shaped = Math.pow(quinticSmooth(t), 1.35 - wb.bankSmoothness * 0.65);
+          heights[idx] = bedY * (1 - shaped) + heights[idx] * shaped;
+          if (t < 0.52) layers[idx] = 1;
+          else if (t < 0.78 && layers[idx] === 0) layers[idx] = 4;
+        }
+      }
+    }
+  } else {
+    const rx = Math.max(2, wb.radiusX);
+    const rz = Math.max(2, wb.radiusZ);
+    for (let row = 0; row < width; row++) {
+      for (let col = 0; col < width; col++) {
+        const vx = -worldRadius + col * step;
+        const vz = -worldRadius + row * step;
+        const ang = Math.atan2(vz - wb.center[1], vx - wb.center[0]);
+        const wobble =
+          1 +
+          wb.shoreNoise *
+            0.22 *
+            (Math.sin(ang * 3 + wb.center[0] * 0.1) + Math.cos(ang * 5 - wb.center[1] * 0.1));
+        const u = Math.hypot((vx - wb.center[0]) / (rx * wobble), (vz - wb.center[1]) / (rz * wobble));
+        if (u > outerMult) continue;
+        const idx = row * width + col;
+        if (u <= 0.68) {
+          heights[idx] = bedY;
+          layers[idx] = 1;
+        } else {
+          const t = (u - 0.68) / Math.max(0.05, outerMult - 0.68);
+          const shaped = Math.pow(quinticSmooth(t), 1.35 - wb.bankSmoothness * 0.65);
+          heights[idx] = bedY * (1 - shaped) + heights[idx] * shaped;
+          if (t < 0.45) layers[idx] = 1;
+          else if (t < 0.75 && layers[idx] === 0) layers[idx] = 4;
+        }
+      }
+    }
+  }
+
+  return {
+    ...terrain,
+    heights,
+    layers,
+    revision: terrain.revision + 1,
+  };
+}
+
+export function applyRoadSplineToTerrain(
+  rawTerrain: TerrainData,
+  road: RoadSpline,
+  regenerateBorder = true
+): TerrainData {
+  const terrain = ensureUpgradedTerrain(rawTerrain);
+  if (road.points.length < 2) return terrain;
+  const samples = samplePolylineSpline(road.points, Math.max(48, road.points.length * 16));
+  const size = terrain.size;
+  const width = size + 1;
+  const worldRadius = IslandTerrain.radius;
+  const step = (2 * worldRadius) / size;
+  const heights = [...terrain.heights];
+  const layers = [...terrain.layers];
+
+  const innerHalf = Math.max(0.6, road.width * 0.5);
+  const bankSpread = Math.max(0.35, (1.1 - road.bankSlopeAngle) * 1.4 + road.edgeTransition * 1.6);
+  const outerHalf = innerHalf + bankSpread;
+  const minSafeH = IslandTerrain.waterLevel + 0.45;
+
+  for (let row = 0; row < width; row++) {
+    for (let col = 0; col < width; col++) {
+      const vx = -worldRadius + col * step;
+      const vz = -worldRadius + row * step;
+      const d = distToSpline(samples, vx, vz);
+      if (d > outerHalf) continue;
+      if (IslandRiver.distanceTo(vx, vz) < 5.2) continue;
+      const idx = row * width + col;
+      if (d <= innerHalf) {
+        heights[idx] = Math.max(minSafeH, heights[idx] - road.recessDepth);
+        layers[idx] = 6;
+      } else {
+        const s = (d - innerHalf) / Math.max(0.05, outerHalf - innerHalf);
+        const w = 1 - quinticSmooth(s);
+        heights[idx] = Math.max(minSafeH, heights[idx] - road.recessDepth * w);
+        const edgeThreshold = 0.25 + (1 - road.edgeTransition) * 0.5;
+        if (w > edgeThreshold) layers[idx] = 6;
+      }
+    }
+  }
+
+  let scatter = terrain.scatter;
+  if (regenerateBorder && road.borderScatter !== 'none') {
+    const rand = Math.max(0, Math.min(1, road.borderRandomness));
+    const stepIdx = Math.max(2, Math.round(7 - road.borderDensity * 3.5));
+    const added: ScatterItem[] = [];
+    for (let i = 2; i < samples.length - 2; i += stepIdx) {
+      const s = samples[i];
+      if (IslandRiver.distanceTo(s.x, s.z) < 6.0) continue;
+      const nx = -s.tz;
+      const nz = s.tx;
+      for (const side of [-1, 1]) {
+        if (Math.random() > Math.min(1, road.borderDensity * 0.82)) continue;
+        const offset = innerHalf + 0.65 + Math.random() * (0.8 + rand * 1.4);
+        const sx = s.x + nx * side * offset + (Math.random() - 0.5) * rand * 0.8;
+        const sz = s.z + nz * side * offset + (Math.random() - 0.5) * rand * 0.8;
+        if (Math.hypot(sx, sz) > IslandTerrain.radius * 0.93) continue;
+        let kind: ScatterItem['kind'] = 'flower';
+        if (road.borderScatter === 'grass') kind = 'tallGrass';
+        else if (road.borderScatter === 'boulders') kind = 'rock';
+        else if (road.borderScatter === 'custom' && road.borderCustomAssetId) kind = 'custom';
+        else if (road.borderScatter === 'mixed') {
+          const pick = Math.random();
+          kind = pick < 0.42 ? 'flower' : pick < 0.78 ? 'tallGrass' : 'rock';
+        }
+        added.push({
+          id: uid(),
+          kind,
+          customAssetId: kind === 'custom' ? road.borderCustomAssetId : undefined,
+          x: sx,
+          z: sz,
+          size: 0.78 + Math.random() * (0.25 + rand * 0.45),
+          rotation: Math.random() * Math.PI * 2,
+        });
+      }
+    }
+    scatter = [...scatter.slice(0, Math.max(0, 3600 - added.length)), ...added];
+  }
+
+  return {
+    ...terrain,
+    heights,
+    layers,
+    scatter,
+    revision: terrain.revision + 1,
+  };
+}
+
+export type Overview2DBrushId =
+  | 'coniferWoods'
+  | 'deciduousWoods'
+  | 'bushes'
+  | 'wildflowers'
+  | 'rocks'
+  | 'hills'
+  | 'beaches'
+  | 'lakes'
+  | 'rivers'
+  | 'caves'
+  | 'roads'
+  | 'erase';
+
+export function apply2DOverviewBrushStroke(
+  rawTerrain: TerrainData,
+  brushId: Overview2DBrushId,
+  x: number,
+  z: number,
+  radius: number,
+  density = 0.65,
+  isStrokeStart = false
+): TerrainData {
+  const terrain = ensureUpgradedTerrain(rawTerrain);
+  const size = terrain.size;
+  const width = size + 1;
+  const worldRadius = IslandTerrain.radius;
+  const step = (2 * worldRadius) / size;
+  const r = Math.max(2, radius);
+  const minCol = Math.max(0, Math.floor(((x - r + worldRadius) / (2 * worldRadius)) * size) - 1);
+  const maxCol = Math.min(size, Math.ceil(((x + r + worldRadius) / (2 * worldRadius)) * size) + 1);
+  const minRow = Math.max(0, Math.floor(((z - r + worldRadius) / (2 * worldRadius)) * size) - 1);
+  const maxRow = Math.min(size, Math.ceil(((z + r + worldRadius) / (2 * worldRadius)) * size) + 1);
+
+  if (brushId === 'hills') {
+    return applyTerrainBrush(terrain, 'raiseGround', x, z, r, undefined, {
+      strength: 0.45 + density * 0.85,
+      falloff: 'smooth',
+    });
+  }
+  if (brushId === 'beaches') {
+    return applyTerrainBrush(terrain, 'paintSand', x, z, r);
+  }
+  if (brushId === 'caves') {
+    if (!isStrokeStart) return terrain;
+    return applyTerrainBrush(terrain, 'carveCave', x, z, Math.max(4.5, Math.min(10, r)));
+  }
+
+  if (brushId === 'lakes' || brushId === 'rivers') {
+    const nextHeights = [...terrain.heights];
+    const nextLayers = [...terrain.layers];
+    const bedY = IslandTerrain.waterLevel - (brushId === 'lakes' ? 1.5 : 1.2);
+    for (let row = minRow; row <= maxRow; row++) {
+      for (let col = minCol; col <= maxCol; col++) {
+        const vx = -worldRadius + col * step;
+        const vz = -worldRadius + row * step;
+        const d = Math.hypot(vx - x, vz - z);
+        if (d > r) continue;
+        const soft = quinticSmooth(1 - d / r);
+        const idx = row * width + col;
+        nextHeights[idx] = nextHeights[idx] * (1 - soft * 0.72) + bedY * (soft * 0.72);
+        if (soft > 0.25) nextLayers[idx] = 1;
+      }
+    }
+    const waterBodies = [...(terrain.waterBodies ?? createDefaultWaterBodies())];
+    if (isStrokeStart && brushId === 'lakes') {
+      const nearby = waterBodies.some(
+        (wb) => wb.kind === 'lake' && Math.hypot(wb.center[0] - x, wb.center[1] - z) < r * 1.15
+      );
+      if (!nearby) {
+        waterBodies.push({
+          id: uid(),
+          name: `Painted Lake ${waterBodies.length + 1}`,
+          kind: 'lake',
+          center: [x, z],
+          radiusX: Math.max(6, r * 0.9),
+          radiusZ: Math.max(6, r * 0.85),
+          width: r * 1.2,
+          waterLevelOffset: 0,
+          waterColor: '#2E86AB',
+          deepMurkColor: '#0C2D48',
+          opacity: 0.86,
+          depth: 2.3,
+          foamAmount: 0.55,
+          waveSpeed: 0.75,
+          windRipple: 0.5,
+          flowSpeed: 0.2,
+          flowAngleDeg: 0,
+          bankSlope: 0.6,
+          bankSmoothness: 0.75,
+          shoreNoise: 0.35,
+        });
+      }
+    } else if (brushId === 'rivers') {
+      let activeRiver = waterBodies.find((wb) => wb.id.startsWith('water-2d-river-'));
+      if (isStrokeStart || !activeRiver) {
+        activeRiver = {
+          id: `water-2d-river-${uid()}`,
+          name: `Painted Creek ${waterBodies.filter((w) => w.kind === 'river' || w.kind === 'stream').length + 1}`,
+          kind: 'stream',
+          center: [x, z],
+          points: [[x, z]],
+          radiusX: r,
+          radiusZ: r,
+          width: Math.max(3.2, r * 0.95),
+          waterLevelOffset: 0,
+          waterColor: '#2A9D8F',
+          deepMurkColor: '#0E3E44',
+          opacity: 0.84,
+          depth: 1.5,
+          foamAmount: 0.65,
+          waveSpeed: 0.9,
+          windRipple: 0.55,
+          flowSpeed: 1.2,
+          flowAngleDeg: 0,
+          bankSlope: 0.5,
+          bankSmoothness: 0.7,
+          shoreNoise: 0.35,
+        };
+        waterBodies.push(activeRiver);
+      } else {
+        const pts = activeRiver.points ?? [activeRiver.center];
+        const last = pts[pts.length - 1];
+        if (!last || Math.hypot(last[0] - x, last[1] - z) >= 3.2) {
+          const updatedPts: [number, number][] = [...pts, [x, z]];
+          const idx = waterBodies.findIndex((w) => w.id === activeRiver!.id);
+          if (idx >= 0) waterBodies[idx] = { ...activeRiver, points: updatedPts };
+        }
+      }
+    }
+    return {
+      ...terrain,
+      heights: nextHeights,
+      layers: nextLayers,
+      waterBodies,
+      revision: terrain.revision + 1,
+    };
+  }
+
+  if (brushId === 'roads') {
+    const roadCfg = terrain.dirtAndRoadConfig ?? createDefaultDirtAndRoadConfig();
+    const roads = [...(terrain.roads ?? [])];
+    if (isStrokeStart || roads.length === 0) {
+      roads.push({
+        id: uid(),
+        name: `Trail ${roads.length + 1}`,
+        points: [[x, z]],
+        width: Math.max(1.6, Math.min(6.0, r * 0.48)),
+        recessDepth: roadCfg.defaultRoadRecess,
+        bankSlopeAngle: roadCfg.defaultRoadBankAngle,
+        edgeTransition: roadCfg.defaultRoadEdgeTransition,
+        borderScatter: roadCfg.defaultBorderKind,
+        borderDensity: roadCfg.defaultBorderDensity,
+        borderRandomness: roadCfg.defaultBorderRandomness,
+        borderCustomAssetId: roadCfg.defaultBorderAssetId,
+      });
+    } else {
+      const lastRoad = roads[roads.length - 1];
+      const prevPt = lastRoad.points[lastRoad.points.length - 1];
+      if (!prevPt || Math.hypot(prevPt[0] - x, prevPt[1] - z) >= 2.5) {
+        roads[roads.length - 1] = {
+          ...lastRoad,
+          points: [...lastRoad.points, [x, z]],
+        };
+      }
+    }
+    const painted = applyTerrainBrush(terrain, 'paintRoad', x, z, Math.max(2.2, r * 0.45), undefined, {
+      strength: 0.9,
+    });
+    return { ...painted, roads };
+  }
+
+  if (brushId === 'erase') {
+    const nextHeights = [...terrain.heights];
+    const nextLayers = [...terrain.layers];
+    for (let row = minRow; row <= maxRow; row++) {
+      for (let col = minCol; col <= maxCol; col++) {
+        const vx = -worldRadius + col * step;
+        const vz = -worldRadius + row * step;
+        const d = Math.hypot(vx - x, vz - z);
+        if (d > r) continue;
+        const soft = quinticSmooth(1 - d / r);
+        const idx = row * width + col;
+        nextHeights[idx] = nextHeights[idx] * (1 - soft * 0.55) + IslandTerrain.baseTop * (soft * 0.55);
+        if (soft > 0.35) nextLayers[idx] = 0;
+      }
+    }
+    const filteredScatter = terrain.scatter.filter((s) => Math.hypot(s.x - x, s.z - z) > r);
+    const filteredCaves = (terrain.caves ?? []).filter((c) => Math.hypot(c.x - x, c.z - z) > r);
+    return {
+      ...terrain,
+      heights: nextHeights,
+      layers: nextLayers,
+      scatter: filteredScatter,
+      caves: filteredCaves,
+      revision: terrain.revision + 1,
+    };
+  }
+
+  // Generic botanical & boulder blocking brushes
+  const targetCount = Math.max(1, Math.round(density * (brushId === 'wildflowers' ? 7 : 4)));
+  const minSpacing = brushId === 'wildflowers' ? 1.1 : brushId === 'bushes' ? 1.8 : 2.6;
+  const nextScatter = [...terrain.scatter];
+  for (let i = 0; i < targetCount; i++) {
+    if (nextScatter.length >= 3600) break;
+    const ang = Math.random() * Math.PI * 2;
+    const dist = Math.sqrt(Math.random()) * r;
+    const sx = x + Math.cos(ang) * dist;
+    const sz = z + Math.sin(ang) * dist;
+    if (Math.hypot(sx, sz) >= IslandTerrain.radius * 0.94) continue;
+    if (nextScatter.some((item) => Math.hypot(item.x - sx, item.z - sz) < minSpacing)) continue;
+    let kind: ScatterItem['kind'] = 'oak';
+    if (brushId === 'coniferWoods') kind = 'pine';
+    else if (brushId === 'deciduousWoods') kind = Math.random() < 0.32 ? 'birch' : 'oak';
+    else if (brushId === 'bushes') kind = Math.random() < 0.3 ? 'berryBush' : 'bush';
+    else if (brushId === 'wildflowers') kind = 'flower';
+    else if (brushId === 'rocks') kind = 'rock';
+    nextScatter.push({
+      id: uid(),
+      kind,
+      x: sx,
+      z: sz,
+      size:
+        kind === 'pine' || kind === 'oak' || kind === 'birch'
+          ? 0.92 + Math.random() * 0.55
+          : 0.78 + Math.random() * 0.48,
+      rotation: Math.random() * Math.PI * 2,
+    });
+  }
+  return { ...terrain, scatter: nextScatter, revision: terrain.revision + 1 };
 }
 

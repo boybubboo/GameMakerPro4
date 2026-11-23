@@ -564,7 +564,7 @@ export const TextureStudioModal: React.FC<TextureStudioModalProps> = ({
           <div className="min-w-0">
             <h2 className="text-base font-extrabold tracking-tight flex items-center gap-2 truncate">
               <Layers size={16} className="text-[#7C5CFF] shrink-0" />
-              <span>Scenery Texture Studio</span>
+              <span>Texture Maker</span>
               {activeCount > 0 && (
                 <span className="px-2 py-0.5 rounded-lg bg-[#7C5CFF]/15 text-[#7C5CFF] text-[11px] font-bold">
                   {activeCount} custom {activeCount === 1 ? 'surface' : 'surfaces'}
@@ -579,7 +579,7 @@ export const TextureStudioModal: React.FC<TextureStudioModalProps> = ({
             type="button"
             onClick={onClose}
             className="p-2 rounded-xl hover:bg-slate-100 dark:hover:bg-white/[0.06] text-slate-500"
-            aria-label="Close Texture Studio"
+            aria-label="Close Texture Maker"
           >
             <X size={16} />
           </button>

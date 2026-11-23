@@ -950,7 +950,7 @@ export const MotionStage: React.FC<{ store: MakerStore }> = ({ store }) => {
           <div className="mx-auto w-14 h-14 rounded-2xl bg-[#7C5CFF]/15 text-[#7C5CFF] flex items-center justify-center">
             <Film size={26} />
           </div>
-          <h2 className="text-xl font-black tracking-tight">Character Motion Studio</h2>
+          <h2 className="text-xl font-black tracking-tight">Character Motion Maker</h2>
           <p className="text-sm text-slate-600 dark:text-[#949BB0]">
             Import a rigged 3D character (.glb or .gltf) to pose joints directly in 3D, keyframe
             custom looping animations on the timeline, and set them as default game moves.
@@ -1002,7 +1002,7 @@ export const MotionStage: React.FC<{ store: MakerStore }> = ({ store }) => {
           <div className="flex items-center gap-2 pr-2 border-r border-slate-200/80 dark:border-white/[0.08]">
             <Film size={16} className="text-[#7C5CFF] shrink-0" />
             <span className="text-sm font-black tracking-tight whitespace-nowrap">
-              Motion Studio
+              Motion Maker
             </span>
           </div>
 

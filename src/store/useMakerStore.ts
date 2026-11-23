@@ -18,6 +18,7 @@ import {
 } from '../data/registries';
 import type { FxLibraryTemplate } from '../data/fxEffectLibrary';
 import {
+  evictCachedAsset,
   parseUploadedGlbFile,
   registerGeneratedGlbAsset,
 } from '../three/gltfAssetManager';
@@ -36,6 +37,8 @@ import type {
   BuildingMaterialId,
   BuildingShapeId,
   BuiltinMechanismTemplate,
+  CaveGrotto,
+  CharacterMakerDoc,
   CraftingRecipe,
   CustomAssetMeta,
   CustomTextureAssetMeta,
@@ -59,6 +62,7 @@ import type {
   ObjectMakerDoc,
   ObjectMechanism,
   PlayerTelemetry,
+  RoadSpline,
   RuleRecipe,
   SavePresetEntry,
   SavePresetScope,
@@ -70,11 +74,17 @@ import type {
   TerrainBrush,
   TerrainBrushFalloff,
   TerrainBrushOptions,
+  TerrainData,
+  VertexPaintStroke,
   ViewportResolutionScale,
   ViewportShadowQuality,
   ViewportTool,
   VisualStyleId,
+  WaterBodyConfig,
+  WaterBodyKind,
   WidgetKind,
+  WorldDomainId,
+  WorldViewMode,
 } from '../types/maker';
 import {
   BUILDING_SHAPES,
@@ -148,13 +158,20 @@ import {
   type ZipVoiceEntry,
 } from '../utils/makerArchive';
 import {
+  apply2DOverviewBrushStroke,
   applyLushGroundFloraToTerrain,
   applyMountainCaveToTerrain,
+  applyRoadSplineToTerrain,
   applyTerrainBrush,
+  carveWaterBodyIntoTerrain,
+  createDefaultWaterBodies,
   createInitialTerrain,
   ensureUpgradedTerrain,
   getEnvironmentType,
   IslandTerrain,
+  levelWorldToBoard,
+  normalizeCaveGrotto,
+  type Overview2DBrushId,
   sampleTerrainHeight,
   smoothOrganicMossLayers,
   uid,
@@ -442,6 +459,34 @@ export function useMakerStore() {
 
   const [worldTool, setWorldTool] = useState<ViewportTool>('move');
   const [worldGridSnap, setWorldGridSnap] = useState<0 | 0.5 | 1 | 2>(1);
+  const [worldViewMode, setWorldViewMode] = useState<WorldViewMode>('3d');
+  const [activeWorldDomain, setActiveWorldDomain] = useState<WorldDomainId>('select');
+  const [cameraAngleLocked, setCameraAngleLocked] = useState(false);
+  const [cameraFocusRequest, setCameraFocusRequest] = useState<{
+    id: string;
+    x: number;
+    y: number;
+    z: number;
+    distance?: number;
+    yawDeg?: number;
+    pitchDeg?: number;
+    nonce: number;
+  } | null>(null);
+  const [selectedWaterBodyId, setSelectedWaterBodyId] = useState<string | null>(null);
+  const [selectedCaveId, setSelectedCaveId] = useState<string | null>(null);
+  const [selectedRoadId, setSelectedRoadId] = useState<string | null>(null);
+  const [showingAtmosphereDrawer, setShowingAtmosphereDrawer] = useState(false);
+  const [showingSkybox, setShowingSkybox] = useState(false);
+  const [showingPostFx, setShowingPostFx] = useState(false);
+  const [showingFxLibrary, setShowingFxLibrary] = useState(false);
+  const [showingTextureStudio, setShowingTextureStudio] = useState(false);
+  const [vertexPaintTarget, setVertexPaintTarget] = useState<string | null>(null);
+  const [attributeModifierTarget, setAttributeModifierTarget] = useState<
+    | null
+    | { kind: 'entity'; entityId: string }
+    | { kind: 'assetMeta'; assetId: string }
+  >(null);
+
   const [terrainBrush, setTerrainBrush] = useState<TerrainBrush>('raiseGround');
   const [terrainBrushRadius, setTerrainBrushRadius] = useState<number>(5.5);
   const [terrainBrushStrength, setTerrainBrushStrength] = useState<number>(0.75);
@@ -462,6 +507,12 @@ export function useMakerStore() {
   const [motionAssetId, setMotionAssetId] = useState<string | null>(null);
   const [objectMakerOpen, setObjectMakerOpen] = useState(false);
   const [objectMakerTargetAssetId, setObjectMakerTargetAssetId] = useState<string | null>(null);
+  const [plantMakerOpen, setPlantMakerOpen] = useState(false);
+  const [plantMakerTargetAssetId, setPlantMakerTargetAssetId] = useState<string | null>(null);
+  const [characterMakerOpen, setCharacterMakerOpen] = useState(false);
+  const [characterMakerTargetAssetId, setCharacterMakerTargetAssetId] = useState<string | null>(null);
+  const [treeMakerOpen, setTreeMakerOpen] = useState(false);
+  const [treeMakerTargetAssetId, setTreeMakerTargetAssetId] = useState<string | null>(null);
   const [isPlaying, setIsPlaying] = useState(false);
   const [playModalOpen, setPlayModalOpen] = useState(false);
   const [playFromPoint, setPlayFromPoint] = useState<BoardPoint | null>(null);
@@ -488,6 +539,7 @@ export function useMakerStore() {
     setShowingTerrainEditorRaw(open);
     if (open) {
       setSelectedTab('world');
+      setActiveWorldDomain('mountains');
       setWorldTool('terrain');
     }
   }, []);
@@ -678,6 +730,11 @@ export function useMakerStore() {
       buffer: ArrayBuffer;
       mechanisms?: ObjectMechanism[];
       objectRecipe?: ObjectMakerDoc;
+      characterRecipe?: CharacterMakerDoc;
+      treeRecipe?: StylizedCanopyConfig;
+      buildingBlock?: BuildingBlockConfig;
+      vertexPaintStrokes?: VertexPaintStroke[];
+      thumbnailOverride?: string;
       keepMetricScale?: boolean;
     }): Promise<CustomAssetMeta> => {
       const existingMeta = opts.existingAssetId
@@ -690,6 +747,11 @@ export function useMakerStore() {
         buffer: opts.buffer,
         mechanisms: opts.mechanisms,
         objectRecipe: opts.objectRecipe,
+        characterRecipe: opts.characterRecipe,
+        treeRecipe: opts.treeRecipe,
+        buildingBlock: opts.buildingBlock,
+        vertexPaintStrokes: opts.vertexPaintStrokes,
+        thumbnailOverride: opts.thumbnailOverride,
         keepMetricScale: opts.keepMetricScale ?? true,
       });
       await saveAssetRecord(meta, buffer);
@@ -708,8 +770,53 @@ export function useMakerStore() {
     [customAssets]
   );
 
+  const toggleFavoriteCustomAsset = useCallback(
+    async (id: string): Promise<boolean> => {
+      const target = customAssets.find((a) => a.id === id);
+      if (!target) return false;
+      const nextFav = !target.favorite;
+      const updated: CustomAssetMeta = { ...target, favorite: nextFav };
+      await updateAssetMetaRecord(updated);
+      setCustomAssets((prev) => prev.map((a) => (a.id === id ? updated : a)));
+      return nextFav;
+    },
+    [customAssets]
+  );
+
+  const duplicateCustomAsset = useCallback(
+    async (id: string): Promise<CustomAssetMeta | null> => {
+      const source = customAssets.find((a) => a.id === id);
+      if (!source) return null;
+      const blob = (await getAssetBlob(id)) ?? new ArrayBuffer(0);
+      const clonedBuffer = blob.slice(0);
+      const newId = uid();
+      const baseName = `${source.name.replace(/\s+Copy(\s+\d+)?$/i, '')} Copy`;
+      let candidateName = baseName;
+      let copyIdx = 2;
+      const existingNames = new Set(customAssets.map((a) => a.name.toLowerCase()));
+      while (existingNames.has(candidateName.toLowerCase())) {
+        candidateName = `${baseName} ${copyIdx++}`;
+      }
+      const clonedMeta: CustomAssetMeta = {
+        ...(JSON.parse(JSON.stringify(source)) as CustomAssetMeta),
+        id: newId,
+        name: candidateName,
+        favorite: false,
+        createdAt: new Date().toISOString(),
+      };
+      await saveAssetRecord(clonedMeta, clonedBuffer);
+      if (clonedMeta.thumbnailDataUrl) {
+        setCustomAssetThumbnailCache(newId, clonedMeta.thumbnailDataUrl);
+      }
+      setCustomAssets((prev) => [clonedMeta, ...prev]);
+      return clonedMeta;
+    },
+    [customAssets]
+  );
+
   const removeCustomAsset = useCallback(async (id: string) => {
     await deleteAssetRecord(id);
+    evictCachedAsset(id);
     setCustomAssets((prev) => prev.filter((a) => a.id !== id));
   }, []);
 
@@ -975,6 +1082,214 @@ export function useMakerStore() {
     }));
   }, [updateLevel]);
 
+  const focusCameraOnWorldPoint = useCallback(
+    (opts: {
+      id: string;
+      x: number;
+      y?: number;
+      z: number;
+      distance?: number;
+      yawDeg?: number;
+      pitchDeg?: number;
+    }) => {
+      setCameraFocusRequest({
+        id: opts.id,
+        x: opts.x,
+        y: opts.y ?? 1.5,
+        z: opts.z,
+        distance: opts.distance,
+        yawDeg: opts.yawDeg,
+        pitchDeg: opts.pitchDeg,
+        nonce: Date.now() + Math.random(),
+      });
+    },
+    []
+  );
+
+  const updateWaterBody = useCallback(
+    (id: string, patch: Partial<WaterBodyConfig>, recarveTerrain = false, recordUndo = false) => {
+      updateLevel(
+        'edit water body',
+        (lvl) => {
+          const base = ensureUpgradedTerrain(lvl.terrain);
+          const list = base.waterBodies ?? createDefaultWaterBodies();
+          let updatedBody: WaterBodyConfig | null = null;
+          const nextBodies = list.map((wb) => {
+            if (wb.id !== id) return wb;
+            updatedBody = { ...wb, ...patch };
+            return updatedBody;
+          });
+          let nextTerrain: TerrainData = { ...base, waterBodies: nextBodies, revision: base.revision + (recarveTerrain ? 0 : 1) };
+          if (recarveTerrain && updatedBody) {
+            nextTerrain = carveWaterBodyIntoTerrain(nextTerrain, updatedBody);
+          }
+          return { ...lvl, terrain: nextTerrain };
+        },
+        recordUndo
+      );
+    },
+    [updateLevel]
+  );
+
+  const addWaterBody = useCallback(
+    (kind: WaterBodyKind, center: [number, number]) => {
+      const id = uid();
+      const label =
+        kind === 'lake'
+          ? 'Mirror Lake'
+          : kind === 'pond'
+          ? 'Woodland Pond'
+          : kind === 'stream'
+          ? 'Silver Creek'
+          : 'Misty River';
+      const newBody: WaterBodyConfig = {
+        id,
+        name: label,
+        kind,
+        center,
+        points:
+          kind === 'river' || kind === 'stream'
+            ? [
+                [center[0] - 18, center[1] - 6],
+                [center[0], center[1] + 4],
+                [center[0] + 18, center[1] - 4],
+              ]
+            : undefined,
+        radiusX: kind === 'pond' ? 9 : 16,
+        radiusZ: kind === 'pond' ? 7 : 13,
+        width: kind === 'stream' ? 4.2 : 8.5,
+        waterLevelOffset: 0,
+        waterColor: kind === 'stream' ? '#34B3A0' : '#2E86AB',
+        deepMurkColor: '#0C2D48',
+        opacity: 0.85,
+        depth: kind === 'pond' ? 1.5 : 2.4,
+        foamAmount: 0.62,
+        waveSpeed: 0.8,
+        windRipple: 0.55,
+        flowSpeed: kind === 'river' || kind === 'stream' ? 1.2 : 0.25,
+        flowAngleDeg: 0,
+        bankSlope: 0.55,
+        bankSmoothness: 0.75,
+        shoreNoise: 0.35,
+      };
+      updateLevel(`add ${label}`, (lvl) => {
+        const base = ensureUpgradedTerrain(lvl.terrain);
+        const carved = carveWaterBodyIntoTerrain(base, newBody);
+        return {
+          ...lvl,
+          terrain: {
+            ...carved,
+            waterBodies: [...(base.waterBodies ?? createDefaultWaterBodies()), newBody],
+            revision: carved.revision + 1,
+          },
+        };
+      });
+      setSelectedWaterBodyId(id);
+      setActiveWorldDomain('water');
+      focusCameraOnWorldPoint({ id, x: center[0], y: IslandTerrain.waterLevel, z: center[1], distance: 34 });
+      return newBody;
+    },
+    [focusCameraOnWorldPoint, updateLevel]
+  );
+
+  const deleteWaterBody = useCallback(
+    (id: string) => {
+      updateLevel('remove water body', (lvl) => {
+        const base = ensureUpgradedTerrain(lvl.terrain);
+        return {
+          ...lvl,
+          terrain: {
+            ...base,
+            waterBodies: (base.waterBodies ?? []).filter((w) => w.id !== id),
+            revision: base.revision + 1,
+          },
+        };
+      });
+      setSelectedWaterBodyId((prev) => (prev === id ? null : prev));
+    },
+    [updateLevel]
+  );
+
+  const updateCaveGrotto = useCallback(
+    (id: string, patch: Partial<CaveGrotto>, recordUndo = false) => {
+      updateLevel(
+        'edit cave',
+        (lvl) => {
+          const base = ensureUpgradedTerrain(lvl.terrain);
+          return {
+            ...lvl,
+            terrain: {
+              ...base,
+              caves: (base.caves ?? []).map((c, idx) =>
+                c.id === id ? normalizeCaveGrotto({ ...c, ...patch }, idx) : c
+              ),
+              revision: base.revision + 1,
+            },
+          };
+        },
+        recordUndo
+      );
+    },
+    [updateLevel]
+  );
+
+  const updateRoadSpline = useCallback(
+    (id: string, patch: Partial<RoadSpline>, reapplyTerrain = false, recordUndo = false) => {
+      updateLevel(
+        'edit trail road',
+        (lvl) => {
+          const base = ensureUpgradedTerrain(lvl.terrain);
+          let targetRoad: RoadSpline | null = null;
+          const nextRoads = (base.roads ?? []).map((r) => {
+            if (r.id !== id) return r;
+            targetRoad = { ...r, ...patch };
+            return targetRoad;
+          });
+          let nextTerrain: TerrainData = { ...base, roads: nextRoads, revision: base.revision + 1 };
+          if (reapplyTerrain && targetRoad) {
+            nextTerrain = applyRoadSplineToTerrain(nextTerrain, targetRoad, true);
+          }
+          return { ...lvl, terrain: nextTerrain };
+        },
+        recordUndo
+      );
+    },
+    [updateLevel]
+  );
+
+  const apply2DOverviewStroke = useCallback(
+    (
+      brushId: Overview2DBrushId,
+      worldX: number,
+      worldZ: number,
+      radius: number,
+      density: number,
+      isStrokeStart = false,
+      recordUndo = false
+    ) => {
+      updateLevel(
+        `2D paint ${brushId}`,
+        (lvl) => {
+          const base = lvl.terrain ?? createInitialTerrain();
+          return {
+            ...lvl,
+            terrain: apply2DOverviewBrushStroke(
+              base,
+              brushId,
+              worldX,
+              worldZ,
+              radius,
+              density,
+              isStrokeStart
+            ),
+          };
+        },
+        recordUndo
+      );
+    },
+    [updateLevel]
+  );
+
   const addEntity = useCallback(
     (
       kind: EntityKind,
@@ -986,15 +1301,40 @@ export function useMakerStore() {
         x: 0.25 + Math.random() * 0.5,
         y: 0.25 + Math.random() * 0.5,
       };
+      const meta = customAssetId ? customAssets.find((a) => a.id === customAssetId) : undefined;
+      let resolvedKind = kind;
+      let extraProps: Partial<LevelEntity> = {
+        customAssetId,
+        platformEnd: kind === 'platform' ? { x: Math.min(0.9, pos.x + 0.14), y: pos.y } : undefined,
+      };
+      if (meta?.defaultRolePreset) {
+        if (meta.defaultRolePreset === 'buddy') {
+          resolvedKind = 'npc';
+          extraProps.isBuddy = true;
+          extraProps.critterAttitude = 'none';
+        } else if (meta.defaultRolePreset === 'enemy') {
+          resolvedKind = 'baddie';
+        } else if (meta.defaultRolePreset === 'neutralSpeaker') {
+          resolvedKind = 'npc';
+          extraProps.isBuddy = false;
+        } else if (meta.defaultRolePreset === 'neutralSilent') {
+          resolvedKind = 'npc';
+          extraProps.isBuddy = false;
+          extraProps.dialogue = '';
+        }
+      }
+      if (meta?.defaultDialogue) extraProps.dialogue = meta.defaultDialogue;
+      if (meta?.defaultPickupItemId) {
+        extraProps.pickupable = true;
+        extraProps.pickupItemId = meta.defaultPickupItemId;
+      }
+      if (meta?.defaultLoot) extraProps.loot = meta.defaultLoot;
       const entity = createEntity(
-        kind,
-        name ?? kind.charAt(0).toUpperCase() + kind.slice(1),
+        resolvedKind,
+        name ?? meta?.name ?? resolvedKind.charAt(0).toUpperCase() + resolvedKind.slice(1),
         pos.x,
         pos.y,
-        {
-          customAssetId,
-          platformEnd: kind === 'platform' ? { x: Math.min(0.9, pos.x + 0.14), y: pos.y } : undefined,
-        }
+        extraProps
       );
       updateLevel(`add ${entity.name}`, (lvl) => ({
         ...lvl,
@@ -1003,7 +1343,12 @@ export function useMakerStore() {
       setSelectedEntityID(entity.id);
       return entity;
     },
-    [updateLevel]
+    [customAssets, updateLevel]
+  );
+
+  const placeWorldPointBoardHelper = useCallback(
+    (worldX: number, worldZ: number): BoardPoint => levelWorldToBoard(currentLevel, worldX, worldZ),
+    [currentLevel]
   );
 
   const addBuildingBlockEntity = useCallback(
@@ -2525,6 +2870,41 @@ export function useMakerStore() {
     setWorldTool,
     worldGridSnap,
     setWorldGridSnap,
+    worldViewMode,
+    setWorldViewMode,
+    activeWorldDomain,
+    setActiveWorldDomain,
+    cameraAngleLocked,
+    setCameraAngleLocked,
+    cameraFocusRequest,
+    focusCameraOnWorldPoint,
+    selectedWaterBodyId,
+    setSelectedWaterBodyId,
+    selectedCaveId,
+    setSelectedCaveId,
+    selectedRoadId,
+    setSelectedRoadId,
+    showingAtmosphereDrawer,
+    setShowingAtmosphereDrawer,
+    showingSkybox,
+    setShowingSkybox,
+    showingPostFx,
+    setShowingPostFx,
+    showingFxLibrary,
+    setShowingFxLibrary,
+    showingTextureStudio,
+    setShowingTextureStudio,
+    vertexPaintTarget,
+    setVertexPaintTarget,
+    attributeModifierTarget,
+    setAttributeModifierTarget,
+    updateWaterBody,
+    addWaterBody,
+    deleteWaterBody,
+    updateCaveGrotto,
+    updateRoadSpline,
+    apply2DOverviewStroke,
+    placeWorldPointBoardHelper,
     terrainBrush,
     setTerrainBrush,
     terrainBrushRadius,
@@ -2580,9 +2960,52 @@ export function useMakerStore() {
     openObjectMaker: (assetId?: string) => {
       setObjectMakerTargetAssetId(assetId ?? null);
       setShowingAssetVault(false);
+      setPlantMakerOpen(false);
+      setCharacterMakerOpen(false);
+      setTreeMakerOpen(false);
       setSelectedTab('world');
       setObjectMakerOpen(true);
     },
+    plantMakerOpen,
+    setPlantMakerOpen,
+    plantMakerTargetAssetId,
+    setPlantMakerTargetAssetId,
+    openPlantMaker: (assetId?: string) => {
+      setPlantMakerTargetAssetId(assetId ?? null);
+      setShowingAssetVault(false);
+      setObjectMakerOpen(false);
+      setCharacterMakerOpen(false);
+      setTreeMakerOpen(false);
+      setSelectedTab('world');
+      setPlantMakerOpen(true);
+    },
+    characterMakerOpen,
+    setCharacterMakerOpen,
+    characterMakerTargetAssetId,
+    setCharacterMakerTargetAssetId,
+    openCharacterMaker: (assetId?: string) => {
+      setCharacterMakerTargetAssetId(assetId ?? null);
+      setShowingAssetVault(false);
+      setObjectMakerOpen(false);
+      setPlantMakerOpen(false);
+      setTreeMakerOpen(false);
+      setCharacterMakerOpen(true);
+    },
+    treeMakerOpen,
+    setTreeMakerOpen,
+    treeMakerTargetAssetId,
+    setTreeMakerTargetAssetId,
+    openTreeMaker: (assetId?: string) => {
+      setTreeMakerTargetAssetId(assetId ?? null);
+      setShowingAssetVault(false);
+      setObjectMakerOpen(false);
+      setPlantMakerOpen(false);
+      setCharacterMakerOpen(false);
+      setSelectedTab('world');
+      setTreeMakerOpen(true);
+    },
+    toggleFavoriteCustomAsset,
+    duplicateCustomAsset,
     isPlaying,
     setIsPlaying,
     playModalOpen,

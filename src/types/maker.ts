@@ -6,7 +6,7 @@ export type CameraMode = 'front' | 'chase' | 'cozy' | 'isometric' | 'sideScroll'
 
 export type EnvironmentType = 'openWorld' | 'dungeon' | 'castle' | 'sideScroller' | 'scifi';
 
-export type AssetCategory = 'character' | 'prop' | 'scenery' | 'plant';
+export type AssetCategory = 'character' | 'prop' | 'scenery' | 'plant' | 'tree' | 'building';
 
 export type CustomClipSlot = 'idle' | 'walk' | 'run' | 'jump' | 'swim' | 'attack' | 'interact';
 
@@ -165,6 +165,8 @@ export interface ObjectMechanism {
   triggers: MechanismTriggerRule[];
 }
 
+export type EntityRolePreset = 'buddy' | 'enemy' | 'neutralSpeaker' | 'neutralSilent';
+
 export interface CustomAssetMeta {
   id: string;
   name: string;
@@ -180,12 +182,110 @@ export interface CustomAssetMeta {
   savedPoses?: SavedPosePreset[];
   mechanisms?: ObjectMechanism[];
   objectRecipe?: ObjectMakerDoc;
+  characterRecipe?: CharacterMakerDoc;
+  treeRecipe?: StylizedCanopyConfig;
+  buildingBlock?: BuildingBlockConfig;
+  vertexPaintStrokes?: VertexPaintStroke[];
+  favorite?: boolean;
+  defaultRolePreset?: EntityRolePreset;
+  defaultDialogue?: string;
+  defaultPickupItemId?: string;
+  defaultLoot?: string;
   defaultSlotPresets?: Partial<Record<CustomClipSlot, string>>;
   groundOffset: number;
   defaultScale: number;
   animSpeed: number;
   thumbnailDataUrl?: string;
   createdAt: string;
+}
+
+export type PlantLeafPatternId =
+  | 'solid'
+  | 'veins'
+  | 'ribs'
+  | 'variegated'
+  | 'spotted'
+  | 'striped'
+  | 'gradientTip'
+  | 'bioluminescent';
+
+export type PlantShapeId =
+  | 'leafBanana'
+  | 'leafElephantEar'
+  | 'leafTeardrop'
+  | 'leafBlade'
+  | 'leafMonstera'
+  | 'leafFern'
+  | 'leafLotus'
+  | 'leafHeartVine'
+  | 'petalRound'
+  | 'petalPointed'
+  | 'petalRuffled'
+  | 'petalOrchid'
+  | 'flowerCenter'
+  | 'stemCurved'
+  | 'bulbCorm'
+  | 'vineTendril'
+  | 'fantasyBell'
+  | 'fantasyMushroom'
+  | 'fantasySpiralRibbon'
+  | 'fantasySporeOrb'
+  | 'fantasyTrumpet';
+
+export interface PlantPartConfig {
+  pattern?: PlantLeafPatternId;
+  accentColor?: string;
+  tipColor?: string;
+  emissiveColor?: string;
+  emissiveIntensity?: number;
+  /** Downward arch (+1) or upward cup (-1) along leaf/petal length */
+  droop?: number;
+  /** Midrib V-fold / bowl cupping (0..1) */
+  cup?: number;
+  /** Sinusoidal edge frill / undulation (0..1) */
+  ruffle?: number;
+  /** Organic helical twist (-1..1) */
+  twist?: number;
+  /** Asymmetrical left/right lobe skew (-1..1) */
+  asymSkew?: number;
+  /** Natural splits, notches & weathered tip curl (0..1) */
+  tatter?: number;
+  /** Procedural rib/vein relief amplitude (0..1) */
+  veinDepth?: number;
+  doubleSided?: boolean;
+}
+
+export type PlantClusterTarget = 'leaf' | 'petal' | 'fantasy';
+export type PlantClusterLayout = 'fan' | 'randomCenter' | 'spiral';
+
+export interface PlantClusterRecipe {
+  target: PlantClusterTarget;
+  shape: PlantShapeId;
+  /** Grouping limit from 1 to 20 parts */
+  count: number;
+  layout: PlantClusterLayout;
+  symmetrical: boolean;
+  /** Organic random jitter (0..1) in angle, size, pitch, twist & hue */
+  randomness: number;
+  /** Fan tilt angle in degrees (10..85) outward from center axis */
+  fanAngleDeg: number;
+  /** Radial arc span in degrees (60..360) */
+  arcSpanDeg: number;
+  /** Radial offset distance from center hub */
+  centerRadius: number;
+  /** Vertical hub height above floor */
+  hubHeight: number;
+  /** Size multiplier min & max */
+  minScale: number;
+  maxScale: number;
+  /** Multi-ring layered tiers (1..3) */
+  tierLayers: number;
+  includeFlowerCore?: boolean;
+  coreColor?: string;
+  baseDimensions: [number, number, number];
+  basePlant: PlantPartConfig;
+  baseColor: string;
+  seed: number;
 }
 
 export type ObjectPrimitiveShapeId =
@@ -208,7 +308,8 @@ export type ObjectPrimitiveShapeId =
   | 'fence'
   | 'roofAFrame'
   | 'roofSlope'
-  | 'csgResult';
+  | 'csgResult'
+  | PlantShapeId;
 
 export interface ObjectSurfaceFinish {
   materialId?: BuildingMaterialId;
@@ -244,6 +345,7 @@ export interface ObjectPartSpec {
   dimensions: [number, number, number];
   modifiers: ObjectGeometryModifiers;
   material: ObjectSurfaceFinish;
+  plantParams?: PlantPartConfig;
   bakedGeometry?: ObjectSerializedGeometry;
   hidden?: boolean;
   isCutter?: boolean;
@@ -256,6 +358,7 @@ export interface ObjectGroupSpec {
   position: [number, number, number];
   rotation: [number, number, number];
   scale: [number, number, number];
+  plantCluster?: PlantClusterRecipe;
 }
 
 export type CurveGuidePresetId = 'arc' | 'sCurve' | 'arch' | 'semiCircle' | 'circle' | 'free';
@@ -275,6 +378,7 @@ export interface ObjectMakerDoc {
   parts: ObjectPartSpec[];
   groups: ObjectGroupSpec[];
   curveGuide?: CurveGuideConfig;
+  vertexPaintStrokes?: VertexPaintStroke[];
 }
 
 export interface ExportedAssetBundle {
@@ -1318,6 +1422,18 @@ export interface StorySkit {
   beats: SkitBeat[];
 }
 
+export type WorldDomainId =
+  | 'select'
+  | 'mountains'
+  | 'water'
+  | 'caves'
+  | 'grass'
+  | 'dirtRoads'
+  | 'flora'
+  | 'buildings';
+
+export type WorldViewMode = '3d' | '2d';
+
 export type TerrainBrush =
   | 'raiseGround'
   | 'lowerGround'
@@ -1327,9 +1443,12 @@ export type TerrainBrush =
   | 'carveRiver'
   | 'carveCave'
   | 'paintGrass'
+  | 'paintGrassErase'
   | 'paintMoss'
   | 'paintCobble'
   | 'paintDirt'
+  | 'paintRoad'
+  | 'paintWaterLake'
   | 'paintSand'
   | 'paintRock'
   | 'paintSnow'
@@ -1378,22 +1497,116 @@ export interface ScatterItem {
   rotation: number;
 }
 
+export type MountainNoiseType = 'fbm' | 'ridged' | 'billow' | 'terraced';
+
+export interface MountainProfileConfig {
+  rockStartHeight: number; // e.g. 5.5
+  snowStartHeight: number; // e.g. 10.5
+  bandTransition: number; // 0.05..1.0 sharpness vs gradual
+  roughness: number; // 0.1..1.0
+  noiseType: MountainNoiseType;
+  noiseScale: number; // 0.3..3.0
+  randomness: number; // 0..1
+  autoSlopeWeathering: number; // 0..1
+}
+
+export type WaterBodyKind = 'lake' | 'river' | 'stream' | 'pond';
+
+export interface WaterBodyConfig {
+  id: string;
+  name: string;
+  kind: WaterBodyKind;
+  center: [number, number];
+  points?: [number, number][];
+  radiusX: number;
+  radiusZ: number;
+  width: number;
+  waterLevelOffset: number; // -1..1 relative to IslandTerrain.waterLevel
+  waterColor: string;
+  deepMurkColor: string;
+  opacity: number; // 0.2..1.0
+  depth: number; // 0.3..5.0m
+  foamAmount: number; // 0..1.5
+  waveSpeed: number; // 0..2.5
+  windRipple: number; // 0..2.0
+  flowSpeed: number; // 0..3.0
+  flowAngleDeg: number; // 0..360
+  bankSlope: number; // 0.15 steep .. 1.0 gradual
+  bankSmoothness: number; // 0..1
+  shoreNoise: number; // 0..1
+}
+
 export interface CaveGrotto {
   id: string;
+  name?: string;
   x: number;
   z: number;
   rotation: number;
   scale: number;
+  entranceWidth?: number; // 0.5..2.4
+  entranceHeight?: number; // 0.5..2.4
+  archSharpness?: number; // 0.1..1.0
+  cavityDepth?: number; // 0.5..2.5
+  cavityWidth?: number; // 0.5..2.5
+  stalactiteDensity?: number; // 0..1.5
+  stalagmiteDensity?: number; // 0..1.5
+  crystalDensity?: number; // 0..1.5
+  crystalColor?: string;
+  hasSpring?: boolean;
+  springFlow?: number; // 0.1..2.0
+}
+
+export type DirtNoiseKind = 'fineLoam' | 'crackedEarth' | 'rockyGritty' | 'patchy';
+export type RoadBorderScatterKind = 'none' | 'wildflowers' | 'grass' | 'boulders' | 'mixed' | 'custom';
+
+export interface RoadSpline {
+  id: string;
+  name: string;
+  points: [number, number][];
+  width: number; // 1.2..6.5
+  recessDepth: number; // 0..1.0
+  bankSlopeAngle: number; // 0.1..1.0
+  edgeTransition: number; // 0.1..1.0
+  borderScatter: RoadBorderScatterKind;
+  borderDensity: number; // 0..1.5
+  borderRandomness: number; // 0..1.0
+  borderCustomAssetId?: string;
+}
+
+export interface DirtAndRoadConfig {
+  heroColor: string;
+  secondaryColor: string;
+  noiseKind: DirtNoiseKind;
+  noiseContrast: number; // 0..1
+  bumpStrength: number; // 0..1
+  degradeAmount: number; // 0..1
+  pebbleDensity: number; // 0..1.5
+  pebbleSpread: number; // 0..1
+  pebbleShapeRandomness: number; // 0..1
+  pebbleColor: string;
+  pebbleHueVariance: number; // 0..1
+  defaultRoadWidth: number;
+  defaultRoadRecess: number;
+  defaultRoadBankAngle: number;
+  defaultRoadEdgeTransition: number;
+  defaultBorderKind: RoadBorderScatterKind;
+  defaultBorderDensity: number;
+  defaultBorderRandomness: number;
+  defaultBorderAssetId?: string;
 }
 
 export interface TerrainData {
   size: number; // 64 (or legacy 48 auto-migrated)
   heights: number[]; // (size+1)*(size+1)
-  layers: number[]; // 0=grass, 1=sand, 2=rock, 3=snow, 4=moss, 5=cobble
+  layers: number[]; // 0=grass, 1=sand, 2=rock, 3=snow, 4=moss, 5=cobble, 6=dirt
   /** Optional packed 5-channel weathering/degradation grid (moss, cracks, scorch, mud, frost) */
   weathering?: number[];
   scatter: ScatterItem[];
   caves?: CaveGrotto[];
+  mountainConfig?: MountainProfileConfig;
+  waterBodies?: WaterBodyConfig[];
+  dirtAndRoadConfig?: DirtAndRoadConfig;
+  roads?: RoadSpline[];
   revision: number;
 }
 
@@ -1539,6 +1752,11 @@ export interface GrassFieldConfig {
   windWaveStrength: number; // 0.2..2.0
   tipGlow: number; // 0..1.2
   interactiveParting: boolean;
+  primaryColor?: string;
+  secondaryColor?: string;
+  mixNoiseScale?: number; // 0.2..3.0
+  carexMix?: number; // 0..1 (0 = lush short lawn, 1 = tall arching sedge/carex)
+  tuftClumpiness?: number; // 0..1
 }
 
 export interface GameLevel {
@@ -2045,5 +2263,376 @@ export interface SavePresetsFileBundle {
   format: 'maker.savepresets.v1';
   exportedAt: string;
   presets: SavePresetEntry[];
+}
+
+// ============================================================================
+// Character Maker (SDF Smooth-Union Clay Sculpt + Hierarchical Skeleton Rig)
+// ============================================================================
+
+export type CharacterBodyPartKey =
+  | 'head'
+  | 'neck'
+  | 'torso'
+  | 'belly'
+  | 'hips'
+  | 'muzzle'
+  | 'upperArm'
+  | 'lowerArm'
+  | 'upperLeg'
+  | 'lowerLeg'
+  | 'tail'
+  | 'extraArm'
+  | 'extraLeg';
+
+export interface CharacterLimbProfile {
+  /** Radius at proximal / root end (m) */
+  startRadius: number;
+  /** Radius at midpoint bulge / pinch (m) */
+  midRadius: number;
+  /** Radius at distal / tip end (m) */
+  endRadius: number;
+  /** Curvature transition factor (-1 = sleek concave taper, 0 = smooth S-curve, +1 = plump convex clay) */
+  curvature: number;
+  /** Segment length in meters */
+  length: number;
+  /** Optional cross-section ovalness (width vs depth) */
+  squashX?: number;
+  squashZ?: number;
+  /** Region color (smoothly blended across clay joints) */
+  color: string;
+}
+
+export type CharacterMuzzlePresetId =
+  | 'none'
+  | 'bunnySplit'
+  | 'squirrelPuff'
+  | 'catWhiskerPad'
+  | 'foxTaper'
+  | 'dogSnout'
+  | 'horseMuzzle'
+  | 'bearBroad'
+  | 'lizardSnout'
+  | 'custom';
+
+export interface CharacterMuzzleSegment {
+  /** Half-width (X radius in meters) */
+  rx: number;
+  /** Half-height (Y radius in meters) */
+  ry: number;
+}
+
+export interface CharacterMuzzleConfig {
+  preset: CharacterMuzzlePresetId;
+  length: number;
+  yOffset: number;
+  tiltDeg: number;
+  /** 0 = unified snout, 0.1..1.0 = dual oval sphere whisker pads with center cleft */
+  splitCleft: number;
+  /** 5 segments from head root -> upper bridge -> mid -> pre-tip -> nose/lip tip */
+  segments: [
+    CharacterMuzzleSegment,
+    CharacterMuzzleSegment,
+    CharacterMuzzleSegment,
+    CharacterMuzzleSegment,
+    CharacterMuzzleSegment
+  ];
+  color: string;
+}
+
+export type CharacterBeakStyle =
+  | 'none'
+  | 'songbird'
+  | 'duck'
+  | 'owl'
+  | 'eagleHawk'
+  | 'storkCrane'
+  | 'pelican';
+
+export type CharacterNoseStyle =
+  | 'none'
+  | 'buttonSphere'
+  | 'oval'
+  | 'flatButton'
+  | 'longHuman'
+  | 'bulbous'
+  | 'triangleAnimal'
+  | 'wideSnoutNose';
+
+export type CharacterNostrilStyle = 'teardrop' | 'round' | 'slit';
+
+export type CharacterTeethStyle =
+  | 'none'
+  | 'strips'
+  | 'canine'
+  | 'buck'
+  | 'stripsAndCanine';
+
+export type CharacterHandStyle =
+  | 'nub'
+  | 'fingers2'
+  | 'fingers3'
+  | 'fingers4'
+  | 'fingers5'
+  | 'paw'
+  | 'claw'
+  | 'hoof';
+
+export type CharacterFootStyle = 'biped' | 'paw' | 'claw' | 'hoof';
+
+export type CharacterEarStyle =
+  | 'none'
+  | 'human'
+  | 'elfPointed'
+  | 'rabbitLong'
+  | 'rabbitFloppy'
+  | 'squirrelRound'
+  | 'catFoxTriangle'
+  | 'dogFloppy'
+  | 'horsePerked'
+  | 'animalPerk'
+  | 'floppy'
+  | 'bat'
+  | 'fin'
+  | 'antennae';
+
+export type CharacterHornStyle =
+  | 'straight'
+  | 'curvedBack'
+  | 'ramSpiral'
+  | 'devilSweep'
+  | 'antler';
+
+export type CharacterWingStyle =
+  | 'none'
+  | 'birdRound'
+  | 'birdSoaring'
+  | 'birdLong'
+  | 'dragon'
+  | 'bat'
+  | 'feather'
+  | 'fairy'
+  | 'fairyButterfly'
+  | 'angelFeather';
+
+export type CharacterTailStyle =
+  | 'none'
+  | 'smooth'
+  | 'bunnyCotton'
+  | 'squirrelPlume'
+  | 'horseTail'
+  | 'catTail'
+  | 'dogTail'
+  | 'foxBrush'
+  | 'lionTail'
+  | 'geckoTail'
+  | 'dragonTail'
+  | 'fishTail'
+  | 'birdTail'
+  | 'bulbTip'
+  | 'spiky'
+  | 'fluffy'
+  | 'fin';
+
+export type CharacterHairStyle =
+  | 'none'
+  | 'spikyTufts'
+  | 'mohawk'
+  | 'curlSwirl'
+  | 'ponytail'
+  | 'mushroomCap'
+  | 'horseMane'
+  | 'lionMane'
+  | 'featherTuft'
+  | 'fluffyBangs';
+
+export type CharacterEyePupilStyle = 'round' | 'catSlit' | 'oval' | 'starry' | 'glow';
+
+export type CharacterEyebrowExpression = 'neutral' | 'determined' | 'friendly' | 'surprised' | 'sly';
+
+export type CharacterMouthStyle =
+  | 'none'
+  | 'smile'
+  | 'smirk'
+  | 'frown'
+  | 'catW'
+  | 'fangs'
+  | 'openSmile'
+  | 'openSurprised'
+  | 'openWorried'
+  | 'openGrin'
+  | 'beak';
+
+export type CharacterMaterialFinish = 'clay' | 'toonSatin' | 'glossySlime' | 'velvetCreature';
+
+export type CharacterPresetId =
+  | 'adventurer'
+  | 'forestElf'
+  | 'pocketCritter'
+  | 'alienExplorer'
+  | 'hornedMonster'
+  | 'storyHorse'
+  | 'storySquirrel'
+  | 'storyRabbit'
+  | 'storyFox'
+  | 'storyGecko'
+  | 'storyBear'
+  | 'storyOwl'
+  | 'storyTweety';
+
+export interface CharacterMakerDoc {
+  version: 1;
+  presetId?: CharacterPresetId;
+  materialFinish: CharacterMaterialFinish;
+  /** Global smooth minimum blending radius k (0.015..0.18m) */
+  blendSmoothness: number;
+  /** Body proportions & posture */
+  shoulderWidth: number;
+  hipWidth: number;
+  armSpreadDeg: number; // T-pose / A-pose bind spread angle downward (5..55 deg)
+  legStanceWidth: number;
+  headForwardTilt: number;
+  snoutLength: number;
+  snoutWidth: number;
+  snoutColor: string;
+  /** Multi-segment sculpted muzzle (5 segments + optional rabbit/squirrel cheek split) */
+  muzzle?: CharacterMuzzleConfig;
+  bellyPatchEnabled: boolean;
+  bellyColor: string;
+  extremityTipColor: string;
+
+  /** Core and limb radial circumference + curvature profiles */
+  head: CharacterLimbProfile;
+  neck: CharacterLimbProfile;
+  torso: CharacterLimbProfile;
+  belly: CharacterLimbProfile;
+  hips: CharacterLimbProfile;
+  upperArm: CharacterLimbProfile;
+  lowerArm: CharacterLimbProfile;
+  upperLeg: CharacterLimbProfile;
+  lowerLeg: CharacterLimbProfile;
+
+  /** Hands & Feet */
+  handStyle: CharacterHandStyle;
+  handScale: number;
+  fingerSpread: number;
+  footStyle: CharacterFootStyle;
+  footScale: number;
+
+  /** Modular Appendages */
+  extraArmsEnabled: boolean;
+  extraArmHeightOffset: number;
+  extraArmProfile: CharacterLimbProfile;
+
+  extraLegsEnabled: boolean;
+  extraLegRearOffset: number;
+  extraLegProfile: CharacterLimbProfile;
+
+  tailStyle: CharacterTailStyle;
+  tailCurl: number;
+  tailProfile: CharacterLimbProfile;
+
+  earStyle: CharacterEarStyle;
+  earSize: number;
+  earTilt: number;
+  earColor: string;
+
+  hornCount: 0 | 1 | 2 | 4;
+  hornStyle: CharacterHornStyle;
+  hornLength: number;
+  hornThickness: number;
+  hornColor: string;
+
+  wingStyle: CharacterWingStyle;
+  wingSpan: number;
+  wingTilt: number;
+  wingFold?: number;
+  wingColor: string;
+  wingTipColor?: string;
+
+  whiskerPairs: 0 | 1 | 2 | 3;
+  whiskerLength: number;
+  whiskerDroop: number;
+  whiskerColor: string;
+
+  hairStyle: CharacterHairStyle;
+  hairSize: number;
+  hairColor: string;
+
+  /** Beak */
+  beakStyle?: CharacterBeakStyle;
+  beakLength?: number;
+  beakWidth?: number;
+  beakHeight?: number;
+  beakHook?: number;
+  beakOpen?: number;
+  beakColor?: string;
+  beakLowerColor?: string;
+
+  /** Shapeable Nose & Movable Muzzle Nostrils */
+  noseStyle?: CharacterNoseStyle;
+  noseSize?: number;
+  noseScaleX?: number;
+  noseScaleY?: number;
+  noseScaleZ?: number;
+  noseOffsetY?: number;
+  noseOffsetZ?: number;
+  noseColor?: string;
+
+  nostrilsEnabled?: boolean;
+  nostrilStyle?: CharacterNostrilStyle;
+  /** 0 = front end of muzzle, 90 = outer side walls of muzzle */
+  nostrilSideAngleDeg?: number;
+  nostrilHeightOffset?: number;
+  nostrilForwardOffset?: number;
+  nostrilSize?: number;
+  nostrilColor?: string;
+
+  /** Surface-mounted Eyes, Full-closing Eyelids, Eyebrows & Mouth */
+  eyeCount: 1 | 2 | 3 | 4 | 6;
+  /** 0.14 = flat cartoon disc .. 1.0 = full 3D sphere eyeball */
+  eyeFlatness: number;
+  eyeSize: number;
+  eyeAspectX: number;
+  eyeAspectY: number;
+  eyeSpacing: number;
+  eyeHeight: number;
+  pupilStyle: CharacterEyePupilStyle;
+  pupilSize: number;
+  scleraColor: string;
+  irisColor: string;
+  pupilColor: string;
+
+  eyelidEnabled: boolean;
+  /** 0 = wide open tucked up, 0.5 = half-closed sleepy, 1.0 = fully closed */
+  eyelidRestHeight: number;
+  eyelidLowerEnabled: boolean;
+  eyelidColor: string;
+  autoBlink: boolean;
+
+  eyebrowEnabled: boolean;
+  eyebrowExpression: CharacterEyebrowExpression;
+  eyebrowHeight: number;
+  eyebrowTiltDeg: number;
+  eyebrowArch: number;
+  eyebrowThickness: number;
+  eyebrowWidth: number;
+  eyebrowColor: string;
+
+  mouthStyle: CharacterMouthStyle;
+  mouthSize: number;
+  mouthColor: string;
+  mouthWidthScale?: number;
+  mouthOpenAmount?: number;
+  mouthOffsetY?: number;
+  mouthOffsetZ?: number;
+  mouthTiltDeg?: number;
+  mouthRecessEnabled?: boolean;
+  mouthTongueEnabled?: boolean;
+  mouthTongueColor?: string;
+  mouthTeethStyle?: CharacterTeethStyle;
+  buckTeethSize?: number;
+  buckTeethTopWidth?: number;
+  buckTeethBottomWidth?: number;
+  vertexPaintStrokes?: VertexPaintStroke[];
 }
 

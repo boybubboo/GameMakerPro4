@@ -74,7 +74,9 @@ import { getBiome, getSky } from '../data/registries';
 import type {
   CaveGrotto,
   CustomAssetMeta,
+  DirtAndRoadConfig,
   GameLevel,
+  MountainProfileConfig,
   ScatterItem,
   SceneryTextureSlot,
   SurfaceTextureSettings,
@@ -83,6 +85,7 @@ import type {
   ViewportShadowQuality,
   VistaPresetId,
   VisualStyleId,
+  WaterBodyConfig,
 } from '../types/maker';
 import {
   applySeamlessBoxUVs,
@@ -94,6 +97,8 @@ import {
   loadCustomTextureToCache,
 } from './customTextureManager';
 import {
+  createDefaultDirtAndRoadConfig,
+  createDefaultMountainConfig,
   createInitialTerrain,
   ensureUpgradedTerrain,
   evaluateVistaHeight,
@@ -101,6 +106,7 @@ import {
   getLevelWallBoxes,
   IslandTerrain,
   MountainCave,
+  normalizeCaveGrotto,
   RiverCrossing,
   sampleLevelHeight,
   sampleTerrainHeight,
@@ -203,6 +209,9 @@ export interface IslandSceneHandles {
   waterDepthTexData?: Float32Array;
   waterDepthTexSize?: number;
   pendingFoliagePromise?: Promise<void>;
+  updateMountainUniforms?: (cfg?: MountainProfileConfig) => void;
+  updateDirtUniforms?: (cfg?: DirtAndRoadConfig) => void;
+  updateWaterBodiesUniforms?: (bodies?: WaterBodyConfig[], selectedWaterBodyId?: string | null) => void;
 }
 
 export interface BuildIslandMeshOptions {
@@ -983,8 +992,8 @@ function xformTerrainUvTsl(uvNode: any, params: THREE.Vector4, rotRad: number) {
   return vec2(rx, ry).mul(vec2(params.x, params.y)).add(vec2(params.z, params.w));
 }
 
-function sampleTerrainReliefTsl(tex: THREE.Texture, uvNode: any, strengthVal: number) {
-  if (strengthVal < 0.01) return float(1.0);
+function sampleTerrainReliefTsl(tex: THREE.Texture, uvNode: any, strengthVal: any) {
+  if (typeof strengthVal === 'number' && strengthVal < 0.01) return float(1.0);
   const lumaW = vec3(0.299, 0.587, 0.114);
   const cL = texture(tex, uvNode.sub(vec2(0.0045, 0.0))).rgb;
   const cR = texture(tex, uvNode.add(vec2(0.0045, 0.0))).rgb;
@@ -1006,17 +1015,57 @@ function asIslandFloatUniformNode(
   return uniform(u?.value ?? fallback);
 }
 
+function resolveMountainNoiseIndex(noiseType?: MountainProfileConfig['noiseType']): number {
+  if (noiseType === 'ridged') return 1;
+  if (noiseType === 'billow') return 2;
+  if (noiseType === 'terraced') return 3;
+  return 0;
+}
+
+function resolveDirtNoiseIndex(kind?: DirtAndRoadConfig['noiseKind']): number {
+  if (kind === 'crackedEarth') return 1;
+  if (kind === 'rockyGritty') return 2;
+  if (kind === 'patchy') return 3;
+  return 0;
+}
+
+interface TerrainMaterialBundle {
+  material: THREE.Material;
+  updateMountainUniforms: (cfg?: MountainProfileConfig) => void;
+  updateDirtUniforms: (cfg?: DirtAndRoadConfig) => void;
+}
+
 function createTerrainMaterial(
   biomeGroundHex: string,
   biomeDetailHex: string,
   style: VisualStyleId,
   sceneryTextures?: Partial<Record<SceneryTextureSlot, SurfaceTextureSettings>>,
   timeUniform?: { value: number },
-  windUniform?: { value: number }
-): THREE.Material {
+  windUniform?: { value: number },
+  mountainConfig?: MountainProfileConfig,
+  dirtConfig?: DirtAndRoadConfig
+): TerrainMaterialBundle {
   const atlas = getTerrainTextureAtlas();
   const grassTint = new THREE.Color(biomeGroundHex);
   const mossTint = new THREE.Color(biomeDetailHex).lerp(new THREE.Color('#3C8D4B'), 0.45);
+  const mtnCfg = mountainConfig ?? createDefaultMountainConfig();
+  const dCfg = dirtConfig ?? createDefaultDirtAndRoadConfig();
+
+  const uMtnRockH = uniform(mtnCfg.rockStartHeight);
+  const uMtnSnowH = uniform(mtnCfg.snowStartHeight);
+  const uMtnBandSoftness = uniform(Math.max(0.18, mtnCfg.bandTransition * 3.8));
+  const uMtnNoiseScale = uniform(mtnCfg.noiseScale);
+  const uMtnNoiseMode = uniform(resolveMountainNoiseIndex(mtnCfg.noiseType));
+  const uMtnRoughness = uniform(mtnCfg.roughness);
+  const uMtnRandomness = uniform(mtnCfg.randomness);
+
+  const uDirtHeroCol = uniform(new THREE.Color(dCfg.heroColor));
+  const uDirtSecCol = uniform(new THREE.Color(dCfg.secondaryColor));
+  const uDirtUseCustom = uniform(dirtConfig ? 1 : 0);
+  const uDirtNoiseKind = uniform(resolveDirtNoiseIndex(dCfg.noiseKind));
+  const uDirtNoiseContrast = uniform(dCfg.noiseContrast);
+  const uDirtBumpStrength = uniform(dCfg.bumpStrength);
+  const uDirtDegrade = uniform(dCfg.degradeAmount);
 
   const customGrass = getProcessedSurfaceTextures(sceneryTextures?.grass);
   const customPath = getProcessedSurfaceTextures(sceneryTextures?.pathRoad);
@@ -1110,11 +1159,30 @@ function createTerrainMaterial(
     const cSand = mix(cSandMacro, cSandFine, 0.38).mul(float(0.94).add(orgFine.mul(0.12)));
 
     const slopeAmt = clamp(float(1.0).sub(abs(wn.y)), 0.0, 1.0);
+    const mUv = wpXZ.mul(0.075).mul(uMtnNoiseScale);
+    const mFbm = tFbm2DTsl(mUv);
+    const mRidged = float(1.0).sub(abs(mFbm.mul(2.0).sub(1.0)));
+    const mBillow = abs(mFbm.mul(2.0).sub(1.0));
+    const mTerraced = floor(mFbm.mul(5.0)).div(5.0);
+    const mNoise = select(
+      uMtnNoiseMode.lessThan(0.5),
+      mFbm,
+      select(
+        uMtnNoiseMode.lessThan(1.5),
+        mRidged,
+        select(uMtnNoiseMode.lessThan(2.5), mBillow, mTerraced)
+      )
+    );
+    const mAlt = wp.y.add(mNoise.sub(0.5).mul(3.6).mul(uMtnRandomness));
+    const mRockBand = smoothstep(uMtnRockH.sub(uMtnBandSoftness), uMtnRockH.add(uMtnBandSoftness), mAlt);
+    const mSnowBand = smoothstep(uMtnSnowH.sub(uMtnBandSoftness), uMtnSnowH.add(uMtnBandSoftness), mAlt);
+
     const cRockFlat = texture(texRock, uvRock).rgb;
     const cRockWall = texture(texRock, uvRockSlope).rgb;
     const strata = float(0.92).add(sin(wp.y.mul(2.4).add(orgMacro.mul(4.5))).mul(0.16));
     const cRock = mix(cRockFlat, cRockWall, smoothstep(0.22, 0.62, slopeAmt))
       .mul(strata)
+      .mul(float(1.0).add(mNoise.sub(0.5).mul(0.32).mul(uMtnRoughness)))
       .mul(sampleTerrainReliefTsl(texRock, uvRock, Math.max(0.35, rockBumpStrength)));
 
     const cSnow = texture(atlas.snow, uvW).rgb.mul(float(0.96).add(orgFine.mul(0.08)));
@@ -1133,9 +1201,35 @@ function createTerrainMaterial(
     const cCobble = texture(texPath, uvCobble).rgb.mul(
       sampleTerrainReliefTsl(texPath, uvCobble, Math.max(0.3, pathBumpStrength))
     );
-    const cDirt = mix(texture(texDirt, uvDirt).rgb, texture(texDirt, uvFine).rgb, 0.32).mul(
-      sampleTerrainReliefTsl(texDirt, uvDirt, Math.max(0.28, pathBumpStrength))
+
+    const dFbm = tFbm2DTsl(wpXZ.mul(0.28));
+    const dFine = tNoise2DTsl(wpXZ.mul(0.95));
+    const dCracked = smoothstep(0.12, 0.36, abs(dFine.sub(0.5)).mul(2.0));
+    const dRocky = step(0.62, dFine).mul(0.6).add(dFbm.mul(0.4));
+    const dPatchy = smoothstep(0.26, 0.74, tFbm2DTsl(wpXZ.mul(0.11)));
+    const dMixFactor = select(
+      uDirtNoiseKind.lessThan(0.5),
+      dFbm,
+      select(
+        uDirtNoiseKind.lessThan(1.5),
+        dCracked,
+        select(uDirtNoiseKind.lessThan(2.5), dRocky, dPatchy)
+      )
     );
+    const dContrasted = clamp(
+      dMixFactor.sub(0.5).mul(float(0.6).add(uDirtNoiseContrast.mul(1.8))).add(0.5),
+      0.0,
+      1.0
+    );
+    const dCustomTint = mix(uDirtSecCol, uDirtHeroCol, dContrasted);
+    const cDirtBase = mix(texture(texDirt, uvDirt).rgb, texture(texDirt, uvFine).rgb, 0.32).mul(
+      sampleTerrainReliefTsl(texDirt, uvDirt, float(0.25).add(uDirtBumpStrength.mul(0.55)))
+    );
+    const cDirt = mix(
+      cDirtBase,
+      cDirtBase.mul(vec3(1.18)).mul(dCustomTint),
+      uDirtUseCustom
+    ).mul(float(1.0).sub(uDirtDegrade.mul(0.24).mul(float(1.0).sub(dFbm))));
 
     const avgW = vec3(0.33, 0.33, 0.33);
     const hGrass = float(0.55).add(orgFine.mul(0.35)).add(dot(cGrassMacro, avgW).sub(0.5).mul(0.25));
@@ -1182,9 +1276,13 @@ function createTerrainMaterial(
     texCol.assign(mix(texCol, mix(cSand, cDirt.mul(1.06), float(0.22).add(orgFine.mul(0.2))), bankSandMask.mul(0.52)));
 
     const rockSlope = smoothstep(float(0.36).add(edgeJitter.mul(0.12)), 0.76, slopeAmt);
-    texCol.assign(mix(texCol, cRock, rockSlope.mul(isToon ? 0.84 : 0.88)));
+    const rockCov = clamp(max(rockSlope, mRockBand.mul(0.82)).mul(float(1.0).sub(mSnowBand.mul(0.88))), 0.0, 1.0);
+    texCol.assign(mix(texCol, cRock, rockCov.mul(isToon ? 0.84 : 0.88)));
 
-    const meadowCov = clamp(w0.x.add(w1.x.mul(0.85)).div(sumW), 0.0, 1.0).mul(float(1.0).sub(rockSlope));
+    const snowCov = mSnowBand.mul(float(1.0).sub(smoothstep(0.58, 0.9, slopeAmt).mul(0.65)));
+    texCol.assign(mix(texCol, cSnow, snowCov.mul(0.88)));
+
+    const meadowCov = clamp(w0.x.add(w1.x.mul(0.85)).div(sumW), 0.0, 1.0).mul(float(1.0).sub(rockCov));
     const wDirT = normalize(vec2(0.84, 0.54));
     const wSpeedT = float(0.85).add(uWind.mul(0.95));
     const wUvT = wpXZ.mul(0.052).sub(wDirT.mul(uTime.mul(wSpeedT).mul(0.62)));
@@ -1264,7 +1362,29 @@ function createTerrainMaterial(
   })();
   mat.diffuseRoughnessNode = materialDiffuseRoughness;
   attachBotwPainterlyShader(mat, { rimStrengthScale: 0.42, shadowLiftScale: 0.85 });
-  return mat;
+  return {
+    material: mat,
+    updateMountainUniforms: (cfg?: MountainProfileConfig) => {
+      const m = cfg ?? createDefaultMountainConfig();
+      uMtnRockH.value = m.rockStartHeight;
+      uMtnSnowH.value = m.snowStartHeight;
+      uMtnBandSoftness.value = Math.max(0.18, m.bandTransition * 3.8);
+      uMtnNoiseScale.value = m.noiseScale;
+      uMtnNoiseMode.value = resolveMountainNoiseIndex(m.noiseType);
+      uMtnRoughness.value = m.roughness;
+      uMtnRandomness.value = m.randomness;
+    },
+    updateDirtUniforms: (cfg?: DirtAndRoadConfig) => {
+      const dc = cfg ?? createDefaultDirtAndRoadConfig();
+      uDirtHeroCol.value.set(dc.heroColor);
+      uDirtSecCol.value.set(dc.secondaryColor);
+      uDirtUseCustom.value = cfg ? 1 : 0;
+      uDirtNoiseKind.value = resolveDirtNoiseIndex(dc.noiseKind);
+      uDirtNoiseContrast.value = dc.noiseContrast;
+      uDirtBumpStrength.value = dc.bumpStrength;
+      uDirtDegrade.value = dc.degradeAmount;
+    },
+  };
 }
 
 function addWallTorch(
@@ -2386,15 +2506,17 @@ export function buildIslandMesh(
     }
   }
 
-  const terrainMat = createTerrainMaterial(
+  const terrainMatBundle = createTerrainMaterial(
     biome.ground,
     biome.detail,
     style,
     level.sceneryTextures,
     timeUniform,
-    windUniform
+    windUniform,
+    terrain.mountainConfig,
+    terrain.dirtAndRoadConfig
   );
-  const terrainMesh = new THREE.Mesh(geo, terrainMat);
+  const terrainMesh = new THREE.Mesh(geo, terrainMatBundle.material);
   terrainMesh.receiveShadow = true;
   terrainMesh.castShadow = true;
   terrainMesh.userData.isGround = true;
@@ -2613,9 +2735,27 @@ export function buildIslandMesh(
   }
   islandGroup.add(bridgeGroup);
 
+  // Per-Water-Body Selectable Lakes, Ponds, Rivers & Creeks
+  const waterBodyGroupBundle = buildWaterBodiesGroup(
+    terrain.waterBodies ?? [],
+    waterDepthTex,
+    waterDepthTexSize,
+    timeUniform,
+    style
+  );
+  if (waterBodyGroupBundle.group.children.length > 0) {
+    islandGroup.add(waterBodyGroupBundle.group);
+  }
+
+  // Procedural Dirt & Trail Pebble Scatter
+  const dirtPebbleMesh = buildDirtPebblesGroup(terrain, terrain.dirtAndRoadConfig);
+  if (dirtPebbleMesh) {
+    islandGroup.add(dirtPebbleMesh);
+  }
+
   // Cave Grottos
   if (terrain.caves && terrain.caves.length > 0) {
-    const cavesGroup = buildCavesGroup(level, terrain.caves);
+    const cavesGroup = buildCavesGroup(level, terrain.caves, timeUniform);
     islandGroup.add(cavesGroup);
   }
 
@@ -2644,6 +2784,10 @@ export function buildIslandMesh(
     waterDepthTex,
     waterDepthTexData,
     waterDepthTexSize,
+    updateMountainUniforms: (cfg) => terrainMatBundle.updateMountainUniforms(cfg),
+    updateDirtUniforms: (cfg) => terrainMatBundle.updateDirtUniforms(cfg),
+    updateWaterBodiesUniforms: (bodies, selectedWaterBodyId) =>
+      waterBodyGroupBundle.updateUniforms(bodies, selectedWaterBodyId),
   };
 
   const scatterPlan = createScatterBuildPlan(
@@ -2785,14 +2929,19 @@ export function buildIslandMesh(
 
       // Refresh terrain & wood bridge materials in place without rebuilding geometry if textures loaded async
       const prevTerrainMat = terrainMesh.material;
-      terrainMesh.material = createTerrainMaterial(
+      const refreshedBundle = createTerrainMaterial(
         biome.ground,
         biome.detail,
         style,
         level.sceneryTextures,
         timeUniform,
-        windUniform
+        windUniform,
+        terrain.mountainConfig,
+        terrain.dirtAndRoadConfig
       );
+      terrainMesh.material = refreshedBundle.material;
+      handles.updateMountainUniforms = refreshedBundle.updateMountainUniforms;
+      handles.updateDirtUniforms = refreshedBundle.updateDirtUniforms;
       if (Array.isArray(prevTerrainMat)) prevTerrainMat.forEach((m) => m.dispose());
       else prevTerrainMat.dispose();
       applyBotwStyleToObject(terrainMesh, style, { rimStrengthScale: 0.82, shadowLiftScale: 0.85 });
@@ -3550,8 +3699,319 @@ function buildMountainCaveInterior(
   return g;
 }
 
-function buildCavesGroup(level: GameLevel, caves: CaveGrotto[]): THREE.Group {
+interface WaterBodyUniformBundle {
+  uWaterCol: { value: THREE.Color };
+  uMurkCol: { value: THREE.Color };
+  uOpacity: { value: number };
+  uDepth: { value: number };
+  uFoam: { value: number };
+  uWaveSpeed: { value: number };
+  uWindRipple: { value: number };
+  uFlowSpeed: { value: number };
+  uFlowDirX: { value: number };
+  uFlowDirZ: { value: number };
+  uSelected: { value: number };
+  mesh: THREE.Mesh;
+}
+
+function buildWaterBodiesGroup(
+  waterBodies: WaterBodyConfig[],
+  waterDepthTex: THREE.DataTexture,
+  waterDepthTexSize: number,
+  timeUniform: { value: number },
+  style: VisualStyleId
+): {
+  group: THREE.Group;
+  updateUniforms: (bodies?: WaterBodyConfig[], selectedWaterBodyId?: string | null) => void;
+} {
   const group = new THREE.Group();
+  const bundleMap = new Map<string, WaterBodyUniformBundle>();
+
+  for (const wb of waterBodies) {
+    let geo: THREE.BufferGeometry;
+    if ((wb.kind === 'river' || wb.kind === 'stream') && wb.points && wb.points.length >= 2) {
+      const pts3 = wb.points.map(([px, pz]) => new THREE.Vector3(px, 0, pz));
+      const curve = new THREE.CatmullRomCurve3(pts3);
+      const segs = Math.max(20, pts3.length * 10);
+      const samples = curve.getSpacedPoints(segs);
+      const halfW = Math.max(0.8, wb.width * 0.5);
+      const positions: number[] = [];
+      const uvs: number[] = [];
+      const indices: number[] = [];
+      let accumDist = 0;
+
+      for (let i = 0; i < samples.length; i++) {
+        const cur = samples[i];
+        if (i > 0) accumDist += cur.distanceTo(samples[i - 1]);
+        const prev = samples[Math.max(0, i - 1)];
+        const next = samples[Math.min(samples.length - 1, i + 1)];
+        let tx = next.x - prev.x;
+        let tz = next.z - prev.z;
+        const len = Math.max(0.0001, Math.hypot(tx, tz));
+        tx /= len;
+        tz /= len;
+        const nx = -tz;
+        const nz = tx;
+        const edgeWobble = Math.sin(i * 0.72 + wb.center[0] * 0.3) * (wb.shoreNoise * 0.42 * halfW);
+        const w = halfW + edgeWobble;
+        positions.push(cur.x - nx * w, 0, cur.z - nz * w);
+        positions.push(cur.x + nx * w, 0, cur.z + nz * w);
+        uvs.push(0, accumDist * 0.2);
+        uvs.push(1, accumDist * 0.2);
+        if (i < samples.length - 1) {
+          const base = i * 2;
+          indices.push(base, base + 2, base + 1, base + 1, base + 2, base + 3);
+        }
+      }
+      geo = new THREE.BufferGeometry();
+      geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+      geo.setAttribute('uv', new THREE.Float32BufferAttribute(uvs, 2));
+      geo.setIndex(indices);
+      geo.computeVertexNormals();
+    } else {
+      const radialSegs = 40;
+      const rings = 4;
+      geo = new THREE.CircleGeometry(1, radialSegs);
+      geo.rotateX(-Math.PI / 2);
+      const posAttr = geo.attributes.position as THREE.BufferAttribute;
+      for (let i = 0; i < posAttr.count; i++) {
+        const vx = posAttr.getX(i);
+        const vz = posAttr.getZ(i);
+        const r = Math.hypot(vx, vz);
+        if (r > 0.001) {
+          const ang = Math.atan2(vz, vx);
+          const jitter =
+            1 +
+            (Math.sin(ang * 3 + wb.center[0] * 0.25) * 0.14 +
+              Math.cos(ang * 5 - wb.center[1] * 0.3) * 0.08) *
+              wb.shoreNoise;
+          posAttr.setXYZ(
+            i,
+            vx * wb.radiusX * jitter,
+            0,
+            vz * wb.radiusZ * jitter
+          );
+        }
+      }
+      void rings;
+      geo.translate(wb.center[0], 0, wb.center[1]);
+      geo.computeVertexNormals();
+    }
+
+    const uWaterCol = uniform(new THREE.Color(wb.waterColor));
+    const uMurkCol = uniform(new THREE.Color(wb.deepMurkColor));
+    const uOpacity = uniform(THREE.MathUtils.clamp(wb.opacity, 0.2, 1));
+    const uDepth = uniform(Math.max(0.25, wb.depth));
+    const uFoam = uniform(Math.max(0, wb.foamAmount));
+    const uWaveSpeed = uniform(Math.max(0, wb.waveSpeed));
+    const uWindRipple = uniform(Math.max(0, wb.windRipple));
+    const uFlowSpeed = uniform(Math.max(0, wb.flowSpeed));
+    const rad = (wb.flowAngleDeg * Math.PI) / 180;
+    const uFlowDirX = uniform(Math.cos(rad));
+    const uFlowDirZ = uniform(Math.sin(rad));
+    const uSelected = uniform(0);
+
+    const mat = new MeshStandardNodeMaterial({
+      color: new THREE.Color(wb.waterColor),
+      roughness: style === 'celToon' ? 0.28 : 0.14,
+      metalness: 0.08,
+      transparent: true,
+      depthWrite: false,
+      side: THREE.DoubleSide,
+    });
+
+    const uTime = asIslandFloatUniformNode(timeUniform, 0);
+    const waveAmp = float(0.032).mul(float(0.35).add(uWindRipple.mul(0.85)));
+    const wv1 = sin(positionLocal.x.mul(0.48).add(uTime.mul(uWaveSpeed.mul(1.8).add(0.4)))).mul(waveAmp);
+    const wv2 = cos(positionLocal.z.mul(0.54).sub(uTime.mul(uWaveSpeed.mul(1.4).add(0.3)))).mul(waveAmp);
+    mat.positionNode = vec3(positionLocal.x, positionLocal.y.add(wv1).add(wv2), positionLocal.z);
+
+    mat.colorNode = Fn(() => {
+      const worldRadius = float(IslandTerrain.radius);
+      const worldDiameter = float(IslandTerrain.radius * 2.0);
+      const wp = positionWorld;
+      const terrainUv = vec2(wp.x, wp.z).add(worldRadius).div(worldDiameter);
+      const texRes = float(waterDepthTexSize);
+      const texPos = clamp(terrainUv, vec2(0.0), vec2(1.0)).mul(texRes.sub(1.0));
+      const f = fract(texPos);
+      const baseCell = floor(texPos);
+      const h00 = texture(waterDepthTex, baseCell.add(0.5).div(texRes)).r;
+      const h10 = texture(waterDepthTex, baseCell.add(vec2(1.0, 0.0)).add(0.5).div(texRes)).r;
+      const h01 = texture(waterDepthTex, baseCell.add(vec2(0.0, 1.0)).add(0.5).div(texRes)).r;
+      const h11 = texture(waterDepthTex, baseCell.add(vec2(1.0, 1.0)).add(0.5).div(texRes)).r;
+      const terrainY = mix(mix(h00, h10, f.x), mix(h01, h11, f.x), f.y);
+
+      const surfaceY = float(IslandTerrain.waterLevel + wb.waterLevelOffset + 0.03);
+      const waterDepth = max(0.0, surfaceY.sub(terrainY));
+      const depthNorm = clamp(waterDepth.div(max(0.3, uDepth)), 0.0, 1.0);
+
+      const flowShift = vec2(uFlowDirX, uFlowDirZ).mul(uTime.mul(uFlowSpeed.mul(1.15)));
+      const rippleUv = vec2(wp.x, wp.z).mul(0.36).sub(flowShift);
+      const flowNoise = tFbm2DTsl(rippleUv);
+      const flowStreak = smoothstep(0.52, 0.88, flowNoise).mul(float(0.16).add(uWindRipple.mul(0.12)));
+
+      const baseCol = mix(uWaterCol, uMurkCol, smoothstep(0.08, 0.92, depthNorm));
+      const viewDir = normalize(cameraPosition.sub(wp));
+      const fresnel = pow(float(1.0).sub(clamp(dot(normalize(normalWorld), viewDir), 0.0, 1.0)), 3.6);
+
+      const shoreEdgeFoam = float(1.0).sub(smoothstep(0.02, 0.48, waterDepth)).mul(uFoam);
+      const shoreBreakup = smoothstep(0.35, 0.78, tNoise2DTsl(rippleUv.mul(2.1)));
+      const foamVal = clamp(shoreEdgeFoam.mul(float(0.55).add(shoreBreakup.mul(0.45))), 0.0, 1.0);
+
+      const selectedGlow = vec3(0.48, 0.76, 1.0).mul(uSelected.mul(0.28));
+      const finalRgb = mix(
+        baseCol
+          .add(vec3(0.12, 0.2, 0.24).mul(flowStreak))
+          .add(vec3(0.18, 0.32, 0.45).mul(fresnel).mul(0.45))
+          .add(selectedGlow),
+        vec3(0.92, 0.97, 1.0),
+        foamVal.mul(0.75)
+      );
+
+      const edgeFeather = smoothstep(0.0, 0.25, waterDepth);
+      const alpha = clamp(
+        uOpacity.mul(mix(0.22, 1.0, edgeFeather)).add(foamVal.mul(0.3)),
+        0.05,
+        1.0
+      );
+      return vec4(finalRgb, alpha);
+    })();
+
+    const mesh = new THREE.Mesh(geo, mat);
+    mesh.position.y = IslandTerrain.waterLevel + wb.waterLevelOffset + 0.03;
+    mesh.receiveShadow = true;
+    mesh.userData.waterBodyId = wb.id;
+    mesh.userData.skipBotwStyle = true;
+    group.add(mesh);
+
+    bundleMap.set(wb.id, {
+      uWaterCol,
+      uMurkCol,
+      uOpacity,
+      uDepth,
+      uFoam,
+      uWaveSpeed,
+      uWindRipple,
+      uFlowSpeed,
+      uFlowDirX,
+      uFlowDirZ,
+      uSelected,
+      mesh,
+    });
+  }
+
+  return {
+    group,
+    updateUniforms: (bodies?: WaterBodyConfig[], selectedWaterBodyId?: string | null) => {
+      for (const wb of bodies ?? []) {
+        const b = bundleMap.get(wb.id);
+        if (!b) continue;
+        b.uWaterCol.value.set(wb.waterColor);
+        b.uMurkCol.value.set(wb.deepMurkColor);
+        b.uOpacity.value = THREE.MathUtils.clamp(wb.opacity, 0.2, 1);
+        b.uDepth.value = Math.max(0.25, wb.depth);
+        b.uFoam.value = Math.max(0, wb.foamAmount);
+        b.uWaveSpeed.value = Math.max(0, wb.waveSpeed);
+        b.uWindRipple.value = Math.max(0, wb.windRipple);
+        b.uFlowSpeed.value = Math.max(0, wb.flowSpeed);
+        const rad = (wb.flowAngleDeg * Math.PI) / 180;
+        b.uFlowDirX.value = Math.cos(rad);
+        b.uFlowDirZ.value = Math.sin(rad);
+        b.uSelected.value = selectedWaterBodyId === wb.id ? 1 : 0;
+        b.mesh.position.y = IslandTerrain.waterLevel + wb.waterLevelOffset + 0.03;
+      }
+    },
+  };
+}
+
+function buildDirtPebblesGroup(
+  terrain: TerrainData,
+  dirtConfig?: DirtAndRoadConfig
+): THREE.InstancedMesh | null {
+  const cfg = dirtConfig ?? createDefaultDirtAndRoadConfig();
+  if (cfg.pebbleDensity <= 0.02) return null;
+
+  const dirtCells: [number, number][] = [];
+  const step = (IslandTerrain.radius * 2) / terrain.size;
+  for (let row = 1; row < terrain.size; row++) {
+    for (let col = 1; col < terrain.size; col++) {
+      const idx = row * (terrain.size + 1) + col;
+      if (terrain.layers[idx] === 6) {
+        const wx = -IslandTerrain.radius + col * step;
+        const wz = -IslandTerrain.radius + row * step;
+        if (Math.hypot(wx, wz) < IslandTerrain.shoreRadius - 4) {
+          dirtCells.push([wx, wz]);
+        }
+      }
+    }
+  }
+  if (dirtCells.length === 0) return null;
+
+  const targetCount = Math.min(720, Math.max(12, Math.round(dirtCells.length * cfg.pebbleDensity * 1.15)));
+  const pebbleGeo = createFacetedRockGeometry(0.14, 1.22, 0.65, 1.05, 19);
+  const mat = new THREE.MeshStandardMaterial({
+    color: '#FFFFFF',
+    roughness: 0.88,
+    flatShading: true,
+  });
+  const instMesh = new THREE.InstancedMesh(pebbleGeo, mat, targetCount);
+  instMesh.castShadow = false;
+  instMesh.receiveShadow = true;
+
+  const baseColor = new THREE.Color(cfg.pebbleColor || '#7B746C');
+  const tmpColor = new THREE.Color();
+  const dummy = new THREE.Object3D();
+
+  let placed = 0;
+  for (let i = 0; i < targetCount; i++) {
+    const cellIdx = (i * 37 + 11) % dirtCells.length;
+    const [cx, cz] = dirtCells[cellIdx];
+    const hash1 = Math.sin(i * 12.9898 + cx * 0.47 + cz * 0.83) * 43758.5453;
+    const r1 = hash1 - Math.floor(hash1);
+    const hash2 = Math.sin(i * 78.233 - cz * 0.61) * 29432.1234;
+    const r2 = hash2 - Math.floor(hash2);
+    const hash3 = Math.sin(i * 45.164 + cx * 0.91) * 19341.732;
+    const r3 = hash3 - Math.floor(hash3);
+
+    const spreadRange = (0.35 + cfg.pebbleSpread * 1.45) * step;
+    const px = cx + (r1 - 0.5) * spreadRange;
+    const pz = cz + (r2 - 0.5) * spreadRange;
+    const py = sampleTerrainHeight(terrain, px, pz);
+    if (py < IslandTerrain.waterLevel + 0.12) continue;
+
+    const jitter = cfg.pebbleShapeRandomness;
+    const baseScale = 0.6 + r3 * 0.95;
+    const sx = baseScale * (1 + (r1 - 0.5) * 0.7 * jitter);
+    const sy = baseScale * (0.7 + (r2 - 0.5) * 0.5 * jitter);
+    const sz = baseScale * (1 + (r3 - 0.5) * 0.7 * jitter);
+
+    dummy.position.set(px, py + 0.02 * sy, pz);
+    dummy.rotation.set((r1 - 0.5) * 0.5 * jitter, r2 * Math.PI * 2, (r3 - 0.5) * 0.5 * jitter);
+    dummy.scale.set(sx, sy, sz);
+    dummy.updateMatrix();
+    instMesh.setMatrixAt(placed, dummy.matrix);
+
+    tmpColor.copy(baseColor).offsetHSL(
+      (r1 - 0.5) * 0.08 * cfg.pebbleHueVariance,
+      (r2 - 0.5) * 0.14 * cfg.pebbleHueVariance,
+      (r3 - 0.5) * 0.22 * cfg.pebbleHueVariance
+    );
+    instMesh.setColorAt(placed, tmpColor);
+    placed++;
+  }
+  instMesh.count = placed;
+  instMesh.instanceMatrix.needsUpdate = true;
+  if (instMesh.instanceColor) instMesh.instanceColor.needsUpdate = true;
+  return instMesh;
+}
+
+function buildCavesGroup(
+  level: GameLevel,
+  caves: CaveGrotto[],
+  timeUniform: { value: number }
+): THREE.Group {
+  const group = new THREE.Group();
+  const uCaveTime = asIslandFloatUniformNode(timeUniform, 0);
   const atlas = getTerrainTextureAtlas();
   const customCaveTex = level.sceneryTextures?.cave;
 
@@ -3587,7 +4047,6 @@ function buildCavesGroup(level: GameLevel, caves: CaveGrotto[]): THREE.Group {
       baseDark.color.multiplyScalar(0.76);
     }
 
-    // Determine weathering either from Texture Studio Cave preset or painted terrain around this cave
     let wPreset = customCaveTex?.enabled && customCaveTex.weathering ? customCaveTex.weathering : 'none';
     let wIntensity = customCaveTex?.enabled ? customCaveTex.weatheringIntensity ?? 0.65 : 0.65;
     if (wPreset === 'none') {
@@ -3660,20 +4119,79 @@ function buildCavesGroup(level: GameLevel, caves: CaveGrotto[]): THREE.Group {
     }),
     0.86
   ) as THREE.MeshStandardMaterial;
-  const crystalMat = new THREE.MeshStandardMaterial({
-    color: '#6CE5FF',
-    emissive: '#38BDF8',
-    emissiveIntensity: 1.4,
-    roughness: 0.2,
-  });
+
+  const tagCaveId = (root: THREE.Object3D, caveId: string) => {
+    root.userData.caveId = caveId;
+    root.traverse((child) => {
+      child.userData.caveId = caveId;
+    });
+  };
+
+  const attachInteriorSpring = (
+    parent: THREE.Group,
+    depthSpan: number,
+    widthSpan: number,
+    flow: number
+  ) => {
+    const springMat = new MeshStandardNodeMaterial({
+      color: new THREE.Color('#2AA8DF'),
+      roughness: 0.16,
+      metalness: 0.08,
+      transparent: true,
+      opacity: 0.82,
+    });
+    springMat.colorNode = Fn(() => {
+      const p = positionLocal;
+      const shimmer = sin(p.z.mul(2.4).add(uCaveTime.mul(2.5 * Math.max(0.2, flow)))).mul(0.08);
+      return vec4(vec3(0.18, 0.68, 0.88).add(vec3(0.1, 0.14, 0.16).mul(shimmer)), 0.84);
+    })();
+    const creek = new THREE.Mesh(
+      new THREE.PlaneGeometry(widthSpan * 0.46, depthSpan * 0.95, 8, 12),
+      springMat
+    );
+    creek.rotation.x = -Math.PI / 2;
+    creek.position.set(0, 0.06, -depthSpan * 0.35);
+    parent.add(creek);
+  };
 
   let builtMainMountainCave = false;
-  for (const cave of caves) {
+  for (const rawCave of caves) {
+    const cave = normalizeCaveGrotto(rawCave);
+    const crystalMat = new THREE.MeshStandardMaterial({
+      color: cave.crystalColor ?? '#6CE5FF',
+      emissive: cave.crystalColor ?? '#38BDF8',
+      emissiveIntensity: 1.45,
+      roughness: 0.2,
+    });
+
     // Primary reachable Mountain-Base Cave with full enterable interior
     if (!builtMainMountainCave && Math.hypot(cave.x - MountainCave.x, cave.z - MountainCave.z) < 6) {
       builtMainMountainCave = true;
       const mats = resolveCaveMaterialPair(cave.x, cave.z);
-      group.add(buildMountainCaveInterior(mats.stone, mats.dark, mossMat, mossBrightMat));
+      const mainG = buildMountainCaveInterior(mats.stone, mats.dark, mossMat, mossBrightMat);
+      mainG.scale.set(
+        cave.entranceWidth ?? 1,
+        cave.entranceHeight ?? 1,
+        cave.cavityDepth ?? 1
+      );
+      if ((cave.crystalDensity ?? 0.5) > 0.1) {
+        const extraCrystals = Math.round((cave.crystalDensity ?? 0.5) * 6);
+        for (let ci = 0; ci < extraCrystals; ci++) {
+          const crys = new THREE.Mesh(new THREE.OctahedronGeometry(0.28 + (ci % 3) * 0.08, 0), crystalMat);
+          crys.position.set(
+            (ci % 2 === 0 ? -1 : 1) * (3.1 + (ci % 3) * 0.45),
+            0.7 + (ci % 2) * 0.35,
+            -2.4 - ci * 1.15
+          );
+          crys.scale.set(0.7, 1.5, 0.7);
+          mainG.add(crys);
+        }
+      }
+      if (cave.hasSpring) {
+        attachInteriorSpring(mainG, 10.5, 4.2, cave.springFlow ?? 0.75);
+      }
+      tagCaveId(mainG, cave.id);
+      group.add(mainG);
       continue;
     }
 
@@ -3684,53 +4202,104 @@ function buildCavesGroup(level: GameLevel, caves: CaveGrotto[]): THREE.Group {
     g.rotation.y = cave.rotation;
     g.scale.setScalar(cave.scale);
 
+    const ew = cave.entranceWidth ?? 1.0;
+    const eh = cave.entranceHeight ?? 1.0;
+    const cw = cave.cavityWidth ?? 1.0;
+    const cd = cave.cavityDepth ?? 1.0;
+    const archSharp = cave.archSharpness ?? 0.45;
+
     const pillarGeo = createFacetedRockGeometry(1.45, 1.0, 1.0, 1.0, 31);
     const leftP = new THREE.Mesh(pillarGeo, mats.stone);
-    leftP.scale.set(1.0, 1.8, 1.5);
-    leftP.position.set(-1.65, 1.1, 0);
+    leftP.scale.set(0.95 + archSharp * 0.2, 1.8 * eh, 1.45 * cd);
+    leftP.position.set(-1.65 * ew, 1.1 * eh, 0);
     leftP.castShadow = true;
     leftP.receiveShadow = true;
 
     const rightP = new THREE.Mesh(pillarGeo, mats.stone);
-    rightP.scale.set(1.0, 1.8, 1.5);
-    rightP.position.set(1.65, 1.1, 0);
+    rightP.scale.set(0.95 + archSharp * 0.2, 1.8 * eh, 1.45 * cd);
+    rightP.position.set(1.65 * ew, 1.1 * eh, 0);
     rightP.castShadow = true;
     rightP.receiveShadow = true;
 
-    const arch = new THREE.Mesh(
-      createFacetedRockGeometry(1.85, 1.0, 1.0, 1.0, 41),
-      mats.stone
-    );
-    arch.scale.set(1.65, 0.72, 1.55);
-    arch.position.set(0, 2.75, -0.2);
+    const arch = new THREE.Mesh(createFacetedRockGeometry(1.85, 1.0, 1.0, 1.0, 41), mats.stone);
+    arch.scale.set(1.65 * ew, (0.62 + archSharp * 0.35) * eh, 1.55 * cd);
+    arch.position.set(0, 2.75 * eh, -0.2 * cd);
     arch.castShadow = true;
 
-    const backWall = new THREE.Mesh(
-      createFacetedRockGeometry(1.75, 1.0, 1.0, 1.0, 53),
-      mats.dark
-    );
-    backWall.scale.set(1.45, 1.55, 0.85);
-    backWall.position.set(0, 1.35, -1.65);
+    const backWall = new THREE.Mesh(createFacetedRockGeometry(1.75, 1.0, 1.0, 1.0, 53), mats.dark);
+    backWall.scale.set(1.45 * cw, 1.55 * eh, 0.9 * cd);
+    backWall.position.set(0, 1.35 * eh, -1.9 * cd);
     backWall.castShadow = true;
 
-    const mossCap = new THREE.Mesh(
-      createFacetedRockGeometry(1.5, 1.0, 1.0, 1.0, 67),
-      mossMat
-    );
-    mossCap.scale.set(1.4, 0.35, 1.25);
-    mossCap.position.set(0, 3.25, -0.15);
+    const sideWallL = new THREE.Mesh(pillarGeo, mats.dark);
+    sideWallL.scale.set(0.75, 1.45 * eh, 1.75 * cd);
+    sideWallL.position.set(-1.75 * cw, 1.2 * eh, -1.2 * cd);
+    const sideWallR = sideWallL.clone();
+    sideWallR.position.x = 1.75 * cw;
 
-    const crystal = new THREE.Mesh(new THREE.OctahedronGeometry(0.32, 0), crystalMat);
-    crystal.position.set(0, 0.6, -0.75);
+    const mossCap = new THREE.Mesh(createFacetedRockGeometry(1.5, 1.0, 1.0, 1.0, 67), mossMat);
+    mossCap.scale.set(1.4 * ew, 0.35, 1.25 * cd);
+    mossCap.position.set(0, 3.25 * eh, -0.15 * cd);
 
-    g.add(leftP, rightP, arch, backWall, mossCap, crystal);
+    g.add(leftP, rightP, arch, backWall, sideWallL, sideWallR, mossCap);
+
+    // Stalactites
+    const stalCount = Math.round((cave.stalactiteDensity ?? 0.65) * 6);
+    if (stalCount > 0) {
+      const stGeo = new THREE.ConeGeometry(0.16, 0.78, 7);
+      for (let i = 0; i < stalCount; i++) {
+        const st = new THREE.Mesh(stGeo, mats.dark);
+        const rx = (((i * 37) % 10) / 10 - 0.5) * 1.9 * cw;
+        const rz = -0.35 - ((i + 1) / (stalCount + 1)) * 1.45 * cd;
+        st.position.set(rx, 2.25 * eh, rz);
+        st.rotation.x = Math.PI;
+        st.scale.setScalar(0.75 + (i % 3) * 0.25);
+        g.add(st);
+      }
+    }
+
+    // Stalagmites
+    const stagCount = Math.round((cave.stalagmiteDensity ?? 0.5) * 5);
+    if (stagCount > 0) {
+      const smGeo = new THREE.ConeGeometry(0.2, 0.9, 7);
+      for (let i = 0; i < stagCount; i++) {
+        const sm = new THREE.Mesh(smGeo, mats.dark);
+        const side = i % 2 === 0 ? -1 : 1;
+        sm.position.set(side * (0.9 + (i % 2) * 0.4) * cw, 0.42, -0.4 - i * 0.28 * cd);
+        sm.scale.setScalar(0.75 + (i % 3) * 0.22);
+        g.add(sm);
+      }
+    }
+
+    // Glowing Crystals
+    const cryCount = Math.max(0, Math.round((cave.crystalDensity ?? 0.5) * 5));
+    for (let i = 0; i < cryCount; i++) {
+      const crystal = new THREE.Mesh(new THREE.OctahedronGeometry(0.26, 0), crystalMat);
+      crystal.position.set(
+        (((i * 29) % 10) / 10 - 0.5) * 1.4 * cw,
+        0.55 + (i % 2) * 0.2,
+        -0.55 - (i / Math.max(1, cryCount)) * 1.15 * cd
+      );
+      crystal.scale.set(0.75, 1.45, 0.75);
+      crystal.rotation.set((i % 3) * 0.2, i * 0.8, 0.15);
+      g.add(crystal);
+    }
+
+    // Optional Interior Spring / Creek
+    if (cave.hasSpring) {
+      attachInteriorSpring(g, 2.2 * cd, 1.8 * cw, cave.springFlow ?? 0.75);
+    }
+
+    tagCaveId(g, cave.id);
     group.add(g);
   }
 
   // Always ensure the primary enterable MountainCave is built on open-world islands
   if (!builtMainMountainCave) {
     const mats = resolveCaveMaterialPair(MountainCave.x, MountainCave.z);
-    group.add(buildMountainCaveInterior(mats.stone, mats.dark, mossMat, mossBrightMat));
+    const mainG = buildMountainCaveInterior(mats.stone, mats.dark, mossMat, mossBrightMat);
+    tagCaveId(mainG, 'cave-mountain-main');
+    group.add(mainG);
   }
 
   return group;

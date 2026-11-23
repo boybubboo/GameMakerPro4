@@ -4,17 +4,22 @@ import { GLTFLoader, type GLTF } from 'three/addons/loaders/GLTFLoader.js';
 import * as SkeletonUtils from 'three/addons/utils/SkeletonUtils.js';
 import type {
   AssetCategory,
+  BuildingBlockConfig,
+  CharacterMakerDoc,
   CustomAssetMeta,
   CustomClipSlot,
   CustomMotionPreset,
   CustomRigSettings,
   ObjectMakerDoc,
   ObjectMechanism,
+  StylizedCanopyConfig,
+  VertexPaintStroke,
   VisualStyleId,
 } from '../types/maker';
 import { getAssetBlob } from '../utils/assetVault';
 import { uid } from '../utils/terrain';
 import { getTerrainTextureAtlas } from './proceduralTextures';
+import { applyVertexPaintStrokesToObject } from './vertexPainter';
 import {
   createDefaultRigSettings,
   inspectAnimationClip,
@@ -115,7 +120,17 @@ function computeNormalizedBounds(root: THREE.Object3D, category: AssetCategory) 
   box.getSize(size);
   const maxDim = Math.max(0.01, size.y, Math.max(size.x, size.z) * 0.85);
   const targetHeight =
-    category === 'character' ? 1.85 : category === 'scenery' ? 2.8 : category === 'plant' ? 1.45 : 1.25;
+    category === 'character'
+      ? 1.85
+      : category === 'tree'
+      ? 3.2
+      : category === 'scenery'
+      ? 2.8
+      : category === 'building'
+      ? 2.4
+      : category === 'plant'
+      ? 1.45
+      : 1.25;
   const baseScale = THREE.MathUtils.clamp(targetHeight / maxDim, 0.01, 60);
   const baseGroundOffset = -box.min.y * baseScale;
   return { baseScale, baseGroundOffset };
@@ -420,9 +435,15 @@ export async function renderObject3DThumbnail(
   }
 }
 
-async function renderThumbnailSnapshot(cached: CachedGLTF): Promise<string | undefined> {
+async function renderThumbnailSnapshot(
+  cached: CachedGLTF,
+  vertexPaintStrokes?: VertexPaintStroke[]
+): Promise<string | undefined> {
   try {
     const previewClone = SkeletonUtils.clone(cached.scene) as THREE.Group;
+    if (vertexPaintStrokes && vertexPaintStrokes.length > 0) {
+      applyVertexPaintStrokesToObject(previewClone, vertexPaintStrokes);
+    }
     previewClone.scale.setScalar(cached.baseScale);
     previewClone.position.y = cached.baseGroundOffset;
     return await renderObject3DThumbnail(previewClone);
@@ -433,11 +454,12 @@ async function renderThumbnailSnapshot(cached: CachedGLTF): Promise<string | und
 
 export async function regenerateCustomAssetThumbnail(
   assetId: string,
-  category: AssetCategory = 'character'
+  category: AssetCategory = 'character',
+  vertexPaintStrokes?: VertexPaintStroke[]
 ): Promise<string | undefined> {
   const cached = getCachedAssetSync(assetId) ?? (await loadCustomAssetToCache(assetId, category));
   if (!cached) return undefined;
-  return await renderThumbnailSnapshot(cached);
+  return await renderThumbnailSnapshot(cached, vertexPaintStrokes);
 }
 
 export async function parseUploadedGlbFile(
@@ -494,6 +516,11 @@ export async function registerGeneratedGlbAsset(opts: {
   buffer: ArrayBuffer;
   mechanisms?: ObjectMechanism[];
   objectRecipe?: ObjectMakerDoc;
+  characterRecipe?: CharacterMakerDoc;
+  treeRecipe?: StylizedCanopyConfig;
+  buildingBlock?: BuildingBlockConfig;
+  vertexPaintStrokes?: VertexPaintStroke[];
+  thumbnailOverride?: string;
   keepMetricScale?: boolean;
 }): Promise<{ meta: CustomAssetMeta; buffer: ArrayBuffer }> {
   const gltf = await loader.parseAsync(opts.buffer, '');
@@ -509,7 +536,12 @@ export async function registerGeneratedGlbAsset(opts: {
       .replace(/[^a-z0-9]+/g, '_')
       .replace(/^_|_$/g, '') || 'custom_object';
 
-  const thumbnailDataUrl = await renderThumbnailSnapshot(cached);
+  const strokes =
+    opts.vertexPaintStrokes && opts.vertexPaintStrokes.length > 0
+      ? opts.vertexPaintStrokes
+      : undefined;
+  const thumbnailDataUrl =
+    opts.thumbnailOverride ?? (await renderThumbnailSnapshot(cached, strokes));
 
   const meta: CustomAssetMeta = {
     ...(opts.existingMeta ?? {}),
@@ -525,6 +557,11 @@ export async function registerGeneratedGlbAsset(opts: {
     rigSettings: opts.existingMeta?.rigSettings ?? cached.defaultRigSettings,
     mechanisms: opts.mechanisms && opts.mechanisms.length > 0 ? opts.mechanisms : undefined,
     objectRecipe: opts.objectRecipe,
+    characterRecipe: opts.characterRecipe,
+    treeRecipe: opts.treeRecipe,
+    buildingBlock: opts.buildingBlock,
+    vertexPaintStrokes: strokes,
+    favorite: opts.existingMeta?.favorite,
     groundOffset: Number(cached.baseGroundOffset.toFixed(3)),
     defaultScale: opts.keepMetricScale
       ? 1

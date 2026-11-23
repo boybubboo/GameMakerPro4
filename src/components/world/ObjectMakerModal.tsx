@@ -33,6 +33,7 @@ import {
   Scissors,
   Search,
   Shapes,
+  SlidersHorizontal,
   Sparkles,
   Spline,
   Trash2,
@@ -60,6 +61,7 @@ import {
   serializeBufferGeometry,
   type BooleanOperation,
 } from '../../three/meshCsg';
+import { enhanceTransformControlsGizmo } from '../../three/gizmoEnhancer';
 import {
   OBJECT_PRIMITIVE_CATALOG,
   buildAndExportObjectDocToGlb,
@@ -93,7 +95,11 @@ import {
   type MechanismPresetDef,
   type PresetCategory,
 } from '../../data/mechanismPresets';
-import { getCachedAssetSync, loadCustomAssetToCache } from '../../three/gltfAssetManager';
+import {
+  getCachedAssetSync,
+  loadCustomAssetToCache,
+  regenerateCustomAssetThumbnail,
+} from '../../three/gltfAssetManager';
 import {
   createMakerRenderer,
   detectSoftwareGl,
@@ -101,6 +107,18 @@ import {
   setupSceneEnvironment,
 } from '../../three/islandScene';
 import { isWebGPUFallbackAdapter } from '../../three/webglUtils';
+import {
+  applyVertexPaintStrokesToObject,
+  generateOrganicDappleStroke,
+  prepareObjectForVertexPainting,
+  resetObjectVertexPaint,
+  type VertexPaintBrushSettings,
+} from '../../three/vertexPainter';
+import {
+  MakerVertexPaintSession,
+  shiftVertexPaintStrokes,
+} from '../../three/vertexPaintViewportHelper';
+import { VertexPaintInspector } from './VertexPaintInspector';
 import type {
   AssetCategory,
   BuildingMaterialId,
@@ -121,6 +139,7 @@ import type {
   ObjectMechanism,
   ObjectPartSpec,
   ObjectPrimitiveShapeId,
+  VertexPaintStroke,
   WeatheringPreset,
 } from '../../types/maker';
 import { uid } from '../../utils/terrain';
@@ -134,7 +153,7 @@ export interface ObjectMakerModalProps {
 }
 
 type StudioToolMode = 'select' | 'translate' | 'rotate' | 'scale';
-type InspectorTab = 'shape' | 'material' | 'mechanics';
+type InspectorTab = 'shape' | 'material' | 'paint' | 'mechanics';
 type CameraPreset = 'threeQuarter' | 'front' | 'top';
 type HoleShapeKind = 'round' | 'square' | 'arch';
 type HoleAxisKind = 'x' | 'y' | 'z';
@@ -241,264 +260,6 @@ function ensureUniquePartAndGroupNames(doc: ObjectMakerDoc): ObjectMakerDoc {
       name: makeUnique(p.name, `Part_${idx + 1}`),
     })),
   };
-}
-
-type GizmoEntry = [
-  THREE.Object3D,
-  [number, number, number]?,
-  [number, number, number]?,
-  [number, number, number]?
-];
-
-function buildGizmoGroupFromEntries(map: Record<string, GizmoEntry[]>): THREE.Object3D {
-  const root = new THREE.Object3D();
-  for (const name of Object.keys(map)) {
-    const entries = map[name];
-    for (let i = 0; i < entries.length; i++) {
-      const [proto, pos, rot, scl] = entries[i];
-      const obj = proto.clone();
-      obj.name = name;
-      if (pos) obj.position.set(pos[0], pos[1], pos[2]);
-      if (rot) obj.rotation.set(rot[0], rot[1], rot[2]);
-      if (scl) obj.scale.set(scl[0], scl[1], scl[2]);
-      obj.updateMatrix();
-      const mesh = obj as THREE.Mesh;
-      if (mesh.geometry) {
-        const baked = mesh.geometry.clone();
-        baked.applyMatrix4(mesh.matrix);
-        mesh.geometry = baked;
-      }
-      obj.position.set(0, 0, 0);
-      obj.rotation.set(0, 0, 0);
-      obj.scale.set(1, 1, 1);
-      obj.renderOrder = Infinity;
-      root.add(obj);
-    }
-  }
-  return root;
-}
-
-function disposeGizmoGroupChildren(group: THREE.Object3D | undefined) {
-  if (!group) return;
-  group.traverse((child) => {
-    const m = child as THREE.Mesh;
-    if (m.geometry) m.geometry.dispose();
-  });
-  group.clear();
-}
-
-function enhanceTransformControlsGizmo(tc: TransformControls) {
-  const gizmoInst = (
-    tc as unknown as {
-      _gizmo?: THREE.Object3D & {
-        gizmo: Record<string, THREE.Object3D>;
-        picker: Record<string, THREE.Object3D>;
-        materialLib: Record<
-          string,
-          THREE.MeshBasicMaterial & { _color?: THREE.Color; _opacity?: number }
-        >;
-      };
-    }
-  )._gizmo;
-  if (!gizmoInst || !gizmoInst.gizmo || !gizmoInst.picker) return;
-
-  tc.setColors('#FF4757', '#2ED573', '#1E90FF', '#FFD32A');
-
-  const mat = (colorHex: string, opacity = 1) =>
-    new THREE.MeshBasicMaterial({
-      color: colorHex,
-      depthTest: false,
-      depthWrite: false,
-      fog: false,
-      toneMapped: false,
-      transparent: true,
-      opacity,
-    });
-
-  const matX = gizmoInst.materialLib?.xAxis ?? mat('#FF4757', 1);
-  const matY = gizmoInst.materialLib?.yAxis ?? mat('#2ED573', 1);
-  const matZ = gizmoInst.materialLib?.zAxis ?? mat('#1E90FF', 1);
-  const matXPlane = gizmoInst.materialLib?.xAxisTransparent ?? mat('#FF4757', 0.42);
-  const matYPlane = gizmoInst.materialLib?.yAxisTransparent ?? mat('#2ED573', 0.42);
-  const matZPlane = gizmoInst.materialLib?.zAxisTransparent ?? mat('#1E90FF', 0.42);
-  const matCenter = mat('#FFFFFF', 0.72);
-  const matGray = mat('#94A3B8', 0.55);
-  const matRingOuter = mat('#FACC15', 0.45);
-  const matInvisible = mat('#FFFFFF', 0.12);
-
-  // Fat Translate Visuals: thick shafts + prominent arrowheads on both ends
-  const shaftGeo = new THREE.CylinderGeometry(0.032, 0.032, 1.12, 12);
-  const arrowConeGeo = new THREE.CylinderGeometry(0, 0.115, 0.26, 16);
-  arrowConeGeo.translate(0, 0.13, 0);
-  const arrowCollarGeo = new THREE.BoxGeometry(0.095, 0.095, 0.095);
-  const planeQuadGeo = new THREE.BoxGeometry(0.22, 0.22, 0.024);
-
-  const fatTranslate: Record<string, GizmoEntry[]> = {
-    X: [
-      [new THREE.Mesh(shaftGeo, matX), [0, 0, 0], [0, 0, -Math.PI / 2]],
-      [new THREE.Mesh(arrowConeGeo, matX), [0.52, 0, 0], [0, 0, -Math.PI / 2]],
-      [new THREE.Mesh(arrowConeGeo, matX), [-0.52, 0, 0], [0, 0, Math.PI / 2]],
-      [new THREE.Mesh(arrowCollarGeo, matX), [0.50, 0, 0]],
-      [new THREE.Mesh(arrowCollarGeo, matX), [-0.50, 0, 0]],
-    ],
-    Y: [
-      [new THREE.Mesh(shaftGeo, matY), [0, 0, 0]],
-      [new THREE.Mesh(arrowConeGeo, matY), [0, 0.52, 0]],
-      [new THREE.Mesh(arrowConeGeo, matY), [0, -0.52, 0], [Math.PI, 0, 0]],
-      [new THREE.Mesh(arrowCollarGeo, matY), [0, 0.50, 0]],
-      [new THREE.Mesh(arrowCollarGeo, matY), [0, -0.50, 0]],
-    ],
-    Z: [
-      [new THREE.Mesh(shaftGeo, matZ), [0, 0, 0], [Math.PI / 2, 0, 0]],
-      [new THREE.Mesh(arrowConeGeo, matZ), [0, 0, 0.52], [Math.PI / 2, 0, 0]],
-      [new THREE.Mesh(arrowConeGeo, matZ), [0, 0, -0.52], [-Math.PI / 2, 0, 0]],
-      [new THREE.Mesh(arrowCollarGeo, matZ), [0, 0, 0.50]],
-      [new THREE.Mesh(arrowCollarGeo, matZ), [0, 0, -0.50]],
-    ],
-    XYZ: [[new THREE.Mesh(new THREE.SphereGeometry(0.145, 16, 12), matCenter), [0, 0, 0]]],
-    XY: [[new THREE.Mesh(planeQuadGeo, matZPlane), [0.23, 0.23, 0]]],
-    YZ: [[new THREE.Mesh(planeQuadGeo, matXPlane), [0, 0.23, 0.23], [0, Math.PI / 2, 0]]],
-    XZ: [[new THREE.Mesh(planeQuadGeo, matYPlane), [0.23, 0, 0.23], [-Math.PI / 2, 0, 0]]],
-  };
-
-  // Oversized Translate Picker Hit Volumes (cursor + finger friendly!)
-  const pickAxisCyl = new THREE.CylinderGeometry(0.24, 0.24, 1.68, 12);
-  const pickTipSphere = new THREE.SphereGeometry(0.32, 10, 8);
-  const pickPlaneBox = new THREE.BoxGeometry(0.34, 0.34, 0.14);
-
-  const fatPickerTranslate: Record<string, GizmoEntry[]> = {
-    X: [
-      [new THREE.Mesh(pickAxisCyl, matInvisible), [0, 0, 0], [0, 0, -Math.PI / 2]],
-      [new THREE.Mesh(pickTipSphere, matInvisible), [0.64, 0, 0]],
-      [new THREE.Mesh(pickTipSphere, matInvisible), [-0.64, 0, 0]],
-    ],
-    Y: [
-      [new THREE.Mesh(pickAxisCyl, matInvisible), [0, 0, 0]],
-      [new THREE.Mesh(pickTipSphere, matInvisible), [0, 0.64, 0]],
-      [new THREE.Mesh(pickTipSphere, matInvisible), [0, -0.64, 0]],
-    ],
-    Z: [
-      [new THREE.Mesh(pickAxisCyl, matInvisible), [0, 0, 0], [Math.PI / 2, 0, 0]],
-      [new THREE.Mesh(pickTipSphere, matInvisible), [0, 0, 0.64]],
-      [new THREE.Mesh(pickTipSphere, matInvisible), [0, 0, -0.64]],
-    ],
-    XYZ: [[new THREE.Mesh(new THREE.SphereGeometry(0.30, 12, 10), matInvisible), [0, 0, 0]]],
-    XY: [[new THREE.Mesh(pickPlaneBox, matInvisible), [0.23, 0.23, 0]]],
-    YZ: [[new THREE.Mesh(pickPlaneBox, matInvisible), [0, 0.23, 0.23], [0, Math.PI / 2, 0]]],
-    XZ: [[new THREE.Mesh(pickPlaneBox, matInvisible), [0.23, 0, 0.23], [-Math.PI / 2, 0, 0]]],
-  };
-
-  // Fat Scale Visuals: thick shafts + chunky end cubes on every axis + center uniform cube
-  const scaleEndCube = new THREE.BoxGeometry(0.20, 0.20, 0.20);
-  const scaleCenterCube = new THREE.BoxGeometry(0.24, 0.24, 0.24);
-  const fatScale: Record<string, GizmoEntry[]> = {
-    X: [
-      [new THREE.Mesh(shaftGeo, matX), [0, 0, 0], [0, 0, -Math.PI / 2]],
-      [new THREE.Mesh(scaleEndCube, matX), [0.62, 0, 0]],
-      [new THREE.Mesh(scaleEndCube, matX), [-0.62, 0, 0]],
-    ],
-    Y: [
-      [new THREE.Mesh(shaftGeo, matY), [0, 0, 0]],
-      [new THREE.Mesh(scaleEndCube, matY), [0, 0.62, 0]],
-      [new THREE.Mesh(scaleEndCube, matY), [0, -0.62, 0]],
-    ],
-    Z: [
-      [new THREE.Mesh(shaftGeo, matZ), [0, 0, 0], [Math.PI / 2, 0, 0]],
-      [new THREE.Mesh(scaleEndCube, matZ), [0, 0, 0.62]],
-      [new THREE.Mesh(scaleEndCube, matZ), [0, 0, -0.62]],
-    ],
-    XY: [[new THREE.Mesh(planeQuadGeo, matZPlane), [0.23, 0.23, 0]]],
-    YZ: [[new THREE.Mesh(planeQuadGeo, matXPlane), [0, 0.23, 0.23], [0, Math.PI / 2, 0]]],
-    XZ: [[new THREE.Mesh(planeQuadGeo, matYPlane), [0.23, 0, 0.23], [-Math.PI / 2, 0, 0]]],
-    XYZ: [[new THREE.Mesh(scaleCenterCube, matCenter), [0, 0, 0]]],
-  };
-
-  // Oversized Scale Picker Hit Volumes: thick shaft cylinders + 0.42m cube hit zones at tips
-  const pickScaleCube = new THREE.BoxGeometry(0.42, 0.42, 0.42);
-  const fatPickerScale: Record<string, GizmoEntry[]> = {
-    X: [
-      [new THREE.Mesh(pickAxisCyl, matInvisible), [0, 0, 0], [0, 0, -Math.PI / 2]],
-      [new THREE.Mesh(pickScaleCube, matInvisible), [0.62, 0, 0]],
-      [new THREE.Mesh(pickScaleCube, matInvisible), [-0.62, 0, 0]],
-    ],
-    Y: [
-      [new THREE.Mesh(pickAxisCyl, matInvisible), [0, 0, 0]],
-      [new THREE.Mesh(pickScaleCube, matInvisible), [0, 0.62, 0]],
-      [new THREE.Mesh(pickScaleCube, matInvisible), [0, -0.62, 0]],
-    ],
-    Z: [
-      [new THREE.Mesh(pickAxisCyl, matInvisible), [0, 0, 0], [Math.PI / 2, 0, 0]],
-      [new THREE.Mesh(pickScaleCube, matInvisible), [0, 0, 0.62]],
-      [new THREE.Mesh(pickScaleCube, matInvisible), [0, 0, -0.62]],
-    ],
-    XY: [[new THREE.Mesh(pickPlaneBox, matInvisible), [0.23, 0.23, 0]]],
-    YZ: [[new THREE.Mesh(pickPlaneBox, matInvisible), [0, 0.23, 0.23], [0, Math.PI / 2, 0]]],
-    XZ: [[new THREE.Mesh(pickPlaneBox, matInvisible), [0.23, 0, 0.23], [-Math.PI / 2, 0, 0]]],
-    XYZ: [[new THREE.Mesh(new THREE.BoxGeometry(0.40, 0.40, 0.40), matInvisible), [0, 0, 0]]],
-  };
-
-  // Fat Rotate Visuals: thick rings + chunky tactile grabber cubes mounted on each axis ring
-  const makeRotateArcGeo = (radius: number, arcFrac: number) => {
-    const geo = new THREE.TorusGeometry(radius, 0.028, 10, 48, arcFrac * Math.PI * 2);
-    geo.rotateY(Math.PI / 2);
-    geo.rotateX(Math.PI / 2);
-    return geo;
-  };
-  const rotateArcGeo = makeRotateArcGeo(0.60, 0.5);
-  const rotateOuterGeo = makeRotateArcGeo(0.84, 1.0);
-  const rotateFreeGeo = makeRotateArcGeo(0.60, 1.0);
-  const rotateKnobGeo = new THREE.BoxGeometry(0.135, 0.135, 0.135);
-
-  const fatRotate: Record<string, GizmoEntry[]> = {
-    XYZE: [[new THREE.Mesh(rotateFreeGeo, matGray), [0, 0, 0], [0, Math.PI / 2, 0]]],
-    X: [
-      [new THREE.Mesh(rotateArcGeo, matX)],
-      [new THREE.Mesh(rotateKnobGeo, matX), [0, 0, 0.60]],
-    ],
-    Y: [
-      [new THREE.Mesh(rotateArcGeo, matY), [0, 0, 0], [0, 0, -Math.PI / 2]],
-      [new THREE.Mesh(rotateKnobGeo, matY), [0, 0, 0.60], [0, 0, -Math.PI / 2]],
-    ],
-    Z: [
-      [new THREE.Mesh(rotateArcGeo, matZ), [0, 0, 0], [0, Math.PI / 2, 0]],
-      [new THREE.Mesh(rotateKnobGeo, matZ), [0.60, 0, 0], [0, Math.PI / 2, 0]],
-    ],
-    E: [[new THREE.Mesh(rotateOuterGeo, matRingOuter), [0, 0, 0], [0, Math.PI / 2, 0]]],
-  };
-
-  // Oversized Rotate Picker Hit Tori
-  const pickRotateTorus = new THREE.TorusGeometry(0.60, 0.21, 10, 28);
-  const fatPickerRotate: Record<string, GizmoEntry[]> = {
-    XYZE: [[new THREE.Mesh(new THREE.SphereGeometry(0.32, 10, 8), matInvisible)]],
-    X: [[new THREE.Mesh(pickRotateTorus, matInvisible), [0, 0, 0], [0, -Math.PI / 2, -Math.PI / 2]]],
-    Y: [[new THREE.Mesh(pickRotateTorus, matInvisible), [0, 0, 0], [Math.PI / 2, 0, 0]]],
-    Z: [[new THREE.Mesh(pickRotateTorus, matInvisible), [0, 0, 0], [0, 0, -Math.PI / 2]]],
-    E: [[new THREE.Mesh(new THREE.TorusGeometry(0.84, 0.18, 10, 28), matInvisible)]],
-  };
-
-  const swapGroup = (
-    container: Record<string, THREE.Object3D>,
-    mode: 'translate' | 'rotate' | 'scale',
-    entries: Record<string, GizmoEntry[]>,
-    visible: boolean
-  ) => {
-    const oldGroup = container[mode];
-    if (oldGroup) {
-      disposeGizmoGroupChildren(oldGroup);
-      gizmoInst.remove(oldGroup);
-    }
-    const nextGroup = buildGizmoGroupFromEntries(entries);
-    nextGroup.visible = visible;
-    container[mode] = nextGroup;
-    gizmoInst.add(nextGroup);
-  };
-
-  swapGroup(gizmoInst.gizmo, 'translate', fatTranslate, tc.mode === 'translate');
-  swapGroup(gizmoInst.gizmo, 'scale', fatScale, tc.mode === 'scale');
-  swapGroup(gizmoInst.gizmo, 'rotate', fatRotate, tc.mode === 'rotate');
-  swapGroup(gizmoInst.picker, 'translate', fatPickerTranslate, false);
-  swapGroup(gizmoInst.picker, 'scale', fatPickerScale, false);
-  swapGroup(gizmoInst.picker, 'rotate', fatPickerRotate, false);
 }
 
 function buildDocFromBuiltinTemplate(template: BuiltinMechanismTemplate): {
@@ -790,6 +551,26 @@ export const ObjectMakerModal: React.FC<ObjectMakerModalProps> = ({
   const [savingPreset, setSavingPreset] = useState<boolean>(false);
   const [newPresetName, setNewPresetName] = useState<string>('');
 
+  // Embedded Vertex Paint state
+  const [paintStrokes, setPaintStrokes] = useState<VertexPaintStroke[]>([]);
+  const [paintRedoStack, setPaintRedoStack] = useState<VertexPaintStroke[]>([]);
+  const [paintTool, setPaintTool] = useState<'paint' | 'orbit'>('paint');
+  const [spaceOrbiting, setSpaceOrbiting] = useState(false);
+  const [paintBrush, setPaintBrush] = useState<VertexPaintBrushSettings>({
+    radius: 0.42,
+    opacity: 0.55,
+    softness: 0.72,
+    mode: 'paint',
+    target: 'all',
+    color: '#A4DF54',
+    hueShift: 0,
+    saturationShift: 0,
+    valueShift: 0,
+    hueJitter: 12,
+    degradeForm: 'cracked',
+    degradeChipDepth: 0.45,
+  });
+
   // Marquee 2D overlay state
   const [marqueeRect, setMarqueeRect] = useState<{
     x: number;
@@ -811,6 +592,12 @@ export const ObjectMakerModal: React.FC<ObjectMakerModalProps> = ({
       setAssetCategory(asset.category);
       setUndoStack([]);
       setRedoStack([]);
+      setPaintRedoStack([]);
+      setPaintStrokes(
+        JSON.parse(
+          JSON.stringify(asset.vertexPaintStrokes ?? asset.objectRecipe?.vertexPaintStrokes ?? [])
+        ) as VertexPaintStroke[]
+      );
       setPlaceOnSave(false);
       setShowLoadMenu(false);
 
@@ -1598,27 +1385,35 @@ export const ObjectMakerModal: React.FC<ObjectMakerModalProps> = ({
     flashToast(`Saved preset "${preset.name}"`);
   };
 
-  // Save built GLB + recipe + mechanisms into Asset Vault & optional world placement
-  const handleSaveAsset = async (opts?: { asCopy?: boolean; placeNow?: boolean }) => {
+  // Save built GLB + recipe + mechanisms + vertex paint into Asset Vault & optional world placement
+  const handleSaveAsset = async (opts?: { asCopy?: boolean; placeNow?: boolean }): Promise<string | null> => {
     const cleanName = objectName.trim() || 'Custom Object';
     setSaving(true);
     try {
       let meta: CustomAssetMeta;
+      const strokesToSave = paintStrokes.length > 0 ? paintStrokes : undefined;
       if (externalGlbMode && editingAssetId) {
         const existing = store.customAssets.find((a) => a.id === editingAssetId);
         if (!existing) throw new Error('Existing asset not found');
+        const nextThumb = await regenerateCustomAssetThumbnail(
+          existing.id,
+          assetCategory,
+          strokesToSave
+        );
         meta = {
           ...existing,
           name: cleanName,
           category: assetCategory,
           mechanisms: mechanisms.length > 0 ? mechanisms : undefined,
+          vertexPaintStrokes: strokesToSave,
+          thumbnailDataUrl: nextThumb ?? existing.thumbnailDataUrl,
         };
         await store.updateCustomAssetMeta(meta);
         flashToast(`Updated "${cleanName}" in Assets`);
       } else {
         const uniqueDoc = ensureUniquePartAndGroupNames(doc);
         const { doc: groundedDoc, shift } = centerAndGroundObjectDoc(uniqueDoc);
-        // Shift mechanism pivots to stay aligned after X/Z centering & floor grounding
+        // Shift mechanism pivots and vertex paint strokes to stay aligned after X/Z centering & floor grounding
         const shiftedMechs = mechanisms.map((m) => ({
           ...m,
           pivot: [
@@ -1627,8 +1422,13 @@ export const ObjectMakerModal: React.FC<ObjectMakerModalProps> = ({
             Number((m.pivot[2] + shift[2]).toFixed(4)),
           ] as [number, number, number],
         }));
+        const shiftedStrokes = paintStrokes.length > 0 ? shiftVertexPaintStrokes(paintStrokes, shift) : [];
+        const docWithPaint: ObjectMakerDoc = {
+          ...groundedDoc,
+          vertexPaintStrokes: shiftedStrokes.length > 0 ? shiftedStrokes : undefined,
+        };
 
-        const { buffer } = await buildAndExportObjectDocToGlb(groundedDoc);
+        const { buffer } = await buildAndExportObjectDocToGlb(docWithPaint);
         const targetId = opts?.asCopy ? undefined : editingAssetId ?? undefined;
         meta = await store.saveGeneratedAsset({
           existingAssetId: targetId,
@@ -1636,11 +1436,13 @@ export const ObjectMakerModal: React.FC<ObjectMakerModalProps> = ({
           category: assetCategory,
           buffer,
           mechanisms: shiftedMechs,
-          objectRecipe: groundedDoc,
+          objectRecipe: docWithPaint,
+          vertexPaintStrokes: shiftedStrokes.length > 0 ? shiftedStrokes : undefined,
           keepMetricScale: true,
         });
-        setDoc(groundedDoc);
+        setDoc(docWithPaint);
         setMechanisms(shiftedMechs);
+        setPaintStrokes(shiftedStrokes);
         setEditingAssetId(meta.id);
         flashToast(targetId ? `Saved "${meta.name}"` : `Added "${meta.name}" to Assets`);
       }
@@ -1649,27 +1451,48 @@ export const ObjectMakerModal: React.FC<ObjectMakerModalProps> = ({
         const kind =
           assetCategory === 'character'
             ? 'npc'
-            : assetCategory === 'prop'
+            : assetCategory === 'prop' || assetCategory === 'building'
             ? 'prop'
             : 'scenery';
         const hero = store.currentLevel?.entities.find((e) => e.kind === 'hero');
         const bx = hero ? Math.min(0.86, hero.position.x + 0.08) : 0.5;
         const by = hero ? Math.min(0.86, hero.position.y + 0.06) : 0.5;
         const placed = store.addEntity(kind, meta.name, { x: bx, y: by }, meta.id);
-        if (placed && meta.mechanisms && meta.mechanisms.length > 0) {
+        if (placed && ((meta.mechanisms && meta.mechanisms.length > 0) || meta.vertexPaintStrokes?.length)) {
           store.updateEntity(
             placed.id,
-            `attach mechanisms to ${meta.name}`,
-            (ent) => ({ ...ent, mechanisms: JSON.parse(JSON.stringify(meta.mechanisms)) }),
+            `attach features to ${meta.name}`,
+            (ent) => ({
+              ...ent,
+              ...(meta.mechanisms?.length
+                ? { mechanisms: JSON.parse(JSON.stringify(meta.mechanisms)) }
+                : {}),
+              ...(meta.vertexPaintStrokes?.length
+                ? {
+                    vertexPaintStrokes: JSON.parse(
+                      JSON.stringify(meta.vertexPaintStrokes)
+                    ) as VertexPaintStroke[],
+                  }
+                : {}),
+            }),
             false
           );
         }
         flashToast(`Saved & placed "${meta.name}" in level`);
       }
+      return meta.id;
     } catch (err) {
       flashToast(err instanceof Error ? err.message : 'Save failed');
+      return null;
     } finally {
       setSaving(false);
+    }
+  };
+
+  const handleOpenAttributesModal = async () => {
+    const id = editingAssetId ?? (await handleSaveAsset({ placeNow: false }));
+    if (id) {
+      store.setAttributeModifierTarget({ kind: 'assetMeta', assetId: id });
     }
   };
 
@@ -1694,6 +1517,8 @@ export const ObjectMakerModal: React.FC<ObjectMakerModalProps> = ({
     pivotProxy: THREE.Object3D;
     mechController: MechanismRuntimeController | null;
     isDraggingGizmo: boolean;
+    paintSession: MakerVertexPaintSession;
+    paintableMeshes: THREE.Mesh[];
   } | null>(null);
 
   // Latest state refs for smooth pointer/animation closures without tearing down renderer
@@ -1714,6 +1539,9 @@ export const ObjectMakerModal: React.FC<ObjectMakerModalProps> = ({
     showPivotGizmo,
     mechProgress,
     mechTargetOpen,
+    paintBrush,
+    paintTool,
+    spaceOrbiting,
   });
   latestRef.current = {
     doc,
@@ -1732,6 +1560,9 @@ export const ObjectMakerModal: React.FC<ObjectMakerModalProps> = ({
     showPivotGizmo,
     mechProgress,
     mechTargetOpen,
+    paintBrush,
+    paintTool,
+    spaceOrbiting,
   };
 
   // Mount Three.js renderer once
@@ -1824,6 +1655,8 @@ export const ObjectMakerModal: React.FC<ObjectMakerModalProps> = ({
     };
     let controls = createControls(renderer.domElement);
 
+    const paintSession = new MakerVertexPaintSession(scene);
+
     const studioState = {
       scene,
       camera,
@@ -1841,6 +1674,8 @@ export const ObjectMakerModal: React.FC<ObjectMakerModalProps> = ({
       pivotProxy,
       mechController: null as MechanismRuntimeController | null,
       isDraggingGizmo: false,
+      paintSession,
+      paintableMeshes: [] as THREE.Mesh[],
     };
     studioRef.current = studioState;
 
@@ -2234,15 +2069,53 @@ export const ObjectMakerModal: React.FC<ObjectMakerModalProps> = ({
     const onPointerDown = (e: PointerEvent) => {
       if (e.button !== 0) return;
       if (studioState.isDraggingGizmo) return;
+      const cur = latestRef.current;
+      const isPaintingNow =
+        cur.inspectorTab === 'paint' && cur.paintTool === 'paint' && !cur.spaceOrbiting;
+      if (isPaintingNow) {
+        const paintRoot = objectRootHolder.children[0];
+        if (
+          paintRoot &&
+          studioState.paintSession.handlePointerDown({
+            event: e,
+            domEl: studioState.renderer.domElement,
+            camera,
+            paintRoot,
+            paintableMeshes: studioState.paintableMeshes,
+            brush: cur.paintBrush,
+          })
+        ) {
+          return;
+        }
+      }
+
       const rect = getCanvasRect();
       pointerDownClient = { x: e.clientX, y: e.clientY };
 
-      if (latestRef.current.toolMode === 'select') {
+      if (cur.toolMode === 'select' && cur.inspectorTab !== 'paint') {
         marqueeStart = { x: e.clientX - rect.left, y: e.clientY - rect.top };
       }
     };
 
     const onPointerMove = (e: PointerEvent) => {
+      const cur = latestRef.current;
+      const isPaintingNow =
+        cur.inspectorTab === 'paint' && cur.paintTool === 'paint' && !cur.spaceOrbiting;
+      if (isPaintingNow) {
+        const paintRoot = objectRootHolder.children[0];
+        if (paintRoot) {
+          studioState.paintSession.handlePointerMove({
+            event: e,
+            domEl: studioState.renderer.domElement,
+            camera,
+            paintRoot,
+            paintableMeshes: studioState.paintableMeshes,
+            brush: cur.paintBrush,
+          });
+        }
+        if (studioState.paintSession.brushing) return;
+      }
+
       if (!marqueeStart) return;
       const rect = getCanvasRect();
       const cx = e.clientX - rect.left;
@@ -2257,6 +2130,20 @@ export const ObjectMakerModal: React.FC<ObjectMakerModalProps> = ({
     };
 
     const onPointerUp = (e: PointerEvent) => {
+      if (studioState.paintSession.brushing) {
+        const completed = studioState.paintSession.finishStroke(
+          studioState.renderer.domElement,
+          e.pointerId
+        );
+        if (completed) {
+          setPaintStrokes((prev) => [...prev, completed]);
+          setPaintRedoStack([]);
+        }
+        marqueeStart = null;
+        pointerDownClient = null;
+        setMarqueeRect(null);
+        return;
+      }
       if (e.button !== 0) {
         marqueeStart = null;
         pointerDownClient = null;
@@ -2422,6 +2309,7 @@ export const ObjectMakerModal: React.FC<ObjectMakerModalProps> = ({
       marqueeStart = null;
       pointerDownClient = null;
       setMarqueeRect(null);
+      studioState.paintSession.finishStroke();
       if (studioState.isDraggingGizmo) {
         transformControls.pointerUp(null);
       }
@@ -2580,6 +2468,7 @@ export const ObjectMakerModal: React.FC<ObjectMakerModalProps> = ({
       transformControls.removeEventListener('objectChange', onGizmoObjectChange);
       transformControls.detach();
       transformControls.dispose();
+      studioState.paintSession.dispose(scene);
       studioState.controls.dispose();
       timer.dispose();
       envTex?.dispose();
@@ -2604,6 +2493,7 @@ export const ObjectMakerModal: React.FC<ObjectMakerModalProps> = ({
     s.objectRootHolder.clear();
     s.partMeshes.clear();
     s.groupNodes.clear();
+    s.paintableMeshes = [];
 
     if (externalGlbMode && editingAssetId) {
       const cached = getCachedAssetSync(editingAssetId);
@@ -2617,6 +2507,7 @@ export const ObjectMakerModal: React.FC<ObjectMakerModalProps> = ({
         clone.position.z -= center.z;
         clone.position.y -= box.min.y;
         s.objectRootHolder.add(clone);
+        s.paintableMeshes = prepareObjectForVertexPainting(clone);
         const nodes = inspectObjectHierarchy(clone);
         setScenePartNodes(nodes);
         s.mechController = new MechanismRuntimeController(clone, mechanisms);
@@ -2628,10 +2519,22 @@ export const ObjectMakerModal: React.FC<ObjectMakerModalProps> = ({
     s.objectRootHolder.add(built.root);
     s.partMeshes = built.partMeshes;
     s.groupNodes = built.groupNodes;
+    s.paintableMeshes = prepareObjectForVertexPainting(built.root);
     const nodes = inspectObjectHierarchy(built.root);
     setScenePartNodes(nodes);
     s.mechController = new MechanismRuntimeController(built.root, mechanisms);
   }, [doc, externalGlbMode, externalGlbVersion, editingAssetId]);
+
+  // Replay non-destructive vertex paint strokes whenever doc rebuilds or paintStrokes change
+  useEffect(() => {
+    const s = studioRef.current;
+    const root = s?.objectRootHolder.children[0];
+    if (!s || !root || s.isDraggingGizmo || s.paintSession.brushing) return;
+    resetObjectVertexPaint(root);
+    if (paintStrokes.length > 0) {
+      applyVertexPaintStrokesToObject(root, paintStrokes);
+    }
+  }, [paintStrokes, doc, externalGlbMode, externalGlbVersion, editingAssetId]);
 
   // Keep MechanismController synced when mechanisms list updates
   useEffect(() => {
@@ -2691,8 +2594,23 @@ export const ObjectMakerModal: React.FC<ObjectMakerModalProps> = ({
     const s = studioRef.current;
     if (!s || s.isDraggingGizmo) return;
 
-    // 1. Controls Orbit vs Select Marquee mode
-    s.controls.enabled = !s.isDraggingGizmo && toolMode !== 'select';
+    // 1. Controls Orbit vs Select Marquee vs Vertex Paint mode
+    const paintBrushingActive =
+      inspectorTab === 'paint' && paintTool === 'paint' && !spaceOrbiting;
+    s.controls.enabled =
+      !s.isDraggingGizmo && (inspectorTab === 'paint' || toolMode !== 'select');
+    s.controls.mouseButtons = {
+      LEFT: paintBrushingActive ? (null as unknown as THREE.MOUSE) : THREE.MOUSE.ROTATE,
+      MIDDLE: THREE.MOUSE.DOLLY,
+      RIGHT: THREE.MOUSE.ROTATE,
+    };
+    s.controls.touches = {
+      ONE: paintBrushingActive ? (null as unknown as THREE.TOUCH) : THREE.TOUCH.ROTATE,
+      TWO: THREE.TOUCH.DOLLY_PAN,
+    };
+    if (!paintBrushingActive) {
+      s.paintSession.hideCursor();
+    }
 
     // 2. Snap & Transform Mode
     const tc = s.transformControls;
@@ -2704,7 +2622,7 @@ export const ObjectMakerModal: React.FC<ObjectMakerModalProps> = ({
     // 3. Selection Box outlines
     disposeObject3D(s.selectionBoxGroup);
     s.selectionBoxGroup.clear();
-    if (!externalGlbMode && inspectorTab !== 'mechanics') {
+    if (!externalGlbMode && inspectorTab !== 'mechanics' && inspectorTab !== 'paint') {
       const box = new THREE.Box3();
       for (const pid of selectedPartIds) {
         const mesh = s.partMeshes.get(pid);
@@ -2791,7 +2709,7 @@ export const ObjectMakerModal: React.FC<ObjectMakerModalProps> = ({
       return;
     }
 
-    if (externalGlbMode || toolMode === 'select' || inspectorTab === 'mechanics') {
+    if (externalGlbMode || toolMode === 'select' || inspectorTab === 'mechanics' || inspectorTab === 'paint') {
       tc.detach();
       return;
     }
@@ -2827,6 +2745,8 @@ export const ObjectMakerModal: React.FC<ObjectMakerModalProps> = ({
     selectedPartIds,
     selectedGroupId,
     inspectorTab,
+    paintTool,
+    spaceOrbiting,
     curveEnabled,
     curveCfg,
     activeCurvePtIdx,
@@ -2834,11 +2754,26 @@ export const ObjectMakerModal: React.FC<ObjectMakerModalProps> = ({
     showPivotGizmo,
   ]);
 
-  // Keyboard shortcuts (Delete, Undo/Redo, W/E/R/Q)
+  // Keyboard shortcuts (Delete, Undo/Redo, W/E/R/Q, Space orbit & [ ] brush size in Paint tab)
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       const tag = (e.target as HTMLElement | null)?.tagName?.toLowerCase();
       if (tag === 'input' || tag === 'textarea' || tag === 'select') return;
+      if (inspectorTab === 'paint') {
+        if (e.code === 'Space') {
+          e.preventDefault();
+          setSpaceOrbiting(true);
+          return;
+        }
+        if (e.key === '[') {
+          setPaintBrush((b) => ({ ...b, radius: Math.max(0.12, Number((b.radius - 0.08).toFixed(2))) }));
+          return;
+        }
+        if (e.key === ']') {
+          setPaintBrush((b) => ({ ...b, radius: Math.min(2.4, Number((b.radius + 0.08).toFixed(2))) }));
+          return;
+        }
+      }
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'z') {
         e.preventDefault();
         if (e.shiftKey) handleRedo();
@@ -2857,9 +2792,16 @@ export const ObjectMakerModal: React.FC<ObjectMakerModalProps> = ({
         setToolMode('scale');
       }
     };
+    const onKeyUp = (e: KeyboardEvent) => {
+      if (e.code === 'Space') setSpaceOrbiting(false);
+    };
     window.addEventListener('keydown', onKeyDown);
-    return () => window.removeEventListener('keydown', onKeyDown);
-  }, [handleDeleteSelected, handleRedo, handleUndo]);
+    window.addEventListener('keyup', onKeyUp);
+    return () => {
+      window.removeEventListener('keydown', onKeyDown);
+      window.removeEventListener('keyup', onKeyUp);
+    };
+  }, [handleDeleteSelected, handleRedo, handleUndo, inspectorTab]);
 
   const setCameraPreset = (preset: CameraPreset) => {
     const s = studioRef.current;
@@ -2916,8 +2858,10 @@ export const ObjectMakerModal: React.FC<ObjectMakerModalProps> = ({
                 className="px-2.5 py-1.5 rounded-xl bg-slate-100 dark:bg-[#12151E] border border-slate-200/80 dark:border-white/[0.08] text-xs font-bold"
               >
                 <option value="prop">Object / Prop</option>
+                <option value="building">Building</option>
                 <option value="scenery">Scenery</option>
                 <option value="plant">Plant</option>
+                <option value="tree">Tree</option>
                 <option value="character">Character</option>
               </select>
             </div>
@@ -3057,6 +3001,17 @@ export const ObjectMakerModal: React.FC<ObjectMakerModalProps> = ({
               className="p-2 rounded-xl bg-slate-100 dark:bg-[#1F2430] disabled:opacity-35 hover:bg-slate-200 dark:hover:bg-[#282F3F]"
             >
               <Redo2 size={14} />
+            </button>
+
+            <button
+              type="button"
+              disabled={saving}
+              onClick={() => void handleOpenAttributesModal()}
+              title="Configure Role, Pickup & Dialogue defaults"
+              className="px-2.5 py-1.5 rounded-xl bg-slate-100 dark:bg-[#1F2430] hover:bg-slate-200 dark:hover:bg-[#282F3F] text-xs font-bold inline-flex items-center gap-1.5 whitespace-nowrap disabled:opacity-50"
+            >
+              <SlidersHorizontal size={13} className="text-[#7C5CFF]" />
+              <span className="hidden lg:inline">Attributes &amp; Role</span>
             </button>
 
             <label className="hidden xl:inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl bg-slate-100 dark:bg-[#1F2430] text-[11px] font-bold cursor-pointer">
@@ -3601,43 +3556,55 @@ export const ObjectMakerModal: React.FC<ObjectMakerModalProps> = ({
 
           {/* RIGHT CONTEXTUAL INSPECTOR */}
           <aside className="w-[320px] xl:w-[348px] shrink-0 border-l border-slate-200/80 dark:border-white/[0.08] bg-white dark:bg-[#171A23] flex flex-col min-h-0">
-            {/* 3 Tabs: Shape & Curve | Material | Mechanics */}
-            <div className="shrink-0 p-2 border-b border-slate-200/80 dark:border-white/[0.08] grid grid-cols-3 gap-1 bg-slate-50 dark:bg-[#131720]">
+            {/* 4 Tabs: Shape & Curve | Material | Paint | Mechanics */}
+            <div className="shrink-0 p-2 border-b border-slate-200/80 dark:border-white/[0.08] grid grid-cols-4 gap-1 bg-slate-50 dark:bg-[#131720]">
               <button
                 type="button"
                 onClick={() => setInspectorTab('shape')}
-                className={`py-1.5 px-2 rounded-lg text-[11px] font-extrabold inline-flex items-center justify-center gap-1 transition-colors ${
+                className={`py-1.5 px-1.5 rounded-lg text-[11px] font-extrabold inline-flex items-center justify-center gap-1 transition-colors whitespace-nowrap ${
                   inspectorTab === 'shape'
                     ? 'bg-[#7C5CFF] text-white'
                     : 'text-slate-600 dark:text-[#A5AEC4] hover:text-slate-900 dark:hover:text-white'
                 }`}
               >
-                <Box size={12} />
-                <span>Shape &amp; Curve</span>
+                <Box size={11} />
+                <span>Shape</span>
               </button>
               <button
                 type="button"
                 onClick={() => setInspectorTab('material')}
-                className={`py-1.5 px-2 rounded-lg text-[11px] font-extrabold inline-flex items-center justify-center gap-1 transition-colors ${
+                className={`py-1.5 px-1.5 rounded-lg text-[11px] font-extrabold inline-flex items-center justify-center gap-1 transition-colors whitespace-nowrap ${
                   inspectorTab === 'material'
                     ? 'bg-[#7C5CFF] text-white'
                     : 'text-slate-600 dark:text-[#A5AEC4] hover:text-slate-900 dark:hover:text-white'
                 }`}
               >
-                <Paintbrush size={12} />
+                <Layers size={11} />
                 <span>Material</span>
               </button>
               <button
                 type="button"
+                onClick={() => setInspectorTab('paint')}
+                className={`py-1.5 px-1.5 rounded-lg text-[11px] font-extrabold inline-flex items-center justify-center gap-1 transition-colors whitespace-nowrap ${
+                  inspectorTab === 'paint'
+                    ? 'bg-[#EC4899] text-white'
+                    : 'text-slate-600 dark:text-[#A5AEC4] hover:text-slate-900 dark:hover:text-white'
+                }`}
+              >
+                <Paintbrush size={11} />
+                <span>Paint{paintStrokes.length > 0 ? ` (${paintStrokes.length})` : ''}</span>
+              </button>
+              <button
+                type="button"
                 onClick={() => setInspectorTab('mechanics')}
-                className={`py-1.5 px-2 rounded-lg text-[11px] font-extrabold inline-flex items-center justify-center gap-1 transition-colors ${
+                className={`py-1.5 px-1.5 rounded-lg text-[11px] font-extrabold inline-flex items-center justify-center gap-1 transition-colors whitespace-nowrap ${
                   inspectorTab === 'mechanics'
                     ? 'bg-[#7C5CFF] text-white'
                     : 'text-slate-600 dark:text-[#A5AEC4] hover:text-slate-900 dark:hover:text-white'
                 }`}
               >
-                <Wrench size={12} />
-                <span>Mechanics ({mechanisms.length})</span>
+                <Wrench size={11} />
+                <span>Joints ({mechanisms.length})</span>
               </button>
             </div>
 
@@ -4154,7 +4121,54 @@ export const ObjectMakerModal: React.FC<ObjectMakerModalProps> = ({
                 </>
               )}
 
-              {/* TAB 3: HINGES, SLIDERS, TRIGGERS & PRESETS */}
+              {/* TAB 3: EMBEDDED VERTEX PAINT & DEGRADER */}
+              {inspectorTab === 'paint' && (
+                <VertexPaintInspector
+                  brush={paintBrush}
+                  onChangeBrush={setPaintBrush}
+                  interactionTool={paintTool}
+                  onChangeInteractionTool={setPaintTool}
+                  strokeCount={paintStrokes.length}
+                  canRedo={paintRedoStack.length > 0}
+                  onUndoStroke={() => {
+                    setPaintStrokes((prev) => {
+                      if (prev.length === 0) return prev;
+                      const popped = prev[prev.length - 1];
+                      setPaintRedoStack((r) => [...r, popped]);
+                      return prev.slice(0, -1);
+                    });
+                  }}
+                  onRedoStroke={() => {
+                    setPaintRedoStack((stack) => {
+                      if (stack.length === 0) return stack;
+                      const restored = stack[stack.length - 1];
+                      setPaintStrokes((prev) => [...prev, restored]);
+                      return stack.slice(0, -1);
+                    });
+                  }}
+                  onClearAllPaint={() => {
+                    setPaintStrokes([]);
+                    setPaintRedoStack([]);
+                    flashToast('Cleared vertex paint');
+                  }}
+                  onAutoDapple={() => {
+                    const root = studioRef.current?.objectRootHolder.children[0];
+                    if (!root) return;
+                    const stroke = generateOrganicDappleStroke(
+                      root,
+                      paintBrush,
+                      Math.floor(Math.random() * 900000) + 100
+                    );
+                    if (stroke) {
+                      setPaintStrokes((prev) => [...prev, stroke]);
+                      setPaintRedoStack([]);
+                      flashToast('Applied natural paint variation');
+                    }
+                  }}
+                />
+              )}
+
+              {/* TAB 4: HINGES, SLIDERS, TRIGGERS & PRESETS */}
               {inspectorTab === 'mechanics' && (
                 <div className="space-y-3.5">
                   {/* Mechanisms Header & Add Joint */}

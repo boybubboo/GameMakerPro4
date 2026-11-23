@@ -54,7 +54,7 @@ const SCOPE_META: Record<
     icon: <MapIcon size={14} />,
   },
   treeStudio: {
-    label: 'Tree Studio Design',
+    label: 'Tree Maker Design',
     shortLabel: 'Trees',
     blurb: 'Bark, branches, roots, canopy base, 3D leaves, fruit & all species',
     accent: '#10B981',

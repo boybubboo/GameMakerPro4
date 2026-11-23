@@ -19,6 +19,11 @@ import {
   enableShadows,
 } from './buildingBlocks';
 import { deserializeBufferGeometry } from './meshCsg';
+import {
+  buildPlantPartGeometry,
+  createPlantPartMaterial,
+  isPlantShape,
+} from './plantMakerBuilder';
 import { uid } from '../utils/terrain';
 
 export interface ObjectPrimitiveMeta {
@@ -263,6 +268,13 @@ export function buildPartGeometry(part: ObjectPartSpec): THREE.BufferGeometry {
       );
     }
     return geo;
+  }
+
+  if (isPlantShape(part.shape)) {
+    const plantGeo = buildPlantPartGeometry(part);
+    plantGeo.computeBoundingBox();
+    plantGeo.computeBoundingSphere();
+    return plantGeo;
   }
 
   const w = Math.max(0.06, part.dimensions[0]);
@@ -600,7 +612,10 @@ export function buildObjectMakerSceneGroup(
     if (part.hidden) continue;
     if (part.isCutter && !includeCutters) continue;
     const geo = buildPartGeometry(part);
-    const mat = createPartMaterial(part.material, Boolean(part.isCutter));
+    const mat =
+      !part.isCutter && (isPlantShape(part.shape) || part.plantParams)
+        ? createPlantPartMaterial(part.material, part.plantParams)
+        : createPartMaterial(part.material, Boolean(part.isCutter));
     const mesh = new THREE.Mesh(geo, mat);
     mesh.name = sanitizeObjectNodeName(part.name, `Part_${part.id.slice(0, 4)}`);
     mesh.position.set(part.position[0], part.position[1], part.position[2]);
@@ -611,6 +626,12 @@ export function buildObjectMakerSceneGroup(
     );
     mesh.userData.partId = part.id;
     mesh.userData.isCutter = Boolean(part.isCutter);
+    if (!part.isCutter && (isPlantShape(part.shape) || part.plantParams)) {
+      mesh.userData.paintPart =
+        part.shape === 'stemCurved' || part.shape === 'bulbCorm' || part.shape === 'vineTendril'
+          ? 'branches'
+          : 'leaves';
+    }
 
     const parent = part.parentGroupId ? groupNodes.get(part.parentGroupId) : undefined;
     (parent ?? root).add(mesh);

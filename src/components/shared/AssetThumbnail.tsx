@@ -67,8 +67,28 @@ export const AssetThumbnail: React.FC<AssetThumbnailProps> = ({
   }
 
   const meta = resolvedKind ? EntityKindMeta[resolvedKind] : null;
-  const fallbackTint = meta?.tint ?? '#7C5CFF';
-  const fallbackSymbol = hero ? 'figure.stand' : meta?.symbol ?? 'cube.fill';
+  const customFallbackTint =
+    customAsset?.category === 'tree' || customAsset?.category === 'plant'
+      ? '#20B46A'
+      : customAsset?.category === 'building'
+      ? '#F59E0B'
+      : customAsset?.category === 'character'
+      ? '#A855F7'
+      : '#7C5CFF';
+  const customFallbackSymbol =
+    customAsset?.category === 'tree'
+      ? 'tree.fill'
+      : customAsset?.category === 'plant'
+      ? 'leaf.fill'
+      : customAsset?.category === 'building'
+      ? 'house.fill'
+      : customAsset?.category === 'character'
+      ? 'figure.stand'
+      : 'cube.fill';
+  const fallbackTint = meta?.tint ?? customFallbackTint;
+  const fallbackSymbol = hero
+    ? 'figure.stand'
+    : meta?.symbol ?? (customAsset ? customFallbackSymbol : 'cube.fill');
   const label = alt ?? customAsset?.name ?? entity?.name ?? (hero ? hero.body : meta?.title ?? 'Asset');
 
   return (

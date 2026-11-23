@@ -216,7 +216,7 @@ export const ChatBubbleStudioModal: React.FC<ChatBubbleStudioModalProps> = ({
             </div>
             <div className="min-w-0">
               <h2 className="text-base font-extrabold leading-tight truncate">
-                Chat Bubble & Dialogue Studio
+                Chat Bubble Maker
               </h2>
               <div className="text-xs text-slate-500 dark:text-[#949BB0] truncate">
                 {speakerName} · {roleLabel} ·{' '}
@@ -248,7 +248,7 @@ export const ChatBubbleStudioModal: React.FC<ChatBubbleStudioModalProps> = ({
               type="button"
               onClick={handleCloseModal}
               className="p-2 rounded-lg bg-slate-100 dark:bg-[#1F2430] text-slate-500 dark:text-[#949BB0] hover:text-slate-900 dark:hover:text-white transition-colors"
-              aria-label="Close Chat Bubble Studio"
+              aria-label="Close Chat Bubble Maker"
             >
               <X size={16} />
             </button>

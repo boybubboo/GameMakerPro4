@@ -235,7 +235,7 @@ export const TerrainEditorModal: React.FC<{
 
   return (
     <aside
-      aria-label="Terrain Heightmap Sculptor"
+      aria-label="Terrain Maker"
       className="fixed top-16 right-4 bottom-4 w-[368px] max-w-[calc(100vw-2rem)] z-40 flex flex-col rounded-2xl bg-white dark:bg-[#151822] border border-slate-200 dark:border-white/[0.12] shadow-2xl overflow-hidden"
     >
       {/* Header */}
@@ -246,7 +246,7 @@ export const TerrainEditorModal: React.FC<{
           </div>
           <div className="min-w-0">
             <h2 className="text-sm font-extrabold leading-tight truncate">
-              Terrain Sculptor
+              Terrain Maker
             </h2>
             <p className="text-[11px] font-semibold text-slate-500 dark:text-[#949BB0] truncate">
               {level.name} · High-Res Heightmap
@@ -286,7 +286,7 @@ export const TerrainEditorModal: React.FC<{
           <button
             type="button"
             onClick={onClose}
-            title="Close Terrain Sculptor"
+            title="Close Terrain Maker"
             className="w-7 h-7 rounded-lg bg-slate-100 dark:bg-[#1F2430] text-slate-500 dark:text-[#949BB0] hover:text-slate-900 dark:hover:text-white flex items-center justify-center"
           >
             <X size={14} />

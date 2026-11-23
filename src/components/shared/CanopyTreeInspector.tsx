@@ -351,7 +351,7 @@ export const CanopyTreeInspector: React.FC<CanopyTreeInspectorProps> = ({
           className="w-full py-2 rounded-xl bg-slate-100 dark:bg-[#1F2430] hover:bg-slate-200 dark:hover:bg-[#272D3C] text-xs font-bold inline-flex items-center justify-center gap-1.5"
         >
           <Sliders size={13} />
-          <span>Open Tree Studio</span>
+          <span>Open Tree Maker</span>
         </button>
       </div>
     </div>

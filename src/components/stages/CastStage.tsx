@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Box, MessageCircle, Paintbrush, PanelBottom, Plus, Trash2, Upload } from 'lucide-react';
+import { Box, MessageCircle, Paintbrush, PanelBottom, Plus, SlidersHorizontal, Trash2, Upload, User } from 'lucide-react';
 import {
   getChatFontOption,
   resolveChatBubbleStyle,
@@ -259,7 +259,7 @@ export const CastStage: React.FC<{ store: MakerStore }> = ({ store }) => {
                     : 'Using native placeholder rig'}
                 </span>
               </div>
-              <div className="flex items-center gap-2">
+              <div className="flex flex-wrap items-center gap-2">
                 <select
                   value={currentProject.heroCustomAssetId ?? ''}
                   onChange={(e) =>
@@ -279,8 +279,24 @@ export const CastStage: React.FC<{ store: MakerStore }> = ({ store }) => {
                 </select>
                 <button
                   type="button"
+                  onClick={() =>
+                    heroCustomAsset?.category === 'character'
+                      ? store.openCharacterMaker(heroCustomAsset.id)
+                      : store.openCharacterMaker()
+                  }
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-[#A855F7] text-white text-xs font-bold hover:bg-[#9333EA] whitespace-nowrap"
+                >
+                  <User size={12} />
+                  <span>
+                    {heroCustomAsset?.category === 'character'
+                      ? 'Edit in Character Maker'
+                      : 'Character Maker'}
+                  </span>
+                </button>
+                <button
+                  type="button"
                   onClick={() => store.setShowingAssetVault(true)}
-                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-[#7C5CFF] text-white text-xs font-bold hover:bg-[#6A48F5]"
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-[#7C5CFF] text-white text-xs font-bold hover:bg-[#6A48F5] whitespace-nowrap"
                 >
                   <Upload size={12} />
                   <span>Upload .glb</span>
@@ -496,6 +512,15 @@ const EntityInspector: React.FC<{
         </div>
       </div>
 
+      <button
+        type="button"
+        onClick={() => store.setAttributeModifierTarget({ kind: 'entity', entityId: entity.id })}
+        className="w-full py-2.5 px-3 rounded-xl bg-[#7C5CFF] hover:bg-[#6A48F5] text-white text-xs font-extrabold flex items-center justify-center gap-2 shadow-xs transition-colors"
+      >
+        <SlidersHorizontal size={14} />
+        <span>Edit Attributes, Role &amp; Dialogue</span>
+      </button>
+
       {/* 3D Appearance (Native vs Custom GLB) */}
       <div className="p-3.5 rounded-2xl bg-slate-100 dark:bg-[#1F2430] space-y-2.5">
         <div className="flex items-center justify-between">
@@ -577,6 +602,28 @@ const EntityInspector: React.FC<{
               />
             </div>
           </div>
+        )}
+
+        {(boundAsset?.category === 'character' ||
+          entity.kind === 'npc' ||
+          entity.kind === 'baddie' ||
+          entity.kind === 'hero') && (
+          <button
+            type="button"
+            onClick={() =>
+              boundAsset?.category === 'character'
+                ? store.openCharacterMaker(boundAsset.id)
+                : store.openCharacterMaker()
+            }
+            className="w-full py-2 rounded-xl bg-[#A855F7]/15 hover:bg-[#A855F7]/25 text-[#A855F7] text-xs font-extrabold inline-flex items-center justify-center gap-1.5 whitespace-nowrap"
+          >
+            <User size={13} />
+            <span>
+              {boundAsset?.category === 'character'
+                ? 'Edit in Character Maker'
+                : 'Create in Character Maker'}
+            </span>
+          </button>
         )}
 
         {entity.kind !== 'fxEmitter' && (

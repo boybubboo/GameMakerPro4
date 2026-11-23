@@ -743,9 +743,19 @@ function axisFromSetting(axis: Exclude<RigSwingAxis, 'auto'>, out: THREE.Vector3
   }
 }
 
+interface CapturedEyelid {
+  node: THREE.Object3D;
+  role: 'top' | 'bottom';
+  restClosedFrac: number;
+  minOpenRad: number;
+  maxCloseRad: number;
+  restAngleRad: number;
+}
+
 export class ProceduralRigController {
   private readonly charRoot: THREE.Object3D;
   private readonly allBones = new Map<string, CapturedBone>();
+  private readonly eyelids: CapturedEyelid[] = [];
   private settings: CustomRigSettings;
   private customAnimations: CustomMotionPreset[] = [];
   private defaultSlotPresets: Partial<Record<CustomClipSlot, string>> = {};
@@ -757,6 +767,8 @@ export class ProceduralRigController {
   private lastSlot: CustomClipSlot = 'idle';
   private testOverride: RigTestOverride = null;
   private previewTimeNorm = 0;
+  private blinkTimer = 1.6 + Math.random() * 2.4;
+  private blinkActiveElapsed = -1;
 
   constructor(
     charRoot: THREE.Object3D,
@@ -810,6 +822,66 @@ export class ProceduralRigController {
         smoothQuat: node.quaternion.clone(),
         hasSmoothQuat: false,
       });
+    }
+
+    // Collect procedural Character Maker eyelid shells (or any node tagged with eyelidRole)
+    this.eyelids.length = 0;
+    modelClone.traverse((obj) => {
+      const ud = obj.userData as {
+        eyelidRole?: 'top' | 'bottom';
+        restClosedFrac?: number;
+        minOpenRad?: number;
+        maxCloseRad?: number;
+        autoBlink?: boolean;
+      } | undefined;
+      if (ud?.eyelidRole === 'top' || ud?.eyelidRole === 'bottom') {
+        if (ud.autoBlink === false) return;
+        this.eyelids.push({
+          node: obj,
+          role: ud.eyelidRole,
+          restClosedFrac: THREE.MathUtils.clamp(ud.restClosedFrac ?? 0.08, 0, 1),
+          minOpenRad: ud.minOpenRad ?? (ud.eyelidRole === 'top' ? -Math.PI * 0.5 : Math.PI * 0.52),
+          maxCloseRad: ud.maxCloseRad ?? (ud.eyelidRole === 'top' ? Math.PI * 0.48 : 0),
+          restAngleRad: obj.rotation.x,
+        });
+      }
+    });
+  }
+
+  private updateEyelidBlinks(dt: number) {
+    if (this.eyelids.length === 0) return;
+    const blinkDuration = 0.17;
+    let blinkT = 0;
+
+    if (this.blinkActiveElapsed >= 0) {
+      this.blinkActiveElapsed += dt;
+      if (this.blinkActiveElapsed >= blinkDuration) {
+        this.blinkActiveElapsed = -1;
+        this.blinkTimer = 2.4 + Math.random() * 3.1;
+        blinkT = 0;
+      } else {
+        const u = this.blinkActiveElapsed / blinkDuration;
+        if (u < 0.38) {
+          const k = u / 0.38;
+          blinkT = k * k;
+        } else if (u < 0.52) {
+          blinkT = 1;
+        } else {
+          const k = 1 - (u - 0.52) / 0.48;
+          blinkT = k * (2 - k);
+        }
+      }
+    } else {
+      this.blinkTimer -= dt;
+      if (this.blinkTimer <= 0) {
+        this.blinkActiveElapsed = 0;
+      }
+    }
+
+    for (let i = 0; i < this.eyelids.length; i++) {
+      const lid = this.eyelids[i];
+      const frac = THREE.MathUtils.lerp(lid.restClosedFrac, 1, blinkT);
+      lid.node.rotation.x = THREE.MathUtils.lerp(lid.minOpenRad, lid.maxCloseRad, frac);
     }
   }
 
@@ -1380,9 +1452,11 @@ export class ProceduralRigController {
   }
 
   public update(dt: number, slot: CustomClipSlot, speed = 1) {
+    const rawClampedDt = Math.min(0.08, Math.max(0, dt));
+    this.updateEyelidBlinks(rawClampedDt);
     if (this.allBones.size === 0) return;
 
-    const clampedDt = Math.min(0.08, Math.max(0, dt));
+    const clampedDt = rawClampedDt;
     this.elapsed += clampedDt * Math.max(0.15, speed);
 
     if (slot !== this.lastSlot) {

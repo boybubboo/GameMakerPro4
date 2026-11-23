@@ -2148,8 +2148,14 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
           mesh.scale.setScalar(ent.scale);
           mesh.rotation.y = (ent.rotation * Math.PI) / 180;
         } else if (ent.canopyTree) {
+          const resolvedTreeStrokes =
+            ent.vertexPaintStrokes && ent.vertexPaintStrokes.length > 0
+              ? ent.vertexPaintStrokes
+              : ent.canopyTree.vertexPaintStrokes;
           mesh = buildSingleCanopyTreeGroup(
-            ent.canopyTree,
+            resolvedTreeStrokes
+              ? { ...ent.canopyTree, vertexPaintStrokes: resolvedTreeStrokes }
+              : ent.canopyTree,
             ent.id,
             style,
             islandHandles.timeUniform,
@@ -2162,8 +2168,10 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
           mesh.scale.setScalar(ent.scale);
           mesh.rotation.y = (ent.rotation * Math.PI) / 180;
         } else {
+          const meta = ent.customAssetId
+            ? activeAssets.find((a) => a.id === ent.customAssetId)
+            : undefined;
           if (ent.customAssetId) {
-            const meta = activeAssets.find((a) => a.id === ent.customAssetId);
             customInst = instantiateCustomModel(ent.customAssetId, meta, {
               scaleAdjust: ent.modelScaleAdjust ?? 1,
               offsetY: ent.modelOffsetY ?? 0,
@@ -2178,8 +2186,12 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
             mesh = buildEntityMesh(ent);
             applyVisualStyleToObject(mesh, style);
           }
-          if (ent.vertexPaintStrokes && ent.vertexPaintStrokes.length > 0) {
-            applyVertexPaintStrokesToObject(mesh, ent.vertexPaintStrokes);
+          const resolvedStrokes =
+            ent.vertexPaintStrokes && ent.vertexPaintStrokes.length > 0
+              ? ent.vertexPaintStrokes
+              : meta?.vertexPaintStrokes;
+          if (resolvedStrokes && resolvedStrokes.length > 0) {
+            applyVertexPaintStrokesToObject(mesh, resolvedStrokes);
           }
         }
 

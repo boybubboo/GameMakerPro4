@@ -262,7 +262,7 @@ export const InventoryStudioModal: React.FC<{
             </div>
             <div>
               <h2 className="text-sm font-extrabold tracking-tight">
-                Inventory, Workbench &amp; Collectibles Studio
+                Inventory &amp; Item Maker
               </h2>
               <p className="text-[11px] text-[#94A3B8]">
                 Tailor categories, item readouts, keybinds, recipes, and world harvestables for {currentProject.name}
@@ -287,7 +287,7 @@ export const InventoryStudioModal: React.FC<{
               type="button"
               onClick={onClose}
               className="w-8 h-8 rounded-lg bg-white/8 hover:bg-white/15 flex items-center justify-center text-[#CBD5E1]"
-              aria-label="Close Studio"
+              aria-label="Close Inventory &amp; Item Maker"
             >
               <X size={16} />
             </button>

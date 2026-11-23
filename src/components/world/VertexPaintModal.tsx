@@ -1039,7 +1039,7 @@ export const VertexPaintModal: React.FC<VertexPaintModalProps> = ({
 
   const activeTargetLabel =
     targetSource === 'forestTree'
-      ? `Tree Studio (${resolvedTreeCfg?.treeType ?? 'oak'})`
+      ? `Tree Maker (${resolvedTreeCfg?.treeType ?? 'oak'})`
       : activeEntity?.name ?? 'Object';
 
   return (
@@ -1053,7 +1053,7 @@ export const VertexPaintModal: React.FC<VertexPaintModalProps> = ({
             </div>
             <div className="min-w-0">
               <h2 className="text-sm sm:text-base font-black leading-tight truncate">
-                Object Painter &amp; Degrader
+                Paint Maker &amp; Degrader
               </h2>
               <p className="text-[11px] font-semibold text-slate-500 dark:text-[#8E96AB] truncate">
                 Paint color, hue shifts &amp; surface degradation (chips, cracks, moss, scorch, rust) ·{' '}
@@ -1070,7 +1070,7 @@ export const VertexPaintModal: React.FC<VertexPaintModalProps> = ({
               className="px-3 py-1.5 rounded-xl bg-white dark:bg-[#1B202C] border border-slate-200/80 dark:border-white/[0.1] text-xs font-bold max-w-[220px]"
             >
               <option value="forestTree">
-                Tree Studio ({currentLevel?.canopyEngine?.treeType ?? 'oak'} forest)
+                Tree Maker ({currentLevel?.canopyEngine?.treeType ?? 'oak'} forest)
               </option>
               {paintableEntities.map((ent) => (
                 <option key={ent.id} value={ent.id}>

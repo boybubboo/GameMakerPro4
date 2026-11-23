@@ -69,8 +69,10 @@ const CLIP_SLOTS: { slot: CustomClipSlot; label: string; short: string }[] = [
 const CATEGORIES: { id: AssetCategory; label: string; hint: string }[] = [
   { id: 'character', label: 'Character / Rig', hint: 'Hero, NPC, Baddie' },
   { id: 'prop', label: 'Prop', hint: 'Chest, crate, artifact' },
-  { id: 'scenery', label: 'Scenery', hint: 'Trees, ruins, rocks' },
+  { id: 'scenery', label: 'Scenery', hint: 'Rocks, ruins, props' },
   { id: 'plant', label: 'Plant', hint: 'Foliage, shrubs, flowers' },
+  { id: 'tree', label: 'Tree', hint: 'Trees & groves' },
+  { id: 'building', label: 'Building', hint: 'Walls, arches, roofs' },
 ];
 
 const FACING_PRESETS = [0, 90, 180, -90];
@@ -737,7 +739,7 @@ export const AssetVaultModal: React.FC<{
             </div>
             <div>
               <h2 className="text-base sm:text-lg font-black tracking-tight leading-tight">
-                3D Asset Vault &amp; Rig Studio
+                3D Asset Vault &amp; Rig Maker
               </h2>
               <p className="text-xs text-slate-500 dark:text-[#949BB0]">
                 Import GLB / GLTF models, inspect skeletons, test limb animations, and fine-tune rigging.
@@ -829,15 +831,15 @@ export const AssetVaultModal: React.FC<{
             </div>
 
             {/* Category filter */}
-            <div className="flex items-center gap-1 p-1 rounded-xl bg-slate-200/70 dark:bg-[#171A23] border border-slate-200 dark:border-white/[0.08]">
-              {(['all', 'character', 'prop', 'scenery'] as const).map((cat) => {
+            <div className="flex flex-wrap items-center gap-1 p-1 rounded-xl bg-slate-200/70 dark:bg-[#171A23] border border-slate-200 dark:border-white/[0.08]">
+              {(['all', 'character', 'prop', 'scenery', 'plant', 'tree', 'building'] as const).map((cat) => {
                 const active = filterCat === cat;
                 return (
                   <button
                     key={cat}
                     type="button"
                     onClick={() => setFilterCat(cat)}
-                    className={`flex-1 px-2 py-1.5 rounded-lg text-[11px] font-bold capitalize transition-colors whitespace-nowrap ${
+                    className={`px-2 py-1 rounded-lg text-[11px] font-bold capitalize transition-colors whitespace-nowrap shrink-0 ${
                       active
                         ? 'bg-[#7C5CFF] text-white'
                         : 'text-slate-600 dark:text-[#949BB0] hover:text-slate-900 dark:hover:text-white'
@@ -939,7 +941,8 @@ export const AssetVaultModal: React.FC<{
                       onClick={async () => {
                         const fresh = await regenerateCustomAssetThumbnail(
                           selectedAsset.id,
-                          selectedAsset.category
+                          selectedAsset.category,
+                          selectedAsset.vertexPaintStrokes
                         );
                         if (fresh) {
                           setCustomAssetThumbnailCache(selectedAsset.id, fresh);
@@ -959,7 +962,7 @@ export const AssetVaultModal: React.FC<{
                       <button
                         type="button"
                         onClick={() => store.openMotionStudio(selectedAsset.id)}
-                        title="Open this character in the dedicated full-page Character Motion Studio"
+                        title="Open this character in the dedicated full-page Character Motion Maker"
                         className="px-3 py-2 rounded-xl bg-[#7C5CFF] hover:bg-[#6A48F5] text-white text-xs font-bold inline-flex items-center gap-1.5 transition-colors whitespace-nowrap"
                       >
                         <Maximize2 size={13} />

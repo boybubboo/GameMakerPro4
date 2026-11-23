@@ -61,6 +61,7 @@ import {
 import {
   getCachedAssetSync,
   loadCustomAssetToCache,
+  renderObject3DThumbnail,
   subscribeAssetCache,
 } from '../../three/gltfAssetManager';
 import {
@@ -69,8 +70,18 @@ import {
   disposeObject3D,
   setupSceneEnvironment,
 } from '../../three/islandScene';
+import { exportObjectGroupToGlbBuffer } from '../../three/objectMakerBuilder';
+import {
+  applyVertexPaintStrokesToObject,
+  generateOrganicDappleStroke,
+  prepareObjectForVertexPainting,
+  resetObjectVertexPaint,
+  type VertexPaintBrushSettings,
+} from '../../three/vertexPainter';
+import { MakerVertexPaintSession } from '../../three/vertexPaintViewportHelper';
 import { isWebGPUFallbackAdapter } from '../../three/webglUtils';
 import { SurfaceTextureControls } from './SurfaceTextureControls';
+import { VertexPaintInspector } from './VertexPaintInspector';
 import type {
   CanopyBaseGradientScope,
   CanopyBasePattern,
@@ -90,10 +101,11 @@ import type {
   TreeBarkStyle,
   TreeGeneratorMode,
   TreeSpeciesType,
+  VertexPaintStroke,
   VisualStyleId,
 } from '../../types/maker';
 
-type StudioTab = 'base' | 'roots' | 'canopy' | 'leaves' | 'color' | 'fruit';
+type StudioTab = 'base' | 'roots' | 'canopy' | 'leaves' | 'color' | 'fruit' | 'paint';
 type UploadSlot = 'canopy' | 'trunk' | 'fruit';
 type PreviewWindMode = 'level' | 'calm' | 'breeze' | 'gusty';
 
@@ -228,6 +240,71 @@ function stripProfiles(
   return rest;
 }
 
+function cloneExportSafeTreeGroup(src: THREE.Object3D): THREE.Group {
+  const cloneMaterialSafe = (srcMat: THREE.Material): THREE.MeshStandardMaterial => {
+    const anyMat = srcMat as unknown as {
+      color?: THREE.Color;
+      vertexColors?: boolean;
+      roughness?: number;
+      metalness?: number;
+      transparent?: boolean;
+      opacity?: number;
+      alphaTest?: number;
+      side?: THREE.Side;
+      map?: THREE.Texture | null;
+      emissive?: THREE.Color;
+      emissiveIntensity?: number;
+    };
+    return new THREE.MeshStandardMaterial({
+      color: anyMat.color ? anyMat.color.clone() : new THREE.Color('#ffffff'),
+      vertexColors: Boolean(anyMat.vertexColors),
+      roughness: typeof anyMat.roughness === 'number' ? anyMat.roughness : 0.78,
+      metalness: typeof anyMat.metalness === 'number' ? anyMat.metalness : 0.02,
+      transparent: Boolean(anyMat.transparent),
+      opacity: typeof anyMat.opacity === 'number' ? anyMat.opacity : 1,
+      alphaTest: typeof anyMat.alphaTest === 'number' ? anyMat.alphaTest : 0,
+      side: anyMat.side ?? THREE.FrontSide,
+      map: anyMat.map ?? null,
+      emissive: anyMat.emissive ? anyMat.emissive.clone() : new THREE.Color('#000000'),
+      emissiveIntensity: typeof anyMat.emissiveIntensity === 'number' ? anyMat.emissiveIntensity : 0,
+    });
+  };
+
+  const cloneNode = (node: THREE.Object3D): THREE.Object3D => {
+    if (node instanceof THREE.Mesh) {
+      const geo = node.geometry.clone();
+      const mat = Array.isArray(node.material)
+        ? node.material.map(cloneMaterialSafe)
+        : cloneMaterialSafe(node.material);
+      const mesh = new THREE.Mesh(geo, mat);
+      mesh.position.copy(node.position);
+      mesh.rotation.copy(node.rotation);
+      mesh.scale.copy(node.scale);
+      mesh.castShadow = node.castShadow;
+      mesh.receiveShadow = node.receiveShadow;
+      if (node.userData?.paintPart) {
+        mesh.userData.paintPart = node.userData.paintPart;
+      }
+      if (node.userData?.noVertexPaint) {
+        mesh.userData.noVertexPaint = true;
+      }
+      return mesh;
+    }
+    const grp = new THREE.Group();
+    grp.name = node.name;
+    grp.position.copy(node.position);
+    grp.rotation.copy(node.rotation);
+    grp.scale.copy(node.scale);
+    for (const child of node.children) {
+      grp.add(cloneNode(child));
+    }
+    return grp;
+  };
+
+  const out = cloneNode(src);
+  return out instanceof THREE.Group ? out : new THREE.Group().add(out);
+}
+
 const BARK_SWATCHES = ['#72503A', '#5D3F2E', '#8A6345', '#E8E1D5', '#4E4440', '#4A3A63'];
 const FRUIT_SWATCHES = ['#D93B3B', '#F29F38', '#E6C23E', '#7D4AD1', '#FFE08A'];
 const BIRCH_PALETTES: {
@@ -287,12 +364,14 @@ const CONIFER_PALETTES: {
 
 interface CanopyEngineModalProps {
   store: MakerStore;
+  initialAssetId?: string | null;
   onClose: () => void;
   onOpenVertexPainter?: () => void;
 }
 
 export const CanopyEngineModal: React.FC<CanopyEngineModalProps> = ({
   store,
+  initialAssetId = null,
   onClose,
   onOpenVertexPainter,
 }) => {
@@ -304,7 +383,27 @@ export const CanopyEngineModal: React.FC<CanopyEngineModalProps> = ({
   const [baseOnlyPreview, setBaseOnlyPreview] = useState(false);
   const [previewWindMode, setPreviewWindMode] = useState<PreviewWindMode>('level');
   const [savedTreePresetNote, setSavedTreePresetNote] = useState(false);
+  const [editingAssetId, setEditingAssetId] = useState<string | null>(initialAssetId);
+  const [treeAssetName, setTreeAssetName] = useState<string>('Stylized Tree');
+  const [savingTreeAsset, setSavingTreeAsset] = useState(false);
+  const [savedTreeAssetNote, setSavedTreeAssetNote] = useState<string | null>(null);
   const [cacheTick, setCacheTick] = useState(0);
+
+  const [paintTool, setPaintTool] = useState<'paint' | 'orbit'>('paint');
+  const [spaceOrbiting, setSpaceOrbiting] = useState(false);
+  const [paintRedoStack, setPaintRedoStack] = useState<VertexPaintStroke[]>([]);
+  const [paintBrush, setPaintBrush] = useState<VertexPaintBrushSettings>({
+    mode: 'paint',
+    target: 'all',
+    radius: 0.9,
+    opacity: 0.68,
+    softness: 0.45,
+    color: '#F0B838',
+    hueShift: 0,
+    saturationShift: 0,
+    valueShift: 0,
+    hueJitter: 22,
+  });
 
   const canopyFileRef = useRef<HTMLInputElement | null>(null);
   const trunkFileRef = useRef<HTMLInputElement | null>(null);
@@ -312,6 +411,14 @@ export const CanopyEngineModal: React.FC<CanopyEngineModalProps> = ({
   const previewMountRef = useRef<HTMLDivElement | null>(null);
   const autoSpinRef = useRef(autoSpin);
   autoSpinRef.current = autoSpin;
+  const activeTabRef = useRef(activeTab);
+  activeTabRef.current = activeTab;
+  const paintToolRef = useRef(paintTool);
+  paintToolRef.current = paintTool;
+  const spaceOrbitingRef = useRef(spaceOrbiting);
+  spaceOrbitingRef.current = spaceOrbiting;
+  const paintBrushRef = useRef(paintBrush);
+  paintBrushRef.current = paintBrush;
 
   const livePreviewWindFactor =
     previewWindMode === 'calm'
@@ -332,6 +439,9 @@ export const CanopyEngineModal: React.FC<CanopyEngineModalProps> = ({
     treesContainer: THREE.Group;
     timeUniform: { value: number };
     windUniform: { value: number };
+    paintSession: MakerVertexPaintSession;
+    paintableMeshes: THREE.Mesh[];
+    centerTree: THREE.Group | null;
   } | null>(null);
 
   useEffect(() => {
@@ -348,6 +458,8 @@ export const CanopyEngineModal: React.FC<CanopyEngineModalProps> = ({
   const cfg: StylizedCanopyConfig = rawCfg
     ? { ...createDefaultSpeciesConfig(activeSpecies), ...rawCfg }
     : createDefaultCanopyConfig();
+  const cfgRef = useRef(cfg);
+  cfgRef.current = cfg;
   const style: VisualStyleId = currentLevel?.visualStyle ?? 'painterlyPBR';
   const isEzTree = cfg.treeGeneratorMode === 'ezTree';
   const ezCfg = resolveEzTreeParams(cfg);
@@ -377,6 +489,44 @@ export const CanopyEngineModal: React.FC<CanopyEngineModalProps> = ({
           canopyEngine: next,
         };
       },
+      recordUndo
+    );
+  };
+
+  useEffect(() => {
+    if (!initialAssetId) return;
+    const found = store.customAssets.find((a) => a.id === initialAssetId);
+    if (found) {
+      setEditingAssetId(found.id);
+      setTreeAssetName(found.name);
+      setPaintRedoStack([]);
+      if (found.treeRecipe) {
+        const nextStrokes =
+          found.vertexPaintStrokes && found.vertexPaintStrokes.length > 0
+            ? found.vertexPaintStrokes
+            : found.treeRecipe.vertexPaintStrokes;
+        updateConfig(
+          {
+            ...found.treeRecipe,
+            vertexPaintStrokes: nextStrokes ? JSON.parse(JSON.stringify(nextStrokes)) : undefined,
+          },
+          `load saved tree: ${found.name}`,
+          true
+        );
+      }
+    }
+  }, [initialAssetId]);
+
+  const setTreePaintStrokes = (
+    updater: (prev: VertexPaintStroke[]) => VertexPaintStroke[],
+    label = 'paint tree vertices',
+    recordUndo = true
+  ) => {
+    const prev = cfgRef.current.vertexPaintStrokes ?? [];
+    const next = updater(prev);
+    updateConfig(
+      { vertexPaintStrokes: next.length > 0 ? next : undefined },
+      label,
       recordUndo
     );
   };
@@ -611,7 +761,8 @@ export const CanopyEngineModal: React.FC<CanopyEngineModalProps> = ({
 
     const timeUniform = uniform(0);
     const windUniform = uniform(previewWindFactorRef.current);
-    previewRefs.current = {
+    const paintSession = new MakerVertexPaintSession(scene);
+    const refsObj = {
       scene,
       camera,
       controls,
@@ -619,7 +770,91 @@ export const CanopyEngineModal: React.FC<CanopyEngineModalProps> = ({
       treesContainer,
       timeUniform,
       windUniform,
+      paintSession,
+      paintableMeshes: [] as THREE.Mesh[],
+      centerTree: null as THREE.Group | null,
     };
+    previewRefs.current = refsObj;
+
+    const onPointerDown = (e: PointerEvent) => {
+      const isPaintingNow =
+        activeTabRef.current === 'paint' &&
+        paintToolRef.current === 'paint' &&
+        !spaceOrbitingRef.current;
+      if (!isPaintingNow || e.button !== 0 || !refsObj.centerTree) return;
+      const started = refsObj.paintSession.handlePointerDown({
+        event: e,
+        domEl: refsObj.renderer.domElement,
+        camera,
+        paintRoot: refsObj.centerTree,
+        paintableMeshes: refsObj.paintableMeshes,
+        brush: paintBrushRef.current,
+      });
+      if (started) {
+        e.stopPropagation();
+      }
+    };
+
+    const onPointerHoverCursor = (e: PointerEvent) => {
+      const isPaintingNow =
+        activeTabRef.current === 'paint' &&
+        paintToolRef.current === 'paint' &&
+        !spaceOrbitingRef.current;
+      if (isPaintingNow && refsObj.centerTree && !refsObj.paintSession.brushing) {
+        refsObj.paintSession.updateHoverCursor({
+          event: e,
+          domEl: refsObj.renderer.domElement,
+          camera,
+          paintRoot: refsObj.centerTree,
+          paintableMeshes: refsObj.paintableMeshes,
+          brush: paintBrushRef.current,
+        });
+      } else if (!refsObj.paintSession.brushing) {
+        refsObj.paintSession.hideCursor();
+      }
+    };
+
+    const onPointerMove = (e: PointerEvent) => {
+      const isPaintingNow =
+        activeTabRef.current === 'paint' &&
+        paintToolRef.current === 'paint' &&
+        !spaceOrbitingRef.current;
+      if (isPaintingNow && refsObj.centerTree) {
+        refsObj.paintSession.handlePointerMove({
+          event: e,
+          domEl: refsObj.renderer.domElement,
+          camera,
+          paintRoot: refsObj.centerTree,
+          paintableMeshes: refsObj.paintableMeshes,
+          brush: paintBrushRef.current,
+        });
+      }
+    };
+
+    const onPointerUp = (e: PointerEvent) => {
+      if (refsObj.paintSession.brushing) {
+        const completed = refsObj.paintSession.finishStroke(refsObj.renderer.domElement, e.pointerId);
+        if (completed) {
+          setPaintRedoStack([]);
+          setTreePaintStrokes((prev) => [...prev, completed], 'paint tree vertex stroke', true);
+        }
+      }
+    };
+
+    const attachCanvasPointerListeners = (domEl: HTMLElement) => {
+      domEl.style.touchAction = 'none';
+      domEl.addEventListener('pointerdown', onPointerDown);
+      domEl.addEventListener('pointermove', onPointerHoverCursor);
+    };
+    const detachCanvasPointerListeners = (domEl: HTMLElement) => {
+      domEl.removeEventListener('pointerdown', onPointerDown);
+      domEl.removeEventListener('pointermove', onPointerHoverCursor);
+    };
+
+    attachCanvasPointerListeners(renderer.domElement);
+    window.addEventListener('pointermove', onPointerMove);
+    window.addEventListener('pointerup', onPointerUp);
+    window.addEventListener('pointercancel', onPointerUp);
 
     const timer = new THREE.Timer();
     let disposed = false;
@@ -660,8 +895,9 @@ export const CanopyEngineModal: React.FC<CanopyEngineModalProps> = ({
         timer.update();
         const dt = Math.min(0.08, timer.getDelta());
         timeUniform.value = timer.getElapsed();
-        windUniform.value = previewWindFactorRef.current;
-        if (autoSpinRef.current) {
+        const isPaintingTab = activeTabRef.current === 'paint';
+        windUniform.value = isPaintingTab ? 0 : previewWindFactorRef.current;
+        if (autoSpinRef.current && !isPaintingTab) {
           treesContainer.rotation.y += dt * 0.22;
         }
         controls.update();
@@ -680,6 +916,7 @@ export const CanopyEngineModal: React.FC<CanopyEngineModalProps> = ({
       if (disposed) return false;
       cancelAnimationFrame(frameId);
       clearTimeout(frameId);
+      detachCanvasPointerListeners(refsObj.renderer.domElement);
       controls.dispose();
       envTex?.dispose();
       envTex = null;
@@ -693,6 +930,7 @@ export const CanopyEngineModal: React.FC<CanopyEngineModalProps> = ({
       container.innerHTML = '';
       container.appendChild(renderer.domElement);
       controls = createControls(renderer.domElement);
+      attachCanvasPointerListeners(renderer.domElement);
       if (previewRefs.current) {
         previewRefs.current.renderer = renderer;
         previewRefs.current.controls = controls;
@@ -760,6 +998,11 @@ export const CanopyEngineModal: React.FC<CanopyEngineModalProps> = ({
       cancelAnimationFrame(frameId);
       clearTimeout(frameId);
       ro.disconnect();
+      detachCanvasPointerListeners(refsObj.renderer.domElement);
+      window.removeEventListener('pointermove', onPointerMove);
+      window.removeEventListener('pointerup', onPointerUp);
+      window.removeEventListener('pointercancel', onPointerUp);
+      refsObj.paintSession.dispose(scene);
       controls.dispose();
       timer.dispose();
       envTex?.dispose();
@@ -783,7 +1026,17 @@ export const CanopyEngineModal: React.FC<CanopyEngineModalProps> = ({
     });
   }, [cfg.barkTexture?.textureId, cfg.canopyTexture?.textureId, cfg.fruitTexture?.textureId, currentLevel?.sceneryTextures]);
 
-  // Rebuild 3 side-by-side preview trees live (instant on mount, lightly debounced on rapid slider drags)
+  const structuralTreeSig = React.useMemo(
+    () =>
+      JSON.stringify({
+        ...cfg,
+        vertexPaintStrokes: undefined,
+        speciesProfiles: undefined,
+      }),
+    [cfg]
+  );
+
+  // Rebuild 3 side-by-side preview trees live (excludes vertexPaintStrokes so brushing never rebuilds meshes)
   useEffect(() => {
     const refs = previewRefs.current;
     if (!refs) return;
@@ -794,6 +1047,15 @@ export const CanopyEngineModal: React.FC<CanopyEngineModalProps> = ({
 
       disposeObject3D(liveRefs.treesContainer);
       liveRefs.treesContainer.clear();
+      liveRefs.paintableMeshes = [];
+      liveRefs.centerTree = null;
+
+      const curCfg = cfgRef.current;
+      const baseCfg: StylizedCanopyConfig = {
+        ...curCfg,
+        vertexPaintStrokes: undefined,
+      };
+      const strokes = curCfg.vertexPaintStrokes ?? [];
 
       const positions: [number, number, number, string][] = [
         [-4.2, 0, -0.5, 'preview_tree_alpha'],
@@ -803,7 +1065,7 @@ export const CanopyEngineModal: React.FC<CanopyEngineModalProps> = ({
 
       positions.forEach(([px, py, pz, key], idx) => {
         const tree = buildSingleCanopyTreeGroup(
-          cfg,
+          baseCfg,
           `${key}_${idx}`,
           style,
           liveRefs.timeUniform,
@@ -813,11 +1075,21 @@ export const CanopyEngineModal: React.FC<CanopyEngineModalProps> = ({
             previewIndex: idx,
             sceneryTextures: currentLevel?.sceneryTextures,
             weatherWindUniform: liveRefs.windUniform,
+            enableVertexPaint: true,
           }
         );
         tree.position.set(px, py, pz);
         tree.rotation.y = idx * 1.95;
         liveRefs.treesContainer.add(tree);
+
+        const meshes = prepareObjectForVertexPainting(tree);
+        if (strokes.length > 0) {
+          applyVertexPaintStrokesToObject(tree, strokes);
+        }
+        if (idx === 1) {
+          liveRefs.centerTree = tree;
+          liveRefs.paintableMeshes = meshes;
+        }
       });
     };
 
@@ -829,7 +1101,80 @@ export const CanopyEngineModal: React.FC<CanopyEngineModalProps> = ({
 
     const timerId = window.setTimeout(rebuildTrees, 55);
     return () => window.clearTimeout(timerId);
-  }, [cfg, style, cacheTick, baseOnlyPreview, currentLevel?.sceneryTextures]);
+  }, [structuralTreeSig, style, cacheTick, baseOnlyPreview, currentLevel?.sceneryTextures]);
+
+  // Replay non-destructive vertex paint strokes across all 3 showcase trees when strokes change
+  useEffect(() => {
+    const liveRefs = previewRefs.current;
+    if (!liveRefs || liveRefs.paintSession.brushing) return;
+    const strokes = cfg.vertexPaintStrokes ?? [];
+    for (const tree of liveRefs.treesContainer.children) {
+      resetObjectVertexPaint(tree);
+      if (strokes.length > 0) {
+        applyVertexPaintStrokesToObject(tree, strokes);
+      }
+    }
+  }, [cfg.vertexPaintStrokes]);
+
+  // Delegate OrbitControls left-button to brush while in Paint tab
+  useEffect(() => {
+    const liveRefs = previewRefs.current;
+    if (!liveRefs) return;
+    const paintBrushingActive =
+      activeTab === 'paint' && paintTool === 'paint' && !spaceOrbiting;
+    liveRefs.controls.mouseButtons = {
+      LEFT: paintBrushingActive ? (null as unknown as THREE.MOUSE) : THREE.MOUSE.ROTATE,
+      MIDDLE: THREE.MOUSE.DOLLY,
+      RIGHT: THREE.MOUSE.ROTATE,
+    };
+    liveRefs.controls.touches = {
+      ONE: paintBrushingActive ? (null as unknown as THREE.TOUCH) : THREE.TOUCH.ROTATE,
+      TWO: THREE.TOUCH.DOLLY_PAN,
+    };
+    if (!paintBrushingActive) {
+      liveRefs.paintSession.hideCursor();
+    }
+  }, [activeTab, paintTool, spaceOrbiting]);
+
+  // Paint keyboard shortcuts: Space to temporarily orbit, [ / ] to resize brush
+  useEffect(() => {
+    if (activeTab !== 'paint') {
+      setSpaceOrbiting(false);
+      return;
+    }
+    const isTextInput = (el: EventTarget | null) =>
+      el instanceof HTMLInputElement ||
+      el instanceof HTMLTextAreaElement ||
+      el instanceof HTMLSelectElement;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (isTextInput(e.target)) return;
+      if (e.code === 'Space' && !e.repeat) {
+        e.preventDefault();
+        setSpaceOrbiting(true);
+      } else if (e.key === '[') {
+        setPaintBrush((prev) => ({
+          ...prev,
+          radius: Math.max(0.15, Number((prev.radius - 0.1).toFixed(2))),
+        }));
+      } else if (e.key === ']') {
+        setPaintBrush((prev) => ({
+          ...prev,
+          radius: Math.min(3.5, Number((prev.radius + 0.1).toFixed(2))),
+        }));
+      }
+    };
+    const onKeyUp = (e: KeyboardEvent) => {
+      if (e.code === 'Space') {
+        setSpaceOrbiting(false);
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    window.addEventListener('keyup', onKeyUp);
+    return () => {
+      window.removeEventListener('keydown', onKeyDown);
+      window.removeEventListener('keyup', onKeyUp);
+    };
+  }, [activeTab]);
 
   const handleUploadGlb = async (
     slot: UploadSlot,
@@ -885,6 +1230,72 @@ export const CanopyEngineModal: React.FC<CanopyEngineModalProps> = ({
       ? (cfg.customTypeName?.trim() || 'Custom Tree')
       : TREE_SPECIES_OPTIONS.find((s) => s.id === activeSpecies)?.label ?? 'Oak';
 
+  const paintCount = cfg.vertexPaintStrokes?.length ?? 0;
+
+  const handleSaveTreeAsset = async () => {
+    if (savingTreeAsset) return;
+    setSavingTreeAsset(true);
+    setSavedTreeAssetNote(null);
+    const liveRefs = previewRefs.current;
+    const dummyTime = liveRefs?.timeUniform ?? { value: 0 };
+    const cleanName = treeAssetName.trim() || `${activeSpeciesLabel} Tree`;
+    const recipeToSave: StylizedCanopyConfig = JSON.parse(JSON.stringify(cfg));
+    let builtTree: THREE.Group | null = null;
+    let exportGroup: THREE.Group | null = null;
+    let thumbGroup: THREE.Group | null = null;
+
+    try {
+      builtTree = buildSingleCanopyTreeGroup(
+        { ...recipeToSave, vertexPaintStrokes: undefined },
+        `tree_asset_${Date.now()}`,
+        style,
+        dummyTime,
+        undefined,
+        {
+          sceneryTextures: currentLevel?.sceneryTextures,
+          enableVertexPaint: true,
+        }
+      );
+      exportGroup = cloneExportSafeTreeGroup(builtTree);
+      const buffer = await exportObjectGroupToGlbBuffer(exportGroup);
+
+      thumbGroup = cloneExportSafeTreeGroup(builtTree);
+      if ((recipeToSave.vertexPaintStrokes?.length ?? 0) > 0) {
+        prepareObjectForVertexPainting(thumbGroup);
+        applyVertexPaintStrokesToObject(thumbGroup, recipeToSave.vertexPaintStrokes);
+      }
+      const thumbnailOverride = await renderObject3DThumbnail(thumbGroup, {
+        azimuthRad: 0.45,
+        elevationFactor: 0.34,
+        zoom: 1.04,
+      });
+
+      const savedMeta = await store.saveGeneratedAsset({
+        existingAssetId: editingAssetId ?? undefined,
+        name: cleanName,
+        category: 'tree',
+        buffer,
+        treeRecipe: recipeToSave,
+        vertexPaintStrokes:
+          recipeToSave.vertexPaintStrokes && recipeToSave.vertexPaintStrokes.length > 0
+            ? recipeToSave.vertexPaintStrokes
+            : undefined,
+        thumbnailOverride,
+        keepMetricScale: true,
+      });
+      setEditingAssetId(savedMeta.id);
+      setSavedTreeAssetNote(editingAssetId ? 'Updated in Trees!' : 'Saved to Trees!');
+      window.setTimeout(() => setSavedTreeAssetNote(null), 2600);
+    } catch (err) {
+      setUploadError(err instanceof Error ? err.message : 'Could not save tree asset.');
+    } finally {
+      if (builtTree) disposeObject3D(builtTree);
+      if (exportGroup) disposeObject3D(exportGroup);
+      if (thumbGroup) disposeObject3D(thumbGroup);
+      setSavingTreeAsset(false);
+    }
+  };
+
   const tabs: { id: StudioTab; label: string; icon: React.ReactNode }[] = [
     { id: 'base', label: 'Base', icon: <Trees size={12} /> },
     { id: 'roots', label: 'Roots', icon: <GitBranch size={12} /> },
@@ -892,6 +1303,11 @@ export const CanopyEngineModal: React.FC<CanopyEngineModalProps> = ({
     { id: 'leaves', label: 'Leaves', icon: <Leaf size={12} /> },
     { id: 'color', label: 'Color', icon: <Palette size={12} /> },
     { id: 'fruit', label: 'Fruit', icon: <Apple size={12} /> },
+    {
+      id: 'paint',
+      label: paintCount > 0 ? `Paint (${paintCount})` : 'Paint',
+      icon: <Paintbrush size={12} />,
+    },
   ];
 
   const supportsBroadleafCanopy =
@@ -904,7 +1320,7 @@ export const CanopyEngineModal: React.FC<CanopyEngineModalProps> = ({
         <header className="shrink-0 px-5 py-3 border-b border-slate-200/80 dark:border-white/[0.08] flex flex-wrap items-center justify-between gap-3">
           <div className="min-w-0">
             <h2 className="text-base font-extrabold tracking-tight truncate">
-              Tree Studio · Base Maker &amp; Canopy Engine
+              Tree Maker · Bark &amp; Canopy Designer
             </h2>
             <p className="text-xs text-slate-500 dark:text-[#949BB0] truncate">
               Sculpt bark, branches, owl hollows, arched roots, multi-species canopies &amp; fruit
@@ -927,7 +1343,7 @@ export const CanopyEngineModal: React.FC<CanopyEngineModalProps> = ({
               type="button"
               onClick={onClose}
               className="p-2 rounded-xl hover:bg-slate-100 dark:hover:bg-white/[0.06] text-slate-500"
-              aria-label="Close Tree Studio"
+              aria-label="Close Tree Maker"
             >
               <X size={16} />
             </button>
@@ -1140,13 +1556,13 @@ export const CanopyEngineModal: React.FC<CanopyEngineModalProps> = ({
             />
 
             {/* Tab Navigation */}
-            <div className="shrink-0 px-4 pt-3 pb-2 border-b border-slate-200/80 dark:border-white/[0.08] grid grid-cols-6 gap-1">
+            <div className="shrink-0 px-4 pt-3 pb-2 border-b border-slate-200/80 dark:border-white/[0.08] grid grid-cols-7 gap-1">
               {tabs.map((tab) => (
                 <button
                   key={tab.id}
                   type="button"
                   onClick={() => setActiveTab(tab.id)}
-                  className={`inline-flex items-center justify-center gap-1 py-2 px-1 rounded-xl text-[11px] font-extrabold whitespace-nowrap transition-colors ${
+                  className={`inline-flex items-center justify-center gap-1 py-2 px-1 rounded-xl text-[10px] font-extrabold whitespace-nowrap transition-colors ${
                     activeTab === tab.id
                       ? 'bg-[#20B46A] text-white'
                       : 'bg-slate-100 dark:bg-[#1F2430] text-slate-600 dark:text-[#A3ACBF] hover:text-slate-900 dark:hover:text-white'
@@ -3661,11 +4077,82 @@ export const CanopyEngineModal: React.FC<CanopyEngineModalProps> = ({
                   </div>
                 </>
               )}
+
+              {/* TAB 7: EMBEDDED 3D VERTEX PAINT */}
+              {activeTab === 'paint' && (
+                <VertexPaintInspector
+                  brush={paintBrush}
+                  onChangeBrush={setPaintBrush}
+                  interactionTool={paintTool}
+                  onChangeInteractionTool={setPaintTool}
+                  strokeCount={paintCount}
+                  canRedo={paintRedoStack.length > 0}
+                  showPartTargets
+                  partTargetLabels={{
+                    all: 'Whole Tree',
+                    leaves: 'Leaves & Canopy',
+                    branches: 'Bark & Branches',
+                  }}
+                  accentColor="#20B46A"
+                  onUndoStroke={() => {
+                    const prev = cfgRef.current.vertexPaintStrokes ?? [];
+                    if (prev.length === 0) return;
+                    const popped = prev[prev.length - 1];
+                    setPaintRedoStack((r) => [...r, popped]);
+                    setTreePaintStrokes((list) => list.slice(0, -1), 'undo tree paint stroke', true);
+                  }}
+                  onRedoStroke={() => {
+                    setPaintRedoStack((stack) => {
+                      if (stack.length === 0) return stack;
+                      const restored = stack[stack.length - 1];
+                      setTreePaintStrokes((list) => [...list, restored], 'redo tree paint stroke', true);
+                      return stack.slice(0, -1);
+                    });
+                  }}
+                  onClearAllPaint={() => {
+                    setPaintRedoStack([]);
+                    setTreePaintStrokes(() => [], 'clear tree vertex paint', true);
+                  }}
+                  onAutoDapple={() => {
+                    const centerTree = previewRefs.current?.centerTree;
+                    if (!centerTree) return;
+                    const stroke = generateOrganicDappleStroke(
+                      centerTree,
+                      paintBrush,
+                      Math.floor(Math.random() * 900000) + 100
+                    );
+                    if (stroke) {
+                      setPaintRedoStack([]);
+                      setTreePaintStrokes((list) => [...list, stroke], 'auto dapple tree leaves', true);
+                    }
+                  }}
+                />
+              )}
             </div>
 
             {/* Bottom Action Footer */}
             <footer className="shrink-0 px-4 py-3 border-t border-slate-200/80 dark:border-white/[0.08] bg-slate-50/70 dark:bg-[#131720] flex flex-wrap items-center justify-between gap-2">
-              <div className="flex items-center gap-2">
+              <div className="flex flex-wrap items-center gap-2">
+                <input
+                  type="text"
+                  value={treeAssetName}
+                  onChange={(e) => setTreeAssetName(e.target.value)}
+                  placeholder="Tree asset name…"
+                  className="w-32 px-2.5 py-1.5 rounded-xl bg-white dark:bg-[#1C212D] border border-slate-200 dark:border-white/[0.1] text-xs font-bold focus:outline-none focus:border-[#20B46A]"
+                />
+                <button
+                  type="button"
+                  disabled={savingTreeAsset}
+                  onClick={() => void handleSaveTreeAsset()}
+                  className="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl bg-[#7C5CFF] hover:bg-[#6A48F5] text-white text-xs font-extrabold whitespace-nowrap disabled:opacity-50"
+                >
+                  <Save size={13} />
+                  <span>
+                    {savingTreeAsset
+                      ? 'Saving…'
+                      : savedTreeAssetNote ?? (editingAssetId ? 'Update Tree Asset' : 'Save to Trees')}
+                  </span>
+                </button>
                 <button
                   type="button"
                   onClick={() => {
@@ -3691,15 +4178,13 @@ export const CanopyEngineModal: React.FC<CanopyEngineModalProps> = ({
                 {onOpenVertexPainter && (
                   <button
                     type="button"
-                    onClick={onOpenVertexPainter}
-                    className="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl bg-[#7C5CFF]/15 hover:bg-[#7C5CFF]/25 text-[#7C5CFF] text-xs font-extrabold whitespace-nowrap"
+                    onClick={() => setActiveTab('paint')}
+                    className="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl bg-[#EC4899]/15 hover:bg-[#EC4899]/25 text-[#EC4899] text-xs font-extrabold whitespace-nowrap"
                   >
                     <Paintbrush size={13} />
-                    <span>Vertex Paint</span>
-                    {(cfg.vertexPaintStrokes?.length ?? 0) > 0 && (
-                      <span className="tabular-nums text-[10px] opacity-85">
-                        ({cfg.vertexPaintStrokes!.length})
-                      </span>
+                    <span>Paint Brush</span>
+                    {paintCount > 0 && (
+                      <span className="tabular-nums text-[10px] opacity-85">({paintCount})</span>
                     )}
                   </button>
                 )}
@@ -3716,7 +4201,7 @@ export const CanopyEngineModal: React.FC<CanopyEngineModalProps> = ({
                       setTimeout(() => setSavedTreePresetNote(false), 2600);
                     }
                   }}
-                  title="Save this Tree Studio design into your local savepresets library"
+                  title="Save this Tree Maker design into your local saved presets library"
                   className="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl bg-slate-200/80 dark:bg-[#1F2430] hover:bg-slate-300/80 dark:hover:bg-[#272D3C] text-xs font-extrabold whitespace-nowrap"
                 >
                   <Save size={13} className="text-[#20B46A]" />

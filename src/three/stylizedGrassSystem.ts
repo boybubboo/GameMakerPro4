@@ -60,6 +60,11 @@ export function createDefaultGrassConfig(): GrassFieldConfig {
     windWaveStrength: 1.0,
     tipGlow: 0.68,
     interactiveParting: true,
+    primaryColor: '#54B049',
+    secondaryColor: '#98D954',
+    mixNoiseScale: 1.0,
+    carexMix: 0.32,
+    tuftClumpiness: 0.45,
   };
 }
 
@@ -495,6 +500,16 @@ interface GrassMaterialBundle {
     uLodInnerEnd: { value: number };
     uLodOuterStart: { value: number };
     uLodOuterEnd: { value: number };
+    uBladeHeight: { value: number };
+    uBladeWidth: { value: number };
+    uWindWaveStrength: { value: number };
+    uTipGlow: { value: number };
+    uPrimaryCol: { value: THREE.Color };
+    uSecondaryCol: { value: THREE.Color };
+    uUseCustomDualTone: { value: number };
+    uMixNoiseScale: { value: number };
+    uCarexMix: { value: number };
+    uTuftClumpiness: { value: number };
     uCameraPos: { value: THREE.Vector3 };
     uTime: { value: number };
     uWindStrength: { value: number };
@@ -567,6 +582,12 @@ function createGrassNodeMaterial(opts: {
   midHex: string;
   tipHex: string;
   crestHex: string;
+  primaryColorHex?: string;
+  secondaryColorHex?: string;
+  useCustomDualTone?: boolean;
+  mixNoiseScale?: number;
+  carexMix?: number;
+  tuftClumpiness?: number;
 }): GrassMaterialBundle {
   const safeOuterEnd = Math.max(opts.outerEnd, opts.outerStart + 0.01);
   const hasInnerFade = opts.innerEnd > opts.innerStart + 0.001 && opts.innerStart > 0.0;
@@ -579,10 +600,16 @@ function createGrassNodeMaterial(opts: {
   const uLodInnerEnd = uniform(Math.max(opts.innerEnd, opts.innerStart + 0.01));
   const uLodOuterStart = uniform(opts.outerStart);
   const uLodOuterEnd = uniform(safeOuterEnd);
-  const uBladeHeight = float(opts.bladeHeight);
-  const uBladeWidth = float(opts.bladeWidth);
-  const uWindWaveStrength = float(opts.windWaveStrength);
-  const uTipGlow = float(opts.tipGlow);
+  const uBladeHeight = uniform(opts.bladeHeight);
+  const uBladeWidth = uniform(opts.bladeWidth);
+  const uWindWaveStrength = uniform(opts.windWaveStrength);
+  const uTipGlow = uniform(opts.tipGlow);
+  const uPrimaryCol = uniform(new THREE.Color(opts.primaryColorHex ?? opts.midHex));
+  const uSecondaryCol = uniform(new THREE.Color(opts.secondaryColorHex ?? opts.tipHex));
+  const uUseCustomDualTone = uniform(opts.useCustomDualTone ? 1.0 : 0.0);
+  const uMixNoiseScale = uniform(opts.mixNoiseScale ?? 1.0);
+  const uCarexMix = uniform(opts.carexMix ?? 0.32);
+  const uTuftClumpiness = uniform(opts.tuftClumpiness ?? 0.45);
 
   const toColorVec3 = (hex: string) => {
     const c = new THREE.Color(hex);
@@ -621,6 +648,7 @@ function createGrassNodeMaterial(opts: {
   const vSide = varying(float());
   const vWaveCrest = varying(float());
   const vColorVar = varying(float());
+  const vSpeciesMix = varying(float());
   const vCloudShade = varying(float());
   const vGroundTint = varying(vec3());
   const vWorldPos = varying(vec3());
@@ -728,13 +756,27 @@ function createGrassNodeMaterial(opts: {
             const trailData = texture(opts.trailTex, trailUv);
             const trampleAmt = float(trailData.r);
 
+            // Dual species selection: Carex / Tall Sedge vs Lush Short Lawn
+            const speciesPatch = gNoise2DTsl(worldXZ.mul(0.11).add(vec2(12.3, 4.7)));
+            const isCarex = smoothstep(
+              float(0.68).sub(uCarexMix.mul(0.65)),
+              float(0.95).sub(uCarexMix.mul(0.5)),
+              speciesPatch.mul(0.62).add(bladeRnd.mul(0.38))
+            ).mul(clamp(uCarexMix.mul(1.35), 0.0, 1.0));
+
+            const clumpHeightSpan = mix(0.14, 0.54, clamp(uTuftClumpiness, 0.0, 1.0));
+            const clumpScaledMul = float(1.0).sub(clumpHeightSpan.mul(0.45)).add(clumpHash.y.mul(clumpHeightSpan));
+
             const borderShrink = smoothstep(0.08, 0.65, grassMask);
+            const speciesHeightMul = mix(0.84, 1.48, isCarex);
             const heightScale = uBladeHeight
               .mul(float(0.58).add(clumpNoise.mul(0.54)).add(bladeRnd.mul(0.28)))
-              .mul(clumpHeightMul)
+              .mul(clumpScaledMul)
+              .mul(speciesHeightMul)
               .mul(borderShrink)
               .mul(lodScale);
             const widthScale = uBladeWidth
+              .mul(mix(1.05, 0.78, isCarex))
               .mul(float(0.84).add(bladeRnd.mul(0.36)))
               .mul(float(0.7).add(lodScale.mul(0.3)));
 
@@ -748,7 +790,7 @@ function createGrassNodeMaterial(opts: {
             // Clumped yaw orientation (neighboring blades lean loosely in tuft clusters)
             const clumpYaw = clumpHash.x.mul(6.2831853);
             const indivYaw = gHash21Tsl(hashSeed.add(vec2(9.2, 61.7))).mul(6.2831853);
-            const yaw = mix(clumpYaw, indivYaw, 0.56);
+            const yaw = mix(clumpYaw, indivYaw, mix(0.76, 0.24, clamp(uTuftClumpiness, 0.0, 1.0)));
 
             // For far billboarded tuft cards: orient card toward camera with subtle normalized tilt
             const farBasis = normalize(
@@ -770,9 +812,12 @@ function createGrassNodeMaterial(opts: {
               ? float(1.16)
               : float(1.0).add(pow(float(1.0).sub(faceAlign), 2.0).mul(0.88));
 
-            // Per-blade procedural quadratic curvature variation
+            // Per-blade procedural quadratic curvature variation (Carex bends gracefully outward)
             const curveRnd = gHash21Tsl(hashSeed.add(vec2(71.9, 13.4)));
-            const archBend = hT.mul(hT).mul(heightScale).mul(float(0.14).add(curveRnd.mul(0.28)));
+            const archBend = hT
+              .mul(hT)
+              .mul(heightScale)
+              .mul(float(0.14).add(curveRnd.mul(0.28)).add(isCarex.mul(0.26)));
 
             const localZ = positionGeometry.z
               .mul(heightScale)
@@ -868,6 +913,7 @@ function createGrassNodeMaterial(opts: {
             vSide.assign(side);
             vWaveCrest.assign(wavePulse.mul(clamp(uWindStrength.mul(0.85).add(0.35), 0.0, 1.35)));
             vColorVar.assign(clumpNoise.mul(0.65).add(bladeRnd.mul(0.35)));
+            vSpeciesMix.assign(isCarex);
             vCloudShade.assign(createDriftingCloudShadowNode(vec2(worldPos.x, worldPos.z)));
             vGroundTint.assign(groundSample);
             vWorldPos.assign(worldPos);
@@ -890,8 +936,19 @@ function createGrassNodeMaterial(opts: {
     const dapple2 = sin(vWorldPos.x.mul(0.14).sub(vWorldPos.z.mul(0.11)).add(1.8)).mul(0.5);
     const meadowVar = float(0.93).add(dapple1.add(dapple2).mul(0.065));
 
-    const gradCol = mix(uRootColor, uMidColor, smoothstep(0.0, 0.55, vHeight));
-    const baseTip = mix(gradCol, uTipColor, smoothstep(0.45, 1.0, vHeight));
+    // Dual-tone noise-driven blend between primary and secondary grass palette colors
+    const patchNoise = gNoise2DTsl(vec2(vWorldPos.x, vWorldPos.z).mul(float(0.045).mul(uMixNoiseScale)));
+    const dualBlend = smoothstep(0.22, 0.78, patchNoise.mul(0.72).add(vSpeciesMix.mul(0.28)));
+    const customRoot = mix(uPrimaryCol.mul(0.62), uSecondaryCol.mul(0.62), dualBlend);
+    const customMid = mix(uPrimaryCol, uSecondaryCol, dualBlend);
+    const customTip = mix(uPrimaryCol.mul(1.24), uSecondaryCol.mul(1.28), dualBlend);
+
+    const effRoot = mix(uRootColor, customRoot, uUseCustomDualTone);
+    const effMid = mix(uMidColor, customMid, uUseCustomDualTone);
+    const effTip = mix(uTipColor, customTip, uUseCustomDualTone);
+
+    const gradCol = mix(effRoot, effMid, smoothstep(0.0, 0.55, vHeight));
+    const baseTip = mix(gradCol, effTip, smoothstep(0.45, 1.0, vHeight));
 
     const warmShift = mix(vec3(0.92, 0.97, 0.94), vec3(1.1, 1.04, 0.88), vColorVar);
     const crestMask = vWaveCrest
@@ -1003,6 +1060,16 @@ function createGrassNodeMaterial(opts: {
       uLodInnerEnd,
       uLodOuterStart,
       uLodOuterEnd,
+      uBladeHeight,
+      uBladeWidth,
+      uWindWaveStrength,
+      uTipGlow,
+      uPrimaryCol,
+      uSecondaryCol,
+      uUseCustomDualTone,
+      uMixNoiseScale,
+      uCarexMix,
+      uTuftClumpiness,
       uCameraPos,
       uTime,
       uWindStrength,
@@ -1171,7 +1238,7 @@ export class StylizedGrassSystem {
   private grassWorldCells = 0;
   private readonly floatingTiles: FloatingGrassTile[] = [];
 
-  private readonly config: GrassFieldConfig;
+  private config: GrassFieldConfig;
   private readonly baseViewDist: number;
   private viewDist: number;
   private nearEnd: number;
@@ -1391,6 +1458,12 @@ export class StylizedGrassSystem {
     const windWaveStr = THREE.MathUtils.clamp(resolved.windWaveStrength, 0.1, 2.5);
     const tipGlowVal = THREE.MathUtils.clamp(resolved.tipGlow, 0, 1.4);
     const celMode = opts.visualStyle === 'celToon';
+    const useCustomDualTone = Boolean(resolved.primaryColor || resolved.secondaryColor);
+    const primaryColorHex = resolved.primaryColor ?? palette.midHex;
+    const secondaryColorHex = resolved.secondaryColor ?? palette.tipHex;
+    const mixNoiseScale = THREE.MathUtils.clamp(resolved.mixNoiseScale ?? 1.0, 0.2, 3.0);
+    const carexMix = THREE.MathUtils.clamp(resolved.carexMix ?? 0.32, 0.0, 1.0);
+    const tuftClumpiness = THREE.MathUtils.clamp(resolved.tuftClumpiness ?? 0.45, 0.0, 1.0);
 
     const nearBundle = createGrassNodeMaterial({
       terrainTex: this.terrainTex,
@@ -1414,6 +1487,12 @@ export class StylizedGrassSystem {
       midHex: palette.midHex,
       tipHex: palette.tipHex,
       crestHex: palette.crestHex,
+      primaryColorHex,
+      secondaryColorHex,
+      useCustomDualTone,
+      mixNoiseScale,
+      carexMix,
+      tuftClumpiness,
     });
     this.nearMat = nearBundle.material;
     this.nearUniforms = nearBundle.uniforms;
@@ -1440,6 +1519,12 @@ export class StylizedGrassSystem {
       midHex: palette.midHex,
       tipHex: palette.tipHex,
       crestHex: palette.crestHex,
+      primaryColorHex,
+      secondaryColorHex,
+      useCustomDualTone,
+      mixNoiseScale,
+      carexMix,
+      tuftClumpiness,
     });
     this.farMat = farBundle.material;
     this.farUniforms = farBundle.uniforms;
@@ -1619,6 +1704,33 @@ export class StylizedGrassSystem {
     this.terrainTex.needsUpdate = true;
     this.groundColorTex.needsUpdate = true;
     this.recomputeChunkBounds(brushArea);
+  }
+
+  public applyConfigUniforms(cfg?: Partial<GrassFieldConfig> | null): void {
+    const resolved = resolveGrassConfig(cfg);
+    this.config = resolved;
+    this.group.visible = resolved.enabled && resolved.quality !== 'off';
+    const bladeH = THREE.MathUtils.clamp(resolved.bladeHeight, 0.25, 1.8);
+    const bladeW = THREE.MathUtils.clamp(resolved.bladeWidth, 0.04, 0.22);
+    const windStr = THREE.MathUtils.clamp(resolved.windWaveStrength, 0.1, 2.5);
+    const tipGlow = THREE.MathUtils.clamp(resolved.tipGlow, 0, 1.4);
+    const useDual = resolved.primaryColor || resolved.secondaryColor ? 1.0 : 0.0;
+    const mixScale = THREE.MathUtils.clamp(resolved.mixNoiseScale ?? 1.0, 0.2, 3.0);
+    const carex = THREE.MathUtils.clamp(resolved.carexMix ?? 0.32, 0.0, 1.0);
+    const clump = THREE.MathUtils.clamp(resolved.tuftClumpiness ?? 0.45, 0.0, 1.0);
+
+    for (const u of [this.nearUniforms, this.farUniforms]) {
+      u.uBladeHeight.value = bladeH;
+      u.uBladeWidth.value = bladeW;
+      u.uWindWaveStrength.value = windStr;
+      u.uTipGlow.value = tipGlow;
+      u.uUseCustomDualTone.value = useDual;
+      if (resolved.primaryColor) u.uPrimaryCol.value.set(resolved.primaryColor);
+      if (resolved.secondaryColor) u.uSecondaryCol.value.set(resolved.secondaryColor);
+      u.uMixNoiseScale.value = mixScale;
+      u.uCarexMix.value = carex;
+      u.uTuftClumpiness.value = clump;
+    }
   }
 
   public setDynamicViewScale(scale: number): void {
